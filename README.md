@@ -1,5 +1,13 @@
 # Free AI Coding Stack: OpenCode + OmniRoute + NVIDIA NIM
 
+<p align="center">
+  <b>🌐 Documentation:</b><br>
+  🇺🇸 <b>English</b> ·
+  <a href="README.pt-BR.md">🇧🇷 Português (Brasil)</a> ·
+  <a href="README.es.md">🇪🇸 Español</a> ·
+  <a href="README.ru.md">🇷🇺 Русский</a>
+</p>
+
 > A practical, battle-tested setup for running a powerful AI coding environment with **OpenCode as the main coding platform**, **OmniRoute as the local AI gateway**, **free or free-tier models as fallbacks**, and **NVIDIA NIM** for heavyweight models such as **GLM-5.2** and **Nemotron 3 Ultra**.
 >
 > Last verified: **2026-08-12** during the OmniRoute **v3.8.49 → v3.8.50** release window.
