@@ -1,0 +1,107 @@
+name: Bug report
+description: Report a reproducible problem in the guide, configuration, scripts, or documented workflow.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve the project. Please provide a reproducible report and **remove all API keys, tokens, passwords, private URLs, and personal data** before submitting.
+
+        If this is a security vulnerability, do not use this form. Follow `SECURITY.md` and report it privately.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is broken or incorrect?
+      placeholder: Describe the problem clearly and concisely.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Give the smallest sequence that reproduces the issue.
+      placeholder: |
+        1. Install/configure ...
+        2. Run ...
+        3. Select provider/model ...
+        4. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead?
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS / environment
+      description: For example, Windows 11 + WSL Ubuntu, native Linux, or macOS.
+      placeholder: Windows 11 + WSL Ubuntu
+    validations:
+      required: true
+
+  - type: input
+    id: opencode
+    attributes:
+      label: OpenCode version
+      placeholder: e.g. 1.x.x or 2.x preview
+
+  - type: input
+    id: omniroute
+    attributes:
+      label: OmniRoute version
+      placeholder: e.g. 3.8.50
+
+  - type: input
+    id: node
+    attributes:
+      label: Node.js version
+      placeholder: e.g. 22.22.2
+
+  - type: input
+    id: provider_model
+    attributes:
+      label: Provider / model route
+      description: If relevant, include the provider and exact model or OmniRoute route.
+      placeholder: NVIDIA NIM / z-ai/glm-5.2
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs or screenshots
+      description: Paste only the minimum useful output. Redact credentials, tokens, private paths, personal data, and confidential information.
+      render: shell
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Links to upstream docs/issues, regression information, workarounds, or anything else useful.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety and verification checklist
+      options:
+        - label: I searched existing Issues for the same problem.
+          required: true
+        - label: I removed all credentials, tokens, passwords, private URLs, and personal/confidential data.
+          required: true
+        - label: This is not a security vulnerability requiring private disclosure under SECURITY.md.
+          required: true
