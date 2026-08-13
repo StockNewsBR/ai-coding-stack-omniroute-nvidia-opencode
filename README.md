@@ -12,7 +12,7 @@
 >
 > Last verified: **2026-08-12** during the OmniRoute **v3.8.49 → v3.8.50** release window.
 
-![OmniRoute dashboard](assets/screenshots/omniroute-home-v3.jpg)
+![OmniRoute dashboard](assets/screenshots/omniroute-home-final.jpg)
 
 ## Why this guide exists
 
