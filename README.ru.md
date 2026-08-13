@@ -12,7 +12,7 @@
 >
 > Последняя проверка: **2026-08-12** в окне релиза OmniRoute **v3.8.49 → v3.8.50**.
 
-![Дашборд OmniRoute](assets/screenshots/omniroute-home-v2.webp)
+![Дашборд OmniRoute](assets/screenshots/omniroute-home-v3.jpg)
 
 ## Зачем существует это руководство
 
