@@ -1,0 +1,66 @@
+name: Feature or documentation request
+description: Suggest an improvement to the guide, tooling coverage, provider notes, troubleshooting, or examples.
+title: "[Request]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. Keep the request focused on making this repository more useful, reproducible, secure, or easier to maintain.
+
+  - type: textarea
+    id: need
+    attributes:
+      label: What problem would this solve?
+      description: Describe the user need or gap before describing the solution.
+      placeholder: The current guide does not explain how to...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed improvement
+      description: What would you like added, changed, or documented?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - OpenCode
+        - OmniRoute
+        - NVIDIA NIM
+        - Providers / model routes
+        - Oh My OpenAgent / agents
+        - Graphify / Ponytail / Serena
+        - Windows / WSL / Linux setup
+        - Troubleshooting
+        - Security / privacy
+        - Documentation / translation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence or references
+      description: If this depends on upstream behavior, include relevant documentation, versions, successful tests, or sanitized output.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Is there a simpler workaround or existing section that could be improved instead?
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing Issues for a similar request.
+          required: true
+        - label: I have not included credentials, tokens, private URLs, or confidential/personal data.
+          required: true
