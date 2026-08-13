@@ -12,7 +12,7 @@
 >
 > Última verificación: **2026-08-12** durante la ventana de lanzamiento de OmniRoute **v3.8.49 → v3.8.50**.
 
-![Dashboard de OmniRoute](assets/screenshots/omniroute-home.webp)
+![Dashboard de OmniRoute](assets/screenshots/omniroute-home-v2.webp)
 
 ## Por qué existe esta guía
 
