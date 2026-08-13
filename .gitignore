@@ -1,0 +1,44 @@
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*
+secrets*
+
+# Local databases / runtime state
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+storage.sqlite
+
+# Caches / build outputs
+node_modules/
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.next/
+dist/
+build/
+coverage/
+*.log
+
+# Local agent/runtime state
+.opencode/session*
+.omniroute/
+.fcc/
+.claude/settings.local.json
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

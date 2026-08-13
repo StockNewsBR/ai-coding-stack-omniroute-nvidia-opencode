@@ -1,0 +1,17 @@
+{
+  // TEMPLATE ONLY. Agent names/config schema can change between OMO versions.
+  // First run the official oh-my-openagent installer and inspect the generated config.
+  // Then adapt model IDs to names returned by YOUR OpenCode /models command.
+
+  "agents": {
+    "Sisyphus": {
+      "model": "omniroute/auto/best-coding"
+    },
+    "Explore": {
+      "model": "opencode/deepseek-v4-flash-free"
+    },
+    "Oracle": {
+      "model": "opencode/nemotron-3-ultra-free"
+    }
+  }
+}
