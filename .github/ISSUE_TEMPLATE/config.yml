@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/StockNewsBR/ai-coding-stack-omniroute-nvidia-opencode/security/policy
+    about: Please report vulnerabilities privately. Do not post secrets or security-sensitive details in a public Issue.
