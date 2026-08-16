@@ -1,6 +1,6 @@
 # OmniRoute Setup
 
-Verified against the OmniRoute v3.8.50 release line on 2026-08-12.
+Verified against the OmniRoute v3.8.50 release line, with the coding pool re-validated on **2026-08-16**.
 
 Official README: https://github.com/diegosouzapw/OmniRoute/blob/release/v3.8.50/README.md
 
@@ -52,19 +52,84 @@ curl -s http://127.0.0.1:20128/v1/chat/completions \
 
 **Do not call a route working until this succeeds.** A model can be present in discovery while inference fails because of quota, auth, retirement, provider-specific metadata, or a bad upstream endpoint.
 
-## Build a useful coding combo
+## Current `OmniRoute Pro Coding` priority pool
 
-A practical priority chain from our lab used independent routes similar to:
+After the 2026-08-16 runtime sweep, the lab combo was reduced to a deliberately small eight-model pool.
 
-1. NVIDIA `z-ai/glm-5.2`
-2. OpenRouter Nemotron Ultra free route
-3. OpenCode DeepSeek V4 Flash Free
-4. another OpenCode/Zen free route
-5. NVIDIA Nemotron 3 Super
-6. `auto/coding:free`
-7. `auto/best-coding`
+Strategy: **`priority`**
 
-The exact IDs are intentionally not presented as permanent. **Read the IDs from your live OmniRoute catalog.** Provider slugs change.
+```text
+1. nvidia/z-ai/glm-5.2
+2. nvidia/nvidia/nemotron-3-ultra-550b-a55b
+3. nvidia/thinkingmachines/inkling
+4. oc/deepseek-v4-flash-free
+5. oc/mimo-v2.5-free
+6. nvidia/nvidia/nemotron-3-super-120b-a12b
+7. nvidia/nvidia/nemotron-3.5-lightning-30b-a3b
+8. nvidia/stepfun-ai/step-3.7-flash
+```
+
+Role split:
+
+```text
+BRAINS
+GLM-5.2 → Nemotron 3 Ultra → Inkling
+
+HEAVY CODING
+DeepSeek V4 Flash Free → MiMo-V2.5 Free
+
+AGENTS / WORKERS
+Nemotron 3 Super → Nemotron 3.5 Lightning → Step 3.7 Flash
+```
+
+Why this shape:
+
+- **GLM-5.2** is the first-choice long-horizon coding/architecture brain;
+- **Nemotron 3 Ultra** is the preferred deep-audit/reasoning fallback;
+- **Inkling** adds a second strong NVIDIA reasoning/tool-use path with multimodal capability;
+- **DeepSeek V4 Flash Free** and **MiMo-V2.5 Free** give the combo independent OpenCode Zen free routes;
+- **Nemotron 3 Super** is well suited to high-volume agent/worker tasks;
+- **Nemotron 3.5 Lightning** is a fast worker route;
+- **Step 3.7 Flash** adds text+image/frontend/GUI capability.
+
+The exact provider prefix exposed to an OpenCode client can differ. For example, an internal OmniRoute route such as:
+
+```text
+oc/deepseek-v4-flash-free
+```
+
+may appear in OpenCode as:
+
+```text
+omniroute/oc/deepseek-v4-flash-free
+```
+
+**Always read the IDs from your live catalog before copying them.**
+
+Detailed audit results: [`14-verified-free-models.md`](14-verified-free-models.md).
+
+## Why we stopped keeping every discovered model
+
+Our NVIDIA direct sweep found **98 catalog entries**, but only **15 passed 3/3**, 2 passed 2/3, and 81 failed 0/3 in the same OpenCode harness.
+
+The right objective is not to collect model names. It is to keep a small set of routes that are:
+
+1. actually reachable;
+2. useful for coding/agents;
+3. sufficiently different in role/provider to add redundancy;
+4. repeatedly re-testable.
+
+## Identity and quota caveat
+
+A friendly alias is not proof of the exact physical upstream checkpoint, and two different aliases are not automatically two independent quotas.
+
+For direct NVIDIA IDs, the upstream route is explicit. For hosted aliases such as OpenCode Zen Free, we separately track:
+
+```text
+friendly alias → provider route → upstream identity (when exposed) → quota bucket
+```
+
+We have not yet published fixed RPM/TPM or safe parallel-agent counts for this pool. Those require a dedicated concurrency test rather than guessing from catalog names.
 
 ## Cloudflare-specific lesson
 
