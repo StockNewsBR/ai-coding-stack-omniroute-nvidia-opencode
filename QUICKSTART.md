@@ -2,6 +2,8 @@
 
 This is the short path. Read the linked guides before using a public or production codebase.
 
+> Latest free-model pool verification: **2026-08-16** — see [`docs/14-verified-free-models.md`](docs/14-verified-free-models.md).
+
 ## 1. Install and start OmniRoute
 
 ```bash
@@ -22,6 +24,23 @@ Recommended shape:
 3. Optional Z.AI, Cloudflare Workers AI, Groq or another provider for extra redundancy.
 
 Do not build a fallback chain where every route ultimately depends on the same upstream.
+
+### Current lab-verified priority pool
+
+The current `OmniRoute Pro Coding` pool is intentionally small:
+
+```text
+1. GLM-5.2 — NVIDIA
+2. Nemotron 3 Ultra 550B A55B — NVIDIA
+3. Inkling — NVIDIA
+4. DeepSeek V4 Flash Free — OpenCode Zen / OmniRoute
+5. MiMo-V2.5 Free — OpenCode Zen / OmniRoute
+6. Nemotron 3 Super 120B A12B — NVIDIA
+7. Nemotron 3.5 Lightning 30B A3B — NVIDIA
+8. Step 3.7 Flash — NVIDIA
+```
+
+All eight routes passed the lab smoke-test criteria used for the pool. Full IDs, caveats, notable failed routes and audit counts are in [`docs/14-verified-free-models.md`](docs/14-verified-free-models.md).
 
 ## 3. Create an OmniRoute API key
 
@@ -83,3 +102,5 @@ bash scripts/verify-opencode-session-isolation.sh
 ```
 
 A working stack is one that completes real requests, survives a provider failure, and keeps concurrent OpenCode sessions isolated.
+
+Do not infer provider rate limits or safe parallel-agent counts from the number of models that appear in `/models`. Those are separate measurements and can vary by account/provider.
