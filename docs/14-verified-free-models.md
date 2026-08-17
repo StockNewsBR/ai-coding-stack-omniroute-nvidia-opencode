@@ -1,10 +1,10 @@
-# Verified Free AI Model Pool — 2026-08-16
+# Verified Free AI Model Pool — 2026-08-17
 
 This page records the models that were **actually exercised in the lab**, not just discovered in a catalog.
 
 The goal is deliberately small: keep a short pool of strong, useful models for OpenCode/OmniRoute instead of collecting every model name a provider exposes.
 
-> Verification date: **2026-08-16**
+> Verification date: **2026-08-17**
 >
 > OpenCode version used in the runtime audit: **1.18.18**
 >
@@ -80,6 +80,26 @@ AGENTS / WORKERS
 8. Step 3.7 Flash
 ```
 
+## Practical operating fallback observed in the lab
+
+The priority pool above is the routing order. The day-to-day fallback when a leading route is quota-limited is simpler:
+
+```text
+IMPLEMENTATION
+DeepSeek V4 Flash Free
+
+INDEPENDENT REVIEW / HEAVY REASONING
+Nemotron 3 Ultra Free / Nemotron 3 Ultra 550B
+
+SECOND CODING FALLBACK
+MiMo-V2.5 Free
+
+FAST / EMERGENCY WORKER
+Nemotron 3.5 Lightning or Laguna S 2.1 Free
+```
+
+This distinction matters: a healthy free route can hit provider/account quota and return 429 without becoming a dead route. Re-test after quota reset before blacklisting it.
+
 ## OmniRoute Pro Coding order
 
 The lab combo uses `priority` routing in this order:
@@ -141,6 +161,12 @@ Passing the smoke test does not automatically earn a slot in the top pool. These
 - `poolside/laguna-xs-2.1`
 
 They remain useful reserves, but the primary pool is intentionally kept small.
+
+## Plan/account-included models are documented separately
+
+A model can be excellent without belonging in a **free-model** ranking. Models exposed through paid plans, account entitlements or bundled developer products should be documented under their tool/provider integration rather than mixed into this table.
+
+That keeps the promise of this page precise: every Top Free entry must have a verified free/free-tier route in the lab.
 
 ## Rate limits and safe agent concurrency
 
