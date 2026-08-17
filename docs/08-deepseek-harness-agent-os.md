@@ -267,7 +267,12 @@ A minimal health check:
 
 ```bash
 curl -fsS http://127.0.0.1:3080/health
-curl -fsS http://127.0.0.1:20128/v1/models >/dev/null
+if [[ -n "${OMNIROUTE_API_KEY:-}" ]]; then
+  curl -fsS http://127.0.0.1:20128/v1/models \
+    -H "Authorization: Bearer $OMNIROUTE_API_KEY" >/dev/null
+else
+  curl -fsS http://127.0.0.1:20128/v1/models >/dev/null
+fi
 ss -ltnp | grep ':3080'
 ```
 
