@@ -2,6 +2,21 @@
 
 > **Lab-validated: 2026-08-19** — Hindsight v0.9.1, self-hosted with Docker, persistent storage, multi-bank memory, safety gating, recall/retain/reflect, restart persistence and fail-safe isolation.
 
+## Public reusable implementation
+
+A sanitized, project-agnostic implementation is included in this repository:
+
+```text
+examples/hindsight-memory-gateway/
+├── README.md
+├── docker-compose.yml
+├── hindsight_client.py
+├── memory_gateway.py
+└── test_memory_gateway.py
+```
+
+It intentionally contains no product-specific names, private seed memories, proprietary architecture facts or credentials. Project banks are derived from a configurable namespace such as `{project}-core` and `{project}-canonical`.
+
 ## Why add a memory gateway?
 
 Coding agents are good at solving the task in front of them, but independent sessions and different agents repeatedly rediscover the same architecture decisions, known bugs, rejected findings and operational constraints.
