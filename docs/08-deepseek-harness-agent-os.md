@@ -1,316 +1,510 @@
 # DeepSeek Harness + OmniRoute: Agent OS field guide
 
-> Lab status: validated on 2026-08-17 with DeepSeek Harness `0.1.0-rc.7`. This is an early release: pin versions, keep rollback paths, and re-test after upgrades.
+> **Production milestone:** validated on **2026-08-19** with the StockNewsBR Agent OS stack running on Windows + WSL/Linux.
+>
+> Harness remains pinned to the tested release line (`0.1.0-rc.7` in this lab). It is still early software: keep immutable plugin pins, rollback paths, and re-test after upgrades.
 
-This guide adds a second agentic execution layer to the OpenCode + OmniRoute stack. The important idea is **not** to replace OpenCode. In our lab, OpenCode remains the primary interactive coding client while DeepSeek Harness is useful as an Agent OS/control plane for isolated workers, QA, research, audits, repeatable workflows, and controlled parallel execution.
+This guide documents the point where DeepSeek Harness stopped being only an experimental second agent surface and became a **real control plane / Agent OS** around the OpenCode + OmniRoute coding stack.
+
+OpenCode remains the primary interactive coding client. Harness adds health monitoring, scheduled audits, semantic review, plugin governance, notifications, bounded automation, safety gates, and mission generation around that workflow.
+
+## Final validated state — 2026-08-19
+
+The final closure run produced:
+
+| Check | Result |
+|---|---|
+| Harness health | ✅ HTTP 200 on `127.0.0.1:3080` |
+| OmniRoute health | ✅ HTTP 200 on `127.0.0.1:20128/v1/models` |
+| n8n health | ✅ HTTP 200 on `127.0.0.1:5678/healthz` |
+| Agent OS watch service | ✅ `active` + `enabled` |
+| Scheduler | ✅ healthy |
+| Agent OS test suite | ✅ **76/76 passed** |
+| Original regression suite | ✅ **43/43 preserved** |
+| Production plugins | ✅ **7 SHA-pinned, zero drift** |
+| Plugin Radar | ✅ integrated into the existing watch scheduler |
+| Plugin auto-install | ✅ **NEVER** |
+| Windows Agent OS notifier | ✅ AUMID + WinRT diagnostics validated |
+| Product source auto-modification | ✅ none during audits/tests |
+| Secret scan | ✅ no real secrets committed |
+
+The important detail is not the number of plugins. It is that the control plane now has a repeatable answer for **what is running, what is allowed to change, how findings are verified, how plugins are pinned, and how the operator is notified**.
+
+---
+
+## What the Agent OS actually does today
+
+It is not just a dashboard.
+
+### 1. Starts and checks the stack
+
+The local control plane monitors the services used by the coding environment, including:
+
+```text
+Harness       127.0.0.1:3080
+OmniRoute     127.0.0.1:20128
+n8n           127.0.0.1:5678
+backend       :8000
+frontend      :3000
+FCC           :8082 when that optional service is in use
+```
+
+The watch loop reports unhealthy services instead of silently assuming the stack is alive.
+
+### 2. Runs scheduled audit tiers
+
+The Agent OS has separate audit cadences for cheap deterministic checks and more expensive semantic work.
+
+The design principle is:
+
+```text
+cheap/deterministic first
+        ↓
+semantic only when useful
+        ↓
+evidence gate
+        ↓
+verification
+        ↓
+finding / mission
+```
+
+This keeps model usage bounded and makes a semantic finding prove more than "an LLM said so".
+
+### 3. Runs semantic audits through OmniRoute
+
+Harness can send semantic audit work through the same local OpenAI-compatible OmniRoute gateway used by the rest of the stack.
+
+That means the control plane can use the configured model/fallback policy without hard-coding one provider into the audit engine.
+
+A semantic candidate is not automatically treated as truth. The pipeline can attach deterministic evidence and adversarial verification before promoting important findings.
+
+### 4. Generates findings and missions
+
+The Agent OS keeps structured findings, fingerprints/deduplication, lifecycle state, and generated missions.
+
+Useful lifecycle states include:
+
+```text
+open
+resolved
+refuted
+obsolete
+```
+
+A refuted candidate should not become an active implementation mission.
+
+### 5. Protects dangerous operations
+
+The production stack includes explicit review/defense layers so the autonomous control plane does not gain unrestricted authority simply because it can call tools.
+
+Examples of behavior covered by the final tests include blocking or escalating destructive operations such as:
+
+```text
+rm -rf /
+git clean -fdx
+```
+
+while allowing normal safe commands and read-only inspection.
+
+### 6. Notifies the operator
+
+There are two separate notification responsibilities:
+
+```text
+Harness task / turn / approval events
+        ↓
+dsh-notify-windows
+        ↓
+Windows
+```
+
+and:
+
+```text
+Agent OS findings / missions / scheduler alerts / radar events
+        ↓
+snbr-agent-notify
+        ↓
+Windows
+```
+
+The Agent OS notifier uses its own AppUserModelID:
+
+```text
+StockNewsBR.AgentOS
+```
+
+The diagnostics intentionally distinguish **delivery requested/API success** from **visual banner confirmation**. Windows can accept a toast without giving the caller a reliable proof that the user physically saw the banner.
+
+### 7. Watches its own plugin supply chain
+
+The final plugin governance flow is:
+
+```text
+GitHub / Plugin Radar
+        ↓
+Plugin Gate / source review
+        ↓
+LAB profile
+        ↓
+compatibility test
+        ↓
+immutable SHA pin
+        ↓
+production
+        ↓
+drift monitoring
+```
+
+Production does **not** follow a moving `main` branch.
+
+---
+
+## Production plugin set
+
+The final validated lock contains seven production plugins, all pinned to immutable Git SHAs and checked for drift:
+
+| Plugin | Role | Final status |
+|---|---|---|
+| `dsh-plugin-gate` | plugin/supply-chain gate | ✅ production verified |
+| `dsh-notify-windows` | Harness task/turn/approval Windows notification | ✅ production verified |
+| `dsh-auto-review` | bounded approval/review layer | ✅ production verified |
+| `dsh-review` | adversarial finding verification | ✅ production verified |
+| `dsh-defend` | destructive/prompt/secret defense seam | ✅ production verified |
+| `dsh-mcp-panel` | MCP visibility with sanitization | ✅ production verified |
+| `dsh-task-notify` | additional task notification integration used by the stack | ✅ production verified |
+
+The exact SHAs belong in the machine/project lockfile, not in prose that will become stale. The operational rule is simple:
+
+```text
+installed SHA == expected locked SHA
+```
+
+If they differ, the Agent OS reports plugin drift.
+
+### Lab-only components
+
+Not every interesting plugin belongs in production.
+
+The final run deliberately left these outside the production path:
+
+| Component | Status | Reason |
+|---|---|---|
+| `dsh-workflow-isolate` | 🧪 LAB only | useful isolation experiment; not required for production closure |
+| `dsh-plugin-reducer` | 🧪 LAB/external diagnostic | useful for plugin conflict minimization; not a permanent runtime dependency |
+| `dsh-windows-notify` | 🧪 LAB only | more complex alternative; `dsh-notify-windows` won the production notifier comparison |
+
+This is intentional. A mature Agent OS should be willing to say **"interesting, but not production"**.
+
+---
+
+## Plugin Radar
+
+The Agent OS now includes a weekly plugin/release radar in the **existing** scheduler rather than creating another daemon.
+
+Validated policy:
+
+```text
+cadence: weekly
+schedule: Monday 09:00 local
+no relevant change: skip LLM
+new relevant delta: classify
+install automatically: NEVER
+```
+
+The radar can inspect Harness/plugin changes and classify candidates without silently modifying the production profile.
+
+Typical outcomes:
+
+```text
+INSTALL_CANDIDATE
+TEST_IN_LAB
+COPY_IDEA
+IGNORE
+BLOCK
+```
+
+Only meaningful events should reach the operator, such as security changes, compatibility breaks, relevant new releases, or genuinely useful install candidates.
+
+---
+
+## Adversarial review: findings must survive disagreement
+
+One of the most useful upgrades is the adversarial verification seam.
+
+Instead of:
+
+```text
+LLM finds bug → mission
+```
+
+we can use:
+
+```text
+semantic candidate
+        ↓
+deterministic evidence
+        ↓
+adversarial reviewer tries to refute it
+        ↓
+refuted ─────────────→ archive / no active mission
+        ↓
+verified
+        ↓
+dedup
+        ↓
+mission
+        ↓
+notification
+```
+
+The final suite also validates graceful degradation when the verifier is unavailable. Unavailability must not magically become `verified` and must not crash the scheduler.
+
+For high-severity findings, this substantially reduces the risk of turning LLM noise into automatic engineering work.
+
+---
+
+## Auto-review: fail closed
+
+The auto-review layer is intentionally conservative.
+
+A good starting policy is:
+
+```text
+read-only inspection      → AI review may approve
+source edits              → human boundary
+commit                    → human boundary
+push                      → human boundary
+production deployment     → human boundary
+secrets                   → never / explicit human handling
+destructive operations    → deny or require human
+```
+
+Timeouts, malformed review results, provider failures, and exceptions should fail closed instead of becoming accidental approvals.
+
+---
+
+## MCP Panel sanitization
+
+MCP observability is useful only if diagnostics do not become a secret exfiltration path.
+
+The final tests cover sanitization of:
+
+- credentials embedded in URLs;
+- query/fragment secret-like values;
+- text containing sensitive patterns;
+- arbitrary errors/objects without throwing from the sanitizer itself.
+
+A diagnostic UI should show enough to debug the MCP server while withholding tokens, passwords, Authorization values, and other credentials.
+
+---
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-    DEV[Developer] --> OC[OpenCode\nprimary coding client]
+    DEV[Developer] --> OC[OpenCode\nprimary interactive coding]
     DEV --> DSH[DeepSeek Harness\nAgent OS / control plane]
 
     OC --> OR[OmniRoute\n127.0.0.1:20128]
     DSH --> OR
 
-    OR --> PC[auto/pro-coding]
-    OR --> VIS[auto/vision]
-    OR --> CHEAP[auto/cheap]
-    OR --> GEM[oc/gemini-3.7-flash]
+    OR --> MODELS[Model/provider routes\nwith fallback]
 
-    DSH --> WEB[Web profile\nrestrictive]
-    DSH --> HEAD[Headless profile\nworker-capable]
+    DSH --> WATCH[Watch + scheduler]
+    WATCH --> AUDITS[Light / Standard / Deep / Semantic]
+    AUDITS --> EVIDENCE[Evidence gates]
+    EVIDENCE --> REVIEW[Adversarial review]
+    REVIEW --> FINDINGS[Findings + lifecycle + dedup]
+    FINDINGS --> MISSIONS[Missions]
+    MISSIONS --> NOTIFY[Windows notifications]
 
-    WEB --> GUARDS[Sandbox + approvals + Git safety]
-    HEAD --> GUARDS
+    DSH --> PG[Plugin Gate]
+    PG --> LAB[Isolated LAB]
+    LAB --> LOCK[SHA-pinned production lock]
+    LOCK --> DRIFT[Drift monitoring]
 
-    DSH --> N8N[n8n lab\noptional / isolated]
+    WATCH --> RADAR[Weekly Plugin Radar\nnever auto-installs]
 ```
 
-## What we validated
+---
 
-Our 2026-08-17 lab run completed successfully with:
+## OpenCode vs Harness
 
-| Check | Result |
-|---|---|
-| Harness health | HTTP 200 |
-| Harness bind | loopback only, `127.0.0.1:3080` |
-| OmniRoute | HTTP 200 on `127.0.0.1:20128` |
-| Harness version | `0.1.0-rc.7` |
-| Web composition | 130 entries: 103 ON, 25 OFF, 2 conditional |
-| Headless composition | 84 entries: 78 ON, 2 OFF, 4 conditional |
-| Model routes exercised by configuration gates | `auto/pro-coding`, `auto/vision`, `auto/cheap`, `oc/gemini-3.7-flash` |
-| Shell timeout used in our hardened profile | 180000 ms |
-| Optional automation lab | n8n bound to loopback only |
-| Git safety test | Agent OS commit isolated from unrelated concurrent working-tree changes |
+The production conclusion is now clearer than the original lab experiment:
 
-These numbers describe **our pinned composition**, not a universal recommended count. Plugin inventories and defaults can change between Harness releases.
+**OpenCode is still the primary interactive coding client. Harness is the autonomous control/guard layer around the project.**
 
-## Why Harness is interesting
-
-Harness exposes an unusually modular architecture: tools, UI capabilities, agent behavior, compaction, subagents, workflows, model selection and other capabilities are represented through plugins. This makes it possible to build purpose-specific presets rather than giving every agent every capability.
-
-The highest-value features for our workflow are:
-
-- custom agent presets;
-- separate web and headless compositions;
-- subagents and worker workflows;
-- trajectory/session visibility;
-- model routing through a local OpenAI-compatible gateway;
-- MCP support;
-- planning, goals and TODO tooling;
-- compaction for long sessions;
-- filesystem/shell sandboxing;
-- explicit approval boundaries;
-- reusable skills and agent instructions;
-- Creator Mode for experimenting with custom presets/plugins.
-
-## Do not enable every plugin
-
-A large plugin list is tempting. Resist the temptation to turn everything on.
-
-A plugin may be disabled because it is:
-
-1. a lower-level implementation hidden behind a safer wrapper;
-2. mutually exclusive with another composition;
-3. intended only for headless execution;
-4. redundant with another tool;
-5. unsafe for an interactive/web agent;
-6. platform-specific;
-7. conditional at runtime.
-
-Our rule is **capability by role**, not "maximum number of green switches".
-
-### Web profile
-
-Use the web profile for interactive work. Keep it restrictive:
-
-- workspace-scoped filesystem access;
-- sandboxed shell;
-- approval gates for sensitive actions;
-- Git mutation protection;
-- no secret stores exposed to prompts;
-- only the tools needed by the preset.
-
-### Headless profile
-
-Use headless for trusted automation/workers. It can expose more worker/workflow capabilities, but should still have:
-
-- explicit workspace roots;
-- timeouts;
-- bounded parallelism;
-- logging;
-- secret isolation;
-- Git guards;
-- narrow task contracts.
-
-## Model routing through OmniRoute
-
-Instead of hard-coding one provider into every Harness preset, we point Harness at OmniRoute's local OpenAI-compatible endpoint.
-
-A practical catalog from our current lab is:
+A useful division of labor is:
 
 ```text
-auto/pro-coding   -> heavyweight coding/reasoning route
-auto/vision       -> multimodal/vision route
-auto/cheap        -> inexpensive utility route
-oc/gemini-3.7-flash -> explicit fallback/alternative route
+OpenCode
+→ interactive implementation
+→ developer-driven sessions
+→ Sisyphus/agent orchestration
+
+Harness / Agent OS
+→ health and watch loops
+→ scheduled audits
+→ semantic verification
+→ plugin governance
+→ drift detection
+→ findings/missions
+→ notifications
+→ bounded autonomous workers
 ```
 
-The exact provider behind an `auto/*` route may change according to the OmniRoute combo. That is the point: the client gets a stable model ID while the gateway owns provider fallback and routing policy.
+They complement each other rather than compete for the same role.
 
-Do not assume a model works just because `/v1/models` lists it. Always run a real completion smoke test.
+---
 
-## Safe concurrency with OpenCode
+## Autostart / persistent operation
 
-Running Harness and OpenCode against the same repository is powerful, but this is where mistakes become expensive.
+The stack is intended to survive normal workstation restarts without requiring the developer to remember a long boot sequence.
 
-**Safe pattern:**
+The lab uses a Windows logon bootstrap into WSL plus a user service as the persistent scheduler/control loop.
 
-```text
-OpenCode session A -> implementation area A
-Harness worker B   -> read-only audit / QA / isolated area B
-Harness worker C   -> research / report / tests that do not rewrite A
-```
+The operational rule is **one scheduler source of truth**. Do not create a second overlapping timer just because a new automation feature is added.
 
-**Unsafe pattern:** two agents editing the same files at the same time without coordination.
-
-Before a worker writes:
-
-1. capture `git status --short`;
-2. capture current HEAD;
-3. record pre-existing modified/untracked paths;
-4. forbid reset/clean/restore of unrelated work;
-5. stage explicit paths only;
-6. inspect `git diff --cached`;
-7. scan staged content for secrets;
-8. commit only files owned by that mission.
-
-Avoid `git add .` and `git add -A` in a dirty shared working tree.
-
-In our validation, the Agent OS commit was created while unrelated tracked and untracked work already existed. The mission staged only its own directory; the pre-existing work remained intact after the commit. This is exactly the behavior a multi-agent environment needs.
-
-## Secrets
-
-Keep provider credentials outside the repository. A useful pattern is:
-
-```text
-repo/                    -> presets, policies, public configuration templates
-~/.config or ~/.dsh/     -> local credentials / machine-specific state
-.env.local               -> local application secrets when appropriate
-```
-
-Never copy real API keys into agent instructions, screenshots, example configs or committed YAML.
-
-Before committing an Agent OS change, scan for at least:
-
-```text
-api_key
-apikey
-token
-password
-cookie
-authorization
-private key
-.env
-sk-
-```
-
-Treat matches as leads, not automatic vulnerabilities: strings such as `ask-user` can produce harmless `sk-` substrings.
-
-## Network exposure
-
-For a workstation deployment, bind the control-plane services to loopback unless remote access is intentionally designed and authenticated:
-
-```text
-Harness:   127.0.0.1:3080
-OmniRoute: 127.0.0.1:20128
-n8n lab:   127.0.0.1:5678
-```
-
-Check with:
-
-```bash
-ss -ltnp | grep -E ':(3080|20128|5678)'
-```
-
-Do not expose a development Harness or automation dashboard directly to the public Internet just because it works locally.
-
-## Agent OS layout
-
-We found it useful to keep the reproducible, non-secret part of the Agent OS inside version control:
-
-```text
-agent-os/
-├── README.md
-├── docs/
-├── preset/
-├── plugins/
-├── qa/
-└── content-sandbox/
-```
-
-Machine credentials, generated session state and backups stay outside Git.
-
-This separation gives you reproducibility without publishing your keys or machine state.
-
-## Workers: start narrow
-
-Do not begin with fifteen autonomous agents that all have shell, Git and production access. Start with narrow contracts:
-
-| Worker | Initial permission |
-|---|---|
-| QA | read + browser/test output; limited writes to QA artifacts |
-| Security | read-only scan first; fixes require explicit approval |
-| Dependency/release watcher | read + network; no product writes |
-| Documentation | docs-only writes |
-| Content/marketing lab | sandbox directory only; no automatic publishing initially |
-| Production monitor | telemetry/read-only; no deployment permission |
-
-Promote a worker only after its behavior is repeatable and observable.
-
-## n8n: useful, but isolate it
-
-n8n can complement Harness for deterministic schedules and external integrations. We run it as an isolated local lab rather than making it the brain of the coding system.
-
-Good division of labor:
-
-```text
-Harness -> reasoning, coding, QA, agent workflows
-n8n     -> schedules, webhooks, deterministic integration chains
-OmniRoute -> model/provider routing
-OpenCode -> primary interactive implementation
-```
-
-For social publishing, payments, credentials or production changes, use approval gates until the workflow has been exercised safely. Automation should not turn an LLM mistake into an automatically published or financially consequential action.
-
-## Creator Mode
-
-Creator Mode is best treated as a development environment for presets/plugins, not as a reason to dynamically rewrite your production agent every session.
-
-Recommended flow:
-
-```text
-Creator experiment
-  -> inspect generated composition
-  -> remove unnecessary capabilities
-  -> test in sandbox
-  -> dump effective config
-  -> version the safe preset
-  -> promote to normal use
-```
+---
 
 ## Operational checks
 
-A minimal health check:
+Useful commands:
+
+```bash
+snbr-agent-status
+snbr-harness-check
+snbr-agent-findings --open
+snbr-agent-missions --latest
+snbr-agent-notify --diagnose
+```
+
+Service checks:
+
+```bash
+systemctl --user is-active snbr-agent-watch.service
+systemctl --user is-enabled snbr-agent-watch.service
+```
+
+Harness / OmniRoute checks:
 
 ```bash
 curl -fsS http://127.0.0.1:3080/health
+
 if [[ -n "${OMNIROUTE_API_KEY:-}" ]]; then
   curl -fsS http://127.0.0.1:20128/v1/models \
     -H "Authorization: Bearer $OMNIROUTE_API_KEY" >/dev/null
 else
   curl -fsS http://127.0.0.1:20128/v1/models >/dev/null
 fi
-ss -ltnp | grep ':3080'
 ```
 
-Dump the effective configuration after every material change and compare it with the previous known-good dump. The effective composition matters more than what the settings UI appears to show.
+After any plugin/profile change, dump the effective Harness config and compare it with the previous known-good state.
 
-## OpenCode vs Harness
+---
 
-Our current conclusion is deliberately conservative:
+## Git safety in a dirty multi-agent repository
 
-**OpenCode remains the main coding client. Harness is an additional control plane, not a mandatory replacement.**
+Running Harness and OpenCode against the same repository is powerful, but two agents editing the same files without coordination is not safe.
 
-Harness becomes especially interesting when you need role-specific presets, transparent agent workflows, multiple bounded workers, reusable Agent OS configuration, or a second execution surface sharing the same OmniRoute gateway.
+Before any controlled write mission:
 
-We have validated the architecture and safety controls, but we have **not yet published a controlled quality/cost benchmark claiming Harness beats OpenCode**. That comparison should be based on identical repository tasks, models, acceptance tests and measured token/time/cost data.
+1. capture `git status --short`;
+2. capture current HEAD;
+3. record pre-existing modified/untracked paths;
+4. never reset/clean/restore unrelated work;
+5. stage explicit paths only;
+6. inspect `git diff --cached`;
+7. scan staged content for secrets;
+8. commit only files owned by that mission.
+
+Avoid:
+
+```text
+git add .
+git add -A
+git reset --hard
+git clean -fdx
+```
+
+unless a human explicitly intends the destructive effect and the repository state is known.
+
+Our final closure was performed while unrelated product work existed in the same working tree; the Agent OS commits staged only their own files and preserved the unrelated work.
+
+---
+
+## Secrets and local state
+
+Keep credentials outside version control.
+
+A useful separation is:
+
+```text
+repo/                    → reproducible policy/config/docs
+~/.config / ~/.dsh/      → machine credentials / local runtime config
+agent-os/runtime/        → generated runtime state, logs, findings, missions
+.env.local               → local app secrets when appropriate
+```
+
+Never copy real provider keys into prompts, screenshots, test fixtures, Markdown examples, or committed YAML.
+
+---
+
+## What is intentionally NOT autonomous yet
+
+The final production milestone does **not** mean "the AI may now do anything it wants".
+
+Important boundaries remain:
+
+- no automatic plugin installation from Plugin Radar;
+- no automatic push/deployment merely because a finding exists;
+- no unrestricted destructive Git/shell operations;
+- `dsh-workflow-isolate` and `dsh-plugin-reducer` remain LAB-only;
+- external finding sources such as Jules are **not yet a fully automatic end-to-end ingestion pipeline** in this setup.
+
+That last gap is useful to state explicitly. The current Agent OS can find, classify, verify, persist, deduplicate, create missions, and notify from its own audit pipeline, but third-party sources still need a dedicated ingestion contract before they can safely feed the same lifecycle automatically.
+
+---
 
 ## Recommended adoption order
 
+For another developer reproducing this setup:
+
 ```text
-1. Install/pin Harness
-2. Bind it to loopback
+1. Pin Harness
+2. Bind control-plane services to loopback
 3. Connect OmniRoute
-4. Create a restrictive interactive preset
-5. Verify effective plugin composition
-6. Add Git/secret/workspace guards
-7. Run read-only missions
-8. Run QA/browser missions
-9. Add narrow headless workers
-10. Benchmark against your existing coding workflow
-11. Only then automate higher-impact actions
+4. Create restrictive profiles
+5. Add Git/workspace/secret guards
+6. Add a persistent watch service
+7. Add cheap deterministic audits
+8. Add semantic audits with evidence gates
+9. Add findings + lifecycle + dedup
+10. Add notifications
+11. Add plugin lock + drift detection
+12. Add Plugin Gate and LAB promotion flow
+13. Add adversarial review
+14. Add weekly Plugin Radar with auto-install disabled
+15. Only then consider higher-impact autonomous workers
 ```
+
+---
 
 ## Final rule
 
-A good Agent OS is not the one with the most plugins, models or autonomous workers. It is the one where you can answer four questions at any time:
+A useful Agent OS is not the one with the most models, agents, or green plugin switches.
+
+It is the one where you can answer, at any moment:
 
 - Which model is running?
 - Which tools can this agent use?
 - Which files/services can it change?
-- How do I prove what it did?
+- Which plugins are actually pinned?
+- What evidence supports this finding?
+- What happens if the reviewer/provider is unavailable?
+- How will the operator know something happened?
+- How do I prove the system did not touch unrelated work?
 
-If those answers are clear, Harness can be a very useful layer in a modern AI coding stack.
+At the 2026-08-19 milestone, the StockNewsBR lab can answer those questions with a working Harness-based Agent OS rather than only a design diagram.
