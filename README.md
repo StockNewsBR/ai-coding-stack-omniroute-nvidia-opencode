@@ -8,9 +8,39 @@
   <a href="README.ru.md">🇷🇺 Русский</a>
 </p>
 
+## 🔥 DeepSeek Harness Agent OS — Production validated
+
+> **NEW — 2026-08-19:** the DeepSeek Harness layer in this stack is no longer just an experiment. It is now running as a **production-validated Agent OS / control plane** around OpenCode + OmniRoute.
+
+**Final closure evidence:** **76/76 Agent OS tests passed**, the original **43/43 regression tests remained green**, the watch service is **active + enabled**, and **7 production Harness plugins are pinned by immutable SHA with zero drift**.
+
+Today the Agent OS can:
+
+- monitor Harness, OmniRoute, n8n and the local product stack;
+- run scheduled light / standard / deep / semantic audits;
+- gate semantic findings with deterministic evidence and adversarial review;
+- persist findings, deduplicate them and generate missions;
+- protect dangerous actions with fail-closed review/defense gates;
+- notify the operator on Windows for Agent OS and Harness events;
+- govern plugin supply chain with LAB testing, immutable SHA pins and drift detection;
+- run a weekly **Plugin Radar** that detects relevant ecosystem changes without silently installing anything (**auto-install = NEVER**).
+
+```text
+OpenCode                → interactive implementation
+OmniRoute               → provider/model routing + fallbacks
+DeepSeek Harness/Agent OS → watch + audits + review + findings + missions + notifications + plugin governance
+```
+
+📘 **Full final guide:** [DeepSeek Harness + OmniRoute — Agent OS](docs/08-deepseek-harness-agent-os.md)  
+🇧🇷 **Guia completo em português:** [DeepSeek Harness + OmniRoute — Agent OS PT-BR](docs/08-deepseek-harness-agent-os.pt-BR.md)
+
+> The design stays deliberately controlled: Plugin Radar never auto-installs, destructive operations do not receive unrestricted approval, `dsh-workflow-isolate` / `dsh-plugin-reducer` remain LAB-only, and external finding sources such as Jules are not yet wired into a fully automatic end-to-end ingestion pipeline.
+
+---
+
 > A practical, battle-tested setup for running a powerful AI coding environment with **OpenCode as the main coding platform**, **OmniRoute as the local AI gateway**, **free or free-tier models as fallbacks**, and **NVIDIA NIM** for heavyweight models such as **GLM-5.2** and **Nemotron 3 Ultra**.
 >
-> Last verified: **2026-08-12** during the OmniRoute **v3.8.49 → v3.8.50** release window.
+> Last verified: **2026-08-19** — Harness Agent OS production closure + OmniRoute/NVIDIA/OpenCode stack.
 
 ![OmniRoute dashboard](assets/screenshots/omniroute-home-final.jpg)
 
