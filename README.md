@@ -8,9 +8,35 @@
   <a href="README.ru.md">🇷🇺 Русский</a>
 </p>
 
-## 🔥 DeepSeek Harness Agent OS — Production validated
+## 🔥 August 20 stack update — Hermes + Harness + Hindsight + OMO
 
-> **NEW — 2026-08-19:** the DeepSeek Harness layer in this stack is no longer just an experiment. It is now running as a **production-validated Agent OS / control plane** around OpenCode + OmniRoute.
+> **NEW — 2026-08-20:** the lab stack now includes a validated **Hermes Agent operator/audit layer**, the production-validated **DeepSeek Harness Agent OS**, governed **Hindsight cross-agent memory**, and an updated **Oh My OpenAgent model-routing profile** designed to avoid concentrating every concurrent agent on the same OmniRoute combo.
+
+The current architecture is deliberately layered:
+
+```text
+OpenCode + Oh My OpenAgent → interactive implementation + multi-agent orchestration
+OmniRoute                  → provider/model routing + fallbacks
+Graphify/Serena/Ponytail   → code understanding + context discipline + small diffs
+Hindsight                  → governed shared memory across agents/tools
+DeepSeek Harness Agent OS  → watch + audits + findings + missions + plugin governance
+Hermes Agent               → independent read-only audits + terminal/web/memory/subagents
+```
+
+### What changed on 2026-08-20
+
+- **Hermes Agent** was added as an optional independent operator/auditor and validated with a real read-only repository mission, terminal/web/memory usage, subagent delegation and browser tooling checks.
+- **OMO agent routing** was split across `Pro Coding`, `Coding`, `Coding Cheap` and `Best Coding Fast` classes instead of putting every agent on one shared `best-coding` route.
+- **DeepSeek V4 Flash Free** and **Nemotron 3.5 Lightning 30B A3B** continued to work in real coding-agent use; quota/concurrency failures are tracked separately from model-health failures.
+- **Graphify + Ponytail + OpenCode/Gemini integration health** is treated as infrastructure that should be checked continuously rather than assumed healthy forever.
+- The previously validated **Harness Agent OS + Hindsight memory gateway** remain part of the production-oriented control/memory layer.
+
+📘 **Hermes operator layer:** [docs/15-hermes-agent-operator-layer.md](docs/15-hermes-agent-operator-layer.md)  
+📘 **Harness Agent OS:** [docs/08-deepseek-harness-agent-os.md](docs/08-deepseek-harness-agent-os.md)  
+🇧🇷 **Harness guide PT-BR:** [docs/08-deepseek-harness-agent-os.pt-BR.md](docs/08-deepseek-harness-agent-os.pt-BR.md)  
+🧠 **Current free-model shortlist:** [BEST_FREE_AI_MODELS.md](BEST_FREE_AI_MODELS.md)
+
+### DeepSeek Harness Agent OS — production validation remains green
 
 **Final closure evidence:** **76/76 Agent OS tests passed**, the original **43/43 regression tests remained green**, the watch service is **active + enabled**, and **7 production Harness plugins are pinned by immutable SHA with zero drift**.
 
@@ -25,22 +51,13 @@ Today the Agent OS can:
 - govern plugin supply chain with LAB testing, immutable SHA pins and drift detection;
 - run a weekly **Plugin Radar** that detects relevant ecosystem changes without silently installing anything (**auto-install = NEVER**).
 
-```text
-OpenCode                → interactive implementation
-OmniRoute               → provider/model routing + fallbacks
-DeepSeek Harness/Agent OS → watch + audits + review + findings + missions + notifications + plugin governance
-```
-
-📘 **Full final guide:** [DeepSeek Harness + OmniRoute — Agent OS](docs/08-deepseek-harness-agent-os.md)  
-🇧🇷 **Guia completo em português:** [DeepSeek Harness + OmniRoute — Agent OS PT-BR](docs/08-deepseek-harness-agent-os.pt-BR.md)
-
 > The design stays deliberately controlled: Plugin Radar never auto-installs, destructive operations do not receive unrestricted approval, `dsh-workflow-isolate` / `dsh-plugin-reducer` remain LAB-only, and external finding sources such as Jules are not yet wired into a fully automatic end-to-end ingestion pipeline.
 
 ---
 
 > A practical, battle-tested setup for running a powerful AI coding environment with **OpenCode as the main coding platform**, **OmniRoute as the local AI gateway**, **free or free-tier models as fallbacks**, and **NVIDIA NIM** for heavyweight models such as **GLM-5.2** and **Nemotron 3 Ultra**.
 >
-> Last verified: **2026-08-19** — Harness Agent OS production closure + OmniRoute/NVIDIA/OpenCode stack.
+> Last verified: **2026-08-20** — Hermes operator layer + OMO routing refresh + free-model revalidation, on top of the Harness/Hindsight/OmniRoute/NVIDIA/OpenCode stack.
 
 ![OmniRoute dashboard](assets/screenshots/omniroute-home-final.jpg)
 
@@ -74,6 +91,8 @@ This is **not** a benchmark lab pretending every provider is always stable. It i
 | OmniRoute dashboard/API | `127.0.0.1:20128` / `/v1` |
 | Main coding client | OpenCode |
 | Orchestration | Oh My OpenAgent / Sisyphus Ultraworker |
+| Shared memory | Hindsight governed memory gateway |
+| Control / audit layer | DeepSeek Harness Agent OS + optional Hermes Agent |
 | Optional Claude compatibility | Free Claude Code on `127.0.0.1:8082` |
 
 The architecture does **not** require a local NVIDIA GPU. NVIDIA NIM in this guide is a hosted API provider; your local hardware mainly affects your editor/build/test workloads, not NVIDIA-hosted inference.
@@ -100,6 +119,9 @@ flowchart LR
     NV --> NS[Nemotron 3 Super]
 
     OC --> TOOLS[Graphify + Ponytail + Serena + Playwright + Quality/Security Skills]
+    OMO --> MEM[Hindsight\nGoverned shared memory]
+    OC --> HAR[DeepSeek Harness\nAgent OS / control plane]
+    OC --> HER[Hermes Agent\nIndependent audit/operator]
 
     CC[Claude Code] --> FCC[Free Claude Code\nlocalhost:8082]
     FCC --> NV
@@ -1207,6 +1229,7 @@ See [docs/09-security.md](docs/09-security.md).
 .
 ├── README.md
 ├── QUICKSTART.md
+├── BEST_FREE_AI_MODELS.md
 ├── docs/
 │   ├── 01-architecture.md
 │   ├── 02-omniroute.md
@@ -1215,12 +1238,16 @@ See [docs/09-security.md](docs/09-security.md).
 │   ├── 05-omo-agents.md
 │   ├── 06-tools-and-plugins.md
 │   ├── 07-fcc-nvidia.md
+│   ├── 08-deepseek-harness-agent-os.md
+│   ├── 08-deepseek-harness-agent-os.pt-BR.md
 │   ├── 08-troubleshooting.md
 │   ├── 09-security.md
 │   ├── 10-sources.md
 │   ├── 11-audit-recipes.md
 │   ├── 12-claude-code-field-guide.md
-│   └── 13-opencode-session-isolation.md
+│   ├── 13-opencode-session-isolation.md
+│   ├── 14-verified-free-models.md
+│   └── 15-hermes-agent-operator-layer.md
 ├── examples/
 │   ├── opencode.omniroute.example.json
 │   ├── opencode.mcp-tools.example.jsonc
@@ -1247,6 +1274,8 @@ If you only copy one configuration philosophy from this repository, use this:
 OpenCode
   + Oh My OpenAgent / Sisyphus
   + Graphify / Serena / Ponytail
+  + Hindsight shared memory
+  + optional Harness/Hermes audit layers
   ↓
 OmniRoute
   1. GLM-5.2 via NVIDIA NIM
@@ -1256,7 +1285,7 @@ OmniRoute
   5. OmniRoute free auto fallback
 ```
 
-That gives you a strong mix of **quality, speed, redundancy and low cost** without forcing every task through the same model.
+That gives you a strong mix of **quality, speed, redundancy, memory, independent verification and low cost** without forcing every task through the same model.
 
 ---
 
