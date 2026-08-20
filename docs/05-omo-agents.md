@@ -83,3 +83,47 @@ Do not hard-code one expensive model for every agent. A practical pattern is:
 - planner/reviewer: enough reasoning to catch architecture gaps, but not necessarily the same provider as the executor.
 
 In our free-heavy stack, GLM-5.2 and Nemotron were high-value heavyweight routes while DeepSeek V4 Flash Free was useful for fast implementation/search work.
+
+## 2026-08-20 lab profile: distribute agents across routing pools
+
+A practical improvement was to stop pointing every OMO role at the same heavyweight combo. In our project profile we grouped agents by workload class instead:
+
+| OMO agent | Lab routing class |
+|---|---|
+| Artistry | Pro Coding |
+| Atlas | Coding |
+| Deep | Coding Cheap |
+| Explore | Best Coding Fast |
+| Hephaestus | Pro Coding |
+| Librarian | Coding |
+| Metis | Coding Cheap |
+| Momus | Best Coding Fast |
+| Multimodal Looker | Pro Coding |
+| Oracle | Coding |
+| Prometheus | Coding Cheap |
+| Quick | Best Coding Fast |
+
+This is a **lab profile**, not an upstream OMO default. The useful principle is the workload split:
+
+```text
+Pro Coding       → expensive/deep implementation and multimodal work
+Coding           → normal execution, research and independent reasoning
+Coding Cheap     → planning/critique where throughput matters
+Best Coding Fast → fast discovery, quick checks and lightweight review
+```
+
+### Why we stopped putting every agent on `auto/best-coding`
+
+On 2026-08-20 we observed that one OpenCode chat could be healthy on the `best-coding` route while another concurrent chat failed or stalled until it was moved to a direct **DeepSeek V4 Flash Free** route.
+
+That does **not** prove a universal one-chat limit for OmniRoute. It does prove a more useful operational rule: **do not infer parallel-agent capacity from the fact that a combo works in one session**.
+
+When several agents run at once:
+
+- spread roles across routing pools or independent providers;
+- keep a direct fast route such as DeepSeek V4 Flash Free available;
+- distinguish provider quota/rate-limit failures from a dead model;
+- test concurrency separately from single-request correctness;
+- avoid sending every sub-agent through the same combo if the provider bucket is shared.
+
+This became especially important with Sisyphus delegation: adding sub-agents can increase throughput only when the provider/routing layer has enough independent capacity behind them.
