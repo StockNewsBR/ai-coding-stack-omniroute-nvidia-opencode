@@ -1,4 +1,12 @@
-import { handleSearch } from "@omniroute/open-sse/handlers/search.ts";
+import { handleSearch, type SearchResult } from "@omniroute/open-sse/handlers/search.ts";
+import {
+  FREE_ONLY_SEARCH_SELECTOR,
+  FREE_SEARCH_BREAKER_PREFIX,
+  NO_FREE_SEARCH_PROVIDER_AVAILABLE,
+  buildFreeSearchChain,
+  runFreeSearchChain,
+} from "@omniroute/open-sse/services/searchFreeRouting.ts";
+import { getCircuitBreaker } from "@/shared/utils/circuitBreaker";
 import {
   getProviderCredentialsWithQuotaPreflight,
   extractApiKey,
@@ -141,6 +149,129 @@ async function postHandler(request: Request, context: unknown) {
 
   const settings = await getSettings().catch(() => ({}) as any);
   const blockedProviders = settings?.blockedProviders || [];
+
+  // FREE_ONLY search routing — `auto/search:free` can only ever reach providers
+  // classified FREE_VERIFIED or SELF_HOSTED; the bounded chain below never
+  // escalates to a paid/credit-backed/unknown-cost provider.
+  if (body.provider === FREE_ONLY_SEARCH_SELECTOR) {
+    const freeChain = buildFreeSearchChain(Object.values(SEARCH_PROVIDERS), {
+      searchType: body.search_type,
+      isBlocked: (providerId) => isProviderBlockedByIdOrAlias(providerId, blockedProviders),
+    });
+    const firstFree = freeChain[0];
+    if (!firstFree) {
+      return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, NO_FREE_SEARCH_PROVIDER_AVAILABLE);
+    }
+
+    const requestedMax = body.max_results ?? firstFree.config.defaultMaxResults;
+    const freeCacheKey = computeCacheKey(
+      body.query,
+      FREE_ONLY_SEARCH_SELECTOR,
+      body.search_type,
+      Math.min(requestedMax, firstFree.config.maxMaxResults),
+      body.country,
+      body.language,
+      {
+        filters: body.filters,
+        offset: body.offset,
+        time_range: body.time_range,
+        content: body.content,
+        provider_options: body.provider_options,
+      }
+    );
+    const freeTtl = firstFree.config.cacheTTLMs ?? SEARCH_CACHE_DEFAULT_TTL_MS;
+
+    let freeCached = true;
+    try {
+      const freeData = await getOrCoalesce(freeCacheKey, freeTtl, async () => {
+        freeCached = false;
+        const outcome = await runFreeSearchChain(freeChain, {
+          executeLeg: async (entry) => {
+            const legCredentials = await resolveSearchExecutionCredentials(entry.config);
+            if (!legCredentials) {
+              return { kind: "skipped", reason: "no-credentials" };
+            }
+            if (isAllRateLimitedCredentials(legCredentials)) {
+              return { kind: "skipped", reason: "rate-limited" };
+            }
+            const breaker = getCircuitBreaker(`${FREE_SEARCH_BREAKER_PREFIX}${entry.config.id}`, {
+              failureThreshold: 3,
+              resetTimeout: 30_000,
+            });
+            if (!breaker.canExecute()) {
+              return { kind: "skipped", reason: "circuit-open" };
+            }
+
+            const legResult = await handleSearch({
+              query: body.query,
+              provider: entry.config.id,
+              maxResults: Math.min(requestedMax, entry.config.maxMaxResults),
+              searchType: body.search_type,
+              country: body.country,
+              language: body.language,
+              timeRange: body.time_range,
+              offset: body.offset,
+              domainFilter: buildDomainFilter(body.filters),
+              contentOptions: body.content,
+              strictFilters: body.strict_filters,
+              providerOptions: body.provider_options,
+              credentials: legCredentials,
+              log,
+              connectionId: legCredentials.connectionId || undefined,
+              apiKeyId: policy.apiKeyInfo?.id || undefined,
+            });
+            if (!legResult.success) {
+              return {
+                kind: "failed",
+                error: legResult.error || "Search failed",
+                status: legResult.status,
+              };
+            }
+            const legResults = (legResult.data as { results?: unknown[] } | undefined)?.results;
+            if (!Array.isArray(legResults) || legResults.length === 0) {
+              return { kind: "empty" };
+            }
+            return { kind: "ok", data: legResult.data as { results?: SearchResult[] } };
+          },
+        });
+
+        if (!outcome.ok) {
+          throw new SearchError(
+            NO_FREE_SEARCH_PROVIDER_AVAILABLE,
+            outcome.allRateLimited ? HTTP_STATUS.TOO_MANY_REQUESTS : HTTP_STATUS.SERVICE_UNAVAILABLE
+          );
+        }
+        return outcome.data;
+      });
+
+      const response = {
+        id: `search-${crypto.randomUUID()}`,
+        ...freeData,
+        cached: freeCached,
+        usage: freeCached ? { queries_used: 0, search_cost_usd: 0 } : freeData.usage,
+      };
+
+      return new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+      });
+    } catch (err: unknown) {
+      if (err instanceof SearchError) {
+        const errorPayload = toJsonErrorPayload(err.message, "Search provider error");
+        return new Response(JSON.stringify(errorPayload), {
+          status: err.statusCode,
+          headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+        });
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      log.error("SEARCH", `Unexpected free-search error: ${message}`);
+      const errorPayload = toJsonErrorPayload(message, "Internal search error");
+      return new Response(JSON.stringify(errorPayload), {
+        status: 500,
+        headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+      });
+    }
+  }
 
   // Resolve provider and credentials
   if (body.provider) {
