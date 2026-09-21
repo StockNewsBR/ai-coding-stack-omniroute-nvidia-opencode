@@ -1,0 +1,202 @@
+# OmniRoute — Final Free Autopilot: R1 Reconstruction (strict dynamic FREE_ONLY)
+
+Mission: `OMNIROUTE_FREE_AUTOPILOT_FINAL_RECONSTRUCTION_R1_11_R4_LIVE_CLOSURE_2026_09_21`
+Phase: 2 — R1 reconstruction (isolated candidate; **not promoted, not deployed**)
+Date: 2026-09-21
+Workspace: `/home/dcima/omniroute-final-free-autopilot-20260921`
+Branch: `final/free-autopilot-2026-09-21`
+
+| Field                  | Value                                                                     |
+| ---------------------- | ------------------------------------------------------------------------- |
+| `UPSTREAM_BASE_SHA`    | `dea6bb8b6b64d3a3d9f639a044625c3452442c56`                                |
+| `BASE_TREE`            | `cc1a406d4cb75ace2ca726880ec0975af5a812e6`                                |
+| `R1_CANDIDATE_SHA`     | `864ddc1d57871827ab2be3a9235bab5f8c12bc48`                                |
+| `R1_CANDIDATE_TREE`    | `7a7d000577237a9f8203bcf1dd0c802be36e28f8`                                |
+| Commit                 | `864ddc1d5 feat(omniroute): reconstruct strict dynamic FREE_ONLY routing` |
+| Working tree at commit | clean (`git status --short` empty)                                        |
+
+This report is written after the R1 candidate commit. It is evidence, not a build input: nothing
+here changes the candidate tree, and its own presence is not part of `R1_CANDIDATE_TREE`.
+
+---
+
+## 1. Result
+
+```
+R1_RECONSTRUCTED=PASS (isolated candidate; production policy unchanged)
+FREE_ONLY_ADMISSION=FREE_VERIFIED+SELF_HOSTED_ONLY
+NO_STATIC_FREE_PROVIDER_ALLOWLIST=YES
+NO_PAID_FALLBACK=YES
+EXPLICIT_AND_PINNED_PATH=UNCHANGED
+PAID_SPEND_TRIGGERED_BY_R1=NO
+```
+
+AUTO FREE admission is now a pure, evidence-driven classification of every discovered
+provider/model, evaluated inside the existing strict zero-cost filter. There is no curated
+"4 providers" list, no NVIDIA+Zen-only list and no OpenRouter+NVIDIA-only list: any provider that
+can _prove_ it cannot bill is eligible; every provider that cannot prove it is excluded.
+
+## 2. Files changed
+
+| File                                                              | Change                                                                                 |
+| ----------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `open-sse/services/autoCombo/freeProviderSentinel.ts`             | **new** (+358) — cost-class vocabulary, classifier, eligibility projector              |
+| `open-sse/services/autoCombo/strictZeroCostFilter.ts`             | 111 changed — admission delegated to the sentinel; exports/signatures unchanged        |
+| `open-sse/services/autoCombo/freeAccessQuota.ts`                  | +27 — `readFreeAccessStateCached()` (cache-only, never triggers a fetch)               |
+| `open-sse/handlers/autoComboCandidates.ts`                        | +104 — read-only projection of cost class / eligibility / reason / cached quota status |
+| `tests/unit/autoCombo/free-provider-sentinel-r1.test.ts`          | **new** (+366) — policy matrix                                                         |
+| `tests/unit/autoCombo/strict-zero-cost-connection-safety.test.ts` | +120 — rewritten to the new contract                                                   |
+| `tests/unit/autoCombo/strict-zero-cost-filter.test.ts`            | +43 — 3 assertions rewritten + 1 compensating test                                     |
+
+Total: 7 files, 1006 insertions, 123 deletions.
+
+Deliberately **not** touched: `open-sse/services/autoCombo/virtualFactory.ts` (its
+`filterStrictZeroCostCandidates` call was already the single extension point), `open-sse/config/*`
+(catalog data unchanged), `src/lib/quota/*`, the provider registry, the circuit breaker, and every
+OpenCode/Hermes/Harness surface.
+
+## 3. Cost classes and admission rule
+
+`classifyFreeCost(candidate, entry?)` derives one class from evidence only — never from a
+provider's name or reputation:
+
+| Class           | Evidence                                                                                                                                                                                                                                                      | AUTO FREE                           |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
+| `SELF_HOSTED`   | provider is a native self-hosted/local id (`isSelfHostedChatProvider` / `isLocalProvider`)                                                                                                                                                                    | **ALLOW** (no cloud quota possible) |
+| `FREE_VERIFIED` | `freeType: "keyless"` reached through the genuine no-auth connection, **or** a `recurring-daily/monthly/uncapped` entry with `hardStopGuaranteed: true` (curated, source-cited provider terms: exceeding the allowance is refused/rate-limited, never billed) | **ALLOW**                           |
+| `FREE_UNKNOWN`  | recurring free tier without a hard-stop proof; keyless metadata reached through a real credentialed connection; no-auth connection with non-keyless metadata                                                                                                  | DENY                                |
+| `CREDIT_BACKED` | `one-time-initial` (signup/trial/AWS-style credits), `recurring-credit` (monthly credit grants)                                                                                                                                                               | DENY                                |
+| `NULL_COST`     | candidate with an explicitly null cost                                                                                                                                                                                                                        | DENY                                |
+| `UNKNOWN_COST`  | no catalog entry and no positive cost evidence (an uncatalogued zero price is _not_ evidence)                                                                                                                                                                 | DENY                                |
+| `PAID`          | known positive cost, no free entitlement                                                                                                                                                                                                                      | DENY                                |
+| `DISCONTINUED`  | entry withdrawn                                                                                                                                                                                                                                               | DENY                                |
+
+`AUTO_FREE_ALLOWED_COST_CLASSES` is exactly `{FREE_VERIFIED, SELF_HOSTED}` — asserted by test, so a
+future class can never be admitted silently.
+
+## 4. Quota telemetry: optimization, not gate (mission "strict policy design review")
+
+The previous strict policy required, for every non-keyless free candidate, a **fresh `SAFE` usage
+reading for the exact connection**. The R5 audit found `provider_quota_state` rows = 0, i.e. the
+policy would fail closed for routes that simply cannot be charged — the failure mode the mission
+forbids.
+
+Reconstructed semantics:
+
+| Telemetry for the connection                 | Result                                                                                                                           |
+| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| absent / stale / `UNKNOWN`                   | **kept** for a provably hard-free route (evidence: self-hosted, keyless no-auth endpoint, or catalog `hardStopGuaranteed: true`) |
+| fresh `SAFE`, remaining above the 1pp margin | kept, and the headroom is reported (`quotaStatus=SAFE`, `quotaRemaining`)                                                        |
+| fresh `SAFE`, remaining at/below the margin  | dropped (prefer a connection with headroom)                                                                                      |
+| `EXHAUSTED` (positive evidence)              | dropped — and `allowedConnectionIds` is narrowed so dispatch can never select it                                                 |
+
+Residual risk and containment: a credentialed account on a provider whose free tier is documented as
+no-card could in principle be a paid-plan account. The containment already in the runtime is the
+mitigation: any 402/403/quota failure calls `invalidateFreeAccessState()`
+(`src/sse/services/auth.ts::markAccountUnavailable`), so the next pool build excludes that
+connection, and 429s are absorbed by the existing connection cooldown and provider circuit breaker.
+No new fallback path, no paid route, no new enforcement point.
+
+## 5. R1.5 — catalog identity (exact, no substitution)
+
+The published identity is preserved byte-for-byte; the reconstruction never repairs one model by
+routing to another.
+
+| Published identity                                                                    | freeType             | hardStopGuaranteed | Sentinel class  | AUTO FREE                              |
+| ------------------------------------------------------------------------------------- | -------------------- | ------------------ | --------------- | -------------------------------------- |
+| `glm/glm-4.7-flash` (displayName "GLM-4.7-Flash", poolKey `zhipu-flash-free`, tos ok) | `recurring-uncapped` | absent             | `FREE_UNKNOWN`  | NO (`FREE_UNKNOWN_NO_HARD_STOP_PROOF`) |
+| `glm-cn/glm-4.7-flash` (same shape)                                                   | `recurring-uncapped` | absent             | `FREE_UNKNOWN`  | NO (`FREE_UNKNOWN_NO_HARD_STOP_PROOF`) |
+| `cloudflare-ai/@cf/zai-org/glm-4.7-flash`                                             | `recurring-daily`    | absent             | `FREE_UNKNOWN`  | NO                                     |
+| `cerebras/zai-glm-4.7` (a **different** model identity)                               | `recurring-daily`    | `true`             | `FREE_VERIFIED` | YES, on its own merits                 |
+| `bluesminds/glm-4.7`, `siliconflow/zai-org/GLM-4.7`                                   | recurring-*          | absent             | `FREE_UNKNOWN`  | NO                                     |
+| `deepinfra/zai-org/GLM-5.1`                                                           | `one-time-initial`   | —                  | `CREDIT_BACKED` | NO                                     |
+
+`AUTO_FREE_ELIGIBLE=NO` for `glm-4.7-flash` is a classification result, not a restriction: explicit
+and pinned requests (`zai/glm-4.7-flash` included) bypass the adaptive pool entirely and keep
+exactly their previous semantics.
+
+## 6. Test evidence
+
+```
+npx vitest run --config vitest.mcp.config.ts \
+  tests/unit/autoCombo/free-provider-sentinel-r1.test.ts \
+  tests/unit/autoCombo/strict-zero-cost-filter.test.ts \
+  tests/unit/autoCombo/strict-zero-cost-connection-safety.test.ts \
+  tests/unit/autoCombo/strict-zero-cost-autodiscovery.test.ts
+```
+
+| Run                                                                  | Result                                                                                   |
+| -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| before the contract rewrite (sentinel wired, old expectations)       | 8 failed / 23 passed — exactly the 8 predicted by-design flips, zero unexpected failures |
+| after the rewrite (pre-commit)                                       | 4 files / 56 tests passed                                                                |
+| after commit, on the committed revision (post prettier/eslint --fix) | 4 files / 56 tests passed                                                                |
+
+Suite sizes: `free-provider-sentinel-r1` 21, `strict-zero-cost-filter` 16,
+`strict-zero-cost-connection-safety` 14, `strict-zero-cost-autodiscovery` 5.
+
+By-design expectation flips (each documented in place with its rationale):
+`strict-zero-cost-filter` tests 7/8/9 (hard-stop route with absent / `UNKNOWN` / stale telemetry now
+admitted) + new compensating test proving an unproven entry with absent telemetry is still
+excluded; `strict-zero-cost-connection-safety` tests 1/3/4/5 and the single-connection case
+(missing telemetry no longer drops a hard-stop-verified connection; the unproven-entry case now
+carries the fail-closed guarantee, and `EXHAUSTED` still narrows/drops) + new tests for
+`SELF_HOSTED` (admitted with no catalog entry, resolver asserted never called) and for an arbitrary
+unlisted provider (still excluded, even with perfect telemetry).
+
+The new suite asserts the full matrix: class table, `AUTO_FREE_ALLOWED_COST_CLASSES`, keyless
+no-auth-only rule, no-auth metadata conflict fail-closed, credit-backed/paid/null-cost/unknown-cost
+denial, self-hosted admission without any quota read, headroom reporting, `EXHAUSTED` exclusion,
+multi-account narrowing only on negative evidence, catalog-driven discovery (same candidate,
+different catalog → different verdict), and no paid fallback.
+
+## 7. Gates
+
+| Gate               | Command                                                                                   | Result                                                                                                                                                                                                                         |
+| ------------------ | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Tests              | `npx vitest run --config vitest.mcp.config.ts` (4 autoCombo suites)                       | **PASS** (4 files / 56 tests, exit 0)                                                                                                                                                                                          |
+| Typecheck (core)   | `npm run typecheck:core`                                                                  | **PASS** (exit 0)                                                                                                                                                                                                              |
+| Lint               | scoped `npx eslint` over the 7 files + pre-commit `lint-staged` (prettier + eslint --fix) | **PASS** (exit 0)                                                                                                                                                                                                              |
+| Open-sse typecheck | `npm run check:open-sse-typecheck`                                                        | `FAIL_PREEXISTING_NOT_R1` — one `src/app/api/v1/models/catalog.ts TS2367` error, reproduced identically with all R1 changes stashed (`git stash push -u` → same failure → `git stash pop`), i.e. present at upstream `dea6bb8` |
+| Build              | `npm run build`                                                                           | not run — deliberately out of R1 scope (no artifact in this phase)                                                                                                                                                             |
+
+Pre-commit hooks also ran and passed: docs-sync (version 3.8.50 consistency, 42 locales),
+`check:any-budget:t11` (no new explicit `any`), tracked-artifacts, secret scan.
+
+## 8. Environment notes
+
+- The clone was first installed with `pnpm install`, which is **not** this workspace's canonical
+  installer: it created an untracked `pnpm-lock.yaml`, rewrote the tracked `pnpm-workspace.yaml`
+  with placeholder `allowBuilds` entries, and produced three extra `TS2307` vendor typecheck
+  errors. All of that was reverted (`git checkout -- pnpm-workspace.yaml`, `rm -f pnpm-lock.yaml`)
+  and the environment was rebuilt with `npm ci` from the tracked `package-lock.json`
+  (exit 0, 2452 packages); the vendor `TS2307`s disappeared, confirming they were an
+  install-tree artifact and not a code change.
+- Pre-existing, not R1: 18 `npm audit` advisories (1 low, 9 moderate, 7 high, 1 critical);
+  a Vite `__dirname` `configLoader` warning from `vitest.mcp.config.ts:34`; the `catalog.ts`
+  `TS2367` baseline residue described above; `gitignored` `.env` regenerated by postinstall.
+
+## 9. Security and safety
+
+```
+SECRETS_EXPOSED=NO
+PAID_INFERENCE_TRIGGERED=NO
+PAID_SPEND_TRIGGERED_BY_R1=NO
+OPENCODE_TOUCHED=NO
+LIVE_20128_TOUCHED=NO
+PROVIDERS_DELETED=0
+CONNECTIONS_DELETED=0
+CREDENTIALS_DELETED=0
+```
+
+No secret was read, printed or committed; the staged diff was secret-scanned before commit
+(`sk-…` / `PRIVATE KEY` / assigned `api_key` patterns: clean). Tests are pure and offline — no
+provider request is made, no quota fetch is triggered, and the read-only candidate endpoint now
+uses the cache-only quota reader.
+
+## 10. Explicitly out of scope here
+
+R2 search, R3 vision/image, R4 quota/circuit/workload-isolation work, the release artifact build,
+promotion, deployment, live :20128 regression, the R1.11 canary and every client-side change are
+**not** part of this phase and were not started. The candidate is an isolated commit on
+`final/free-autopilot-2026-09-21`; production remains on the packaged `v3.8.50` runtime with the
+free policy untouched.
