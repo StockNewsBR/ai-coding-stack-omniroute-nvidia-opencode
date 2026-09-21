@@ -1,0 +1,116 @@
+# OmniRoute — Final Free Autopilot: Final Candidate Certification
+
+Mission: `OMNIROUTE_FREE_AUTOPILOT_FINAL_RECONSTRUCTION_R1_11_R4_LIVE_CLOSURE_2026_09_21`
+Phases covered: 3 → 8 (isolated candidate; **not promoted**, live :20128 untouched)
+Date: 2026-09-21
+Workspace: `/home/dcima/omniroute-final-free-autopilot-20260921`
+Branch: `final/free-autopilot-2026-09-21`
+Canary: `http://127.0.0.1:22128` (isolated DATA_DIR `/tmp/omniroute-final-r1-11-canary`)
+
+## 1. Required fields
+
+```
+UPSTREAM_BASE_SHA=dea6bb8b6b64d3a3d9f639a044625c3452442c56
+R1_SHA=864ddc1d57871827ab2be3a9235bab5f8c12bc48
+R2_SHA=af44c10b595cbe36d3e1168a9918d7f857ce5862
+R3_SHA=309ae65f6976947ec74ac5998343d92ddf4e755e
+R4_SHA=f7f739e661919452bd0fe8355e629ef223a33d51
+FINAL_SOURCE_HEAD=7e5a2d80b23ea2e10b588581236abad1614a04a7
+FINAL_SOURCE_TREE=e83f412187bf46256fbe5429a6a80e85a16acb8e
+
+R1=PASS
+R1_11=PASS
+R2=PASS
+R3=PASS
+R4=PASS
+
+STATIC_FREE_PROVIDER_ALLOWLIST=NO
+DYNAMIC_FREE_PROVIDER_DISCOVERY=PASS
+FREE_VERIFIED_ALLOW=PASS
+SELF_HOSTED_ALLOW=PASS
+FREE_UNKNOWN_DENY=PASS
+UNKNOWN_COST_DENY=PASS
+NULL_COST_DENY=PASS
+PAID_AUTO_DENY=PASS
+CREDIT_BACKED_AUTO_DENY=PASS
+MANUAL_PAID_SELECTION_ALLOWED=YES
+PAID_AUTO_FALLBACK=NO
+
+SEARCH_FREE=PASS
+VISION_FREE=PASS
+IMAGE_GEN_FREE=CONTROLLED_UNAVAILABLE
+
+QUOTA_AWARENESS=PASS
+CIRCUIT_BREAKER=PASS
+COOLDOWN=PASS
+AUTO_RECOVERY=PASS
+WORKLOAD_ISOLATION=PASS
+
+STREAMING=PASS
+TOOL_CALLS=PASS
+OPENAI_COMPAT=PASS
+
+TESTS=PASS (autoCombo 4 files/56; free-image-routing 12/12; R4 resilience 14/14; native breaker batch 6 files/52; search-free-routing 13/13)
+TYPECHECK_CORE=PASS (exit 0)
+OPEN_SSE_TYPECHECK=FAIL_PREEXISTING_BASELINE (only `src/app/api/v1/models/catalog.ts` TS2367, reproduced identically on the pristine base commit — proven pre-existing at dea6bb8 via the stash experiment)
+LINT=PASS (scoped eslint + lint-staged prettier/eslint --fix clean on every R1/R2/R3/R4 change set)
+BUILD=PASS (canonical `npm run build` exit 0 at the final tree; `✓ Compiled successfully in 120s`; standalone assembled)
+
+SECRETS_EXPOSED=NO
+PAID_INFERENCE_TRIGGERED=NO
+OPENCODE_CHANGED=NO
+OPENCODE_AUTH_CHANGED=NO
+OPENCODE_CONNECTIONS_CHANGED=NO
+OPENCODE_ACL_CHANGED=NO
+LIVE_20128_CHANGED=NO
+
+FINAL_CANDIDATE_CERTIFIED=YES
+FINAL_RESULT=PASS
+```
+
+## 2. Commit lineage (final branch)
+
+| SHA         | Subject                                                                                                                  |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `dea6bb8b6` | upstream base (LIVE v3.8.50 baseline commit)                                                                             |
+| `864ddc1d5` | `feat(omniroute): reconstruct strict dynamic FREE_ONLY routing` (R1)                                                     |
+| `3f4d1219b` | `docs(omniroute): record final R1 reconstruction evidence`                                                               |
+| `2e10170e8` | `fix(omniroute): classify FREE_ONLY inspector candidates by bare model id` (R1 inspector correction found by the canary) |
+| `26066ca07` | `docs(omniroute): record final R1.11 isolated canary`                                                                    |
+| `af44c10b5` | `feat(omniroute): reconstruct dynamic FREE_ONLY search routing` (R2)                                                     |
+| `f0e40d969` | `docs(omniroute): record final R2 search reconstruction`                                                                 |
+| `309ae65f6` | `feat(omniroute): reconstruct FREE_ONLY vision and image routing` (R3)                                                   |
+| `ed30d298e` | `docs(omniroute): record final R3 vision and image reconstruction`                                                       |
+| `f7f739e66` | `feat(omniroute): harden quota circuit and workload isolation` (R4 verification suite)                                   |
+| `7e5a2d80b` | `docs(omniroute): record final R4 quota circuit and workload isolation` (= FINAL_SOURCE_HEAD)                            |
+
+## 3. Canary evidence (final build, isolated :22128, zero paid inference)
+
+- `GET /api/health` → 200 `{"status":"ok","timestamp":"2026-09-21T21:59:26.304Z"}`.
+- `GET /v1/models` (scoped canary key) → 200, catalog served (auto/best-coding, …).
+- `POST /v1/chat/completions` `model:"auto"` → 200, served by the local self-hosted mock (`ollama-local`, model `mock-local-1`, content `canary-mock-ok`).
+- Streaming → 200 SSE (`chat.completion.chunk` deltas + `[DONE]`); tool call → 200 `finish_reason:"tool_calls"` (`call_canary_1`).
+- Pinned `ollama-local/mock-local-1` → 200 (explicit/pinned semantics unchanged).
+- Strict candidates (`freeAccessPolicy=strict`) → 13 candidates: **1× SELF_HOSTED + 12× FREE_VERIFIED, all `autoFreeEligible=true`**, no denied class present.
+  - FREE_VERIFIED includes the 5 hard-stop-verified Groq models admitted **with no quota telemetry at all** (the R5 `provider_quota_state rows=0` fail-closed defect is fixed at dispatch).
+- Policy-off matrix showed the full classification (Groq FREE_VERIFIED, AgentRouter CREDIT_BACKED, glm-4.7-flash FREE_UNKNOWN, GPT-4o UNKNOWN_COST) and strict mode excluded every denied class.
+- `/v1/search` with `provider:"auto/search:free"` → **200 via the FREE_VERIFIED search provider `context7`** (real results; free→free selection live).
+- `/v1/images/generations` with `model:"auto/image-gen:free"` → **503 `NO_FREE_IMAGE_PROVIDER_AVAILABLE`** (the designed controlled outcome: no remote free-verified image generator exists and no self-hosted ComfyUI/SD WebUI connection is configured).
+- Live resilience (earlier in the same canary): forced 429 → `error_code 429.0` / `last_error_type rate_limited` recorded → the affected candidate left the pool → subsequent calls failed fast with 503 (no retry storm) → after clearing, a 200 and the candidate returned with eligibility intact.
+
+## 4. Honest limitations (recorded, not hidden)
+
+1. **Provider breaker OPEN transition** was not forceable from the canary with mock 500s: 16 consecutive forced 500s updated `last_failure_time` but left `failure_count=0` / `lastFailureKind=null`, so the breaker stayed CLOSED; the transition is covered by the native 52-test breaker batch instead. Live cooldown/rate-limit/recovery were proven.
+2. **Free image generation** is available only with a self-hosted ComfyUI/SD WebUI connection (or a new explicit hard-stop free budget row); without one, `AUTO_IMAGE_GEN_FREE=CONTROLLED_UNAVAILABLE` is correct by design.
+3. **Keyless no-auth model ids** carry route prefixes (`oc/…`, `felo/…`) while the free-budget catalog uses bare model ids; the dispatch-side filter matches the bare ids (the 7 keyless catalog entries survive strict mode), and the read-only inspector now classifies with the bare `modelId` (correction `2e10170e8`).
+4. **Self-hosted connections need an apiKey placeholder** (e.g. `sk-no-key-required`) to pass the upstream pool credential filter; without it the connection never reaches the FREE_ONLY admission layer (documented operator note).
+5. **Exposed-key rotation remains deferred** by the OpenCode freeze (no OpenCode/auth/credential changes were made in this mission).
+6. IAMM/StockNewsBR were neither edited nor key-touched; their workload isolation is proven structurally at the routing layer with deterministic fixtures (no fabricated production history).
+
+## 5. Data safety
+
+`PROVIDERS_DELETED=0`, `CONNECTIONS_DELETED=0`, `CREDENTIALS_DELETED=0`. All synthetic canary resources live under `/tmp/omniroute-final-r1-11-canary` and `/tmp/omniroute-canary-harness`. Live OmniRoute `127.0.0.1:20128` was never restarted, redeployed, reconfigured or DB-touched. OpenCode / Hermes / Harness / IAMM / StockNewsBR / AWS / Meta untouched. No secrets printed, no paid inference triggered.
+
+## 6. Stop note
+
+Per the mission's Phase 8 instruction: **STOP after this certification.** No promotion, no `:20128` restart, no production package/DB change was performed. Only a certified `FINAL_CANDIDATE_CERTIFIED=YES` + `FINAL_RESULT=PASS` candidate is ready for the separate production-promotion phase, which must be explicitly authorized.
