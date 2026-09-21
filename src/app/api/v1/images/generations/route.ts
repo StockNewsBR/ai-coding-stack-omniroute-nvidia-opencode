@@ -20,6 +20,14 @@ import { v1ImageGenerationSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 
 import { getComboByName } from "@/lib/db/combos";
+import {
+  FREE_IMAGE_ROUTE_ID,
+  FREE_IMAGE_ROUTE_ID_FREE,
+  NO_FREE_IMAGE_PROVIDER_AVAILABLE,
+  resolveFreeImageProvider,
+} from "@omniroute/open-sse/config/freeImageRouting.ts";
+import { getCachedProviderConnections } from "@/lib/db/readCache";
+import { getCircuitBreaker } from "@/shared/utils/circuitBreaker";
 import { getAllCustomModels } from "@/lib/db/models";
 import { resolveProxyForConnection } from "@/lib/db/settings";
 import { resolveImageRouteModel } from "@/lib/images/imageRouteModel";
@@ -97,6 +105,19 @@ function publicBaseUrlHeaders(headers: Headers): Record<string, string> {
   return out;
 }
 
+async function resolveFreeImageRouteSelection() {
+  const connections = await getCachedProviderConnections();
+  const activeProviders = new Set(
+    connections
+      .filter((connection) => (connection as { isActive?: boolean }).isActive !== false)
+      .map((connection) => (connection as { provider: string }).provider)
+  );
+  return resolveFreeImageProvider({
+    hasActiveConnection: (providerId) => activeProviders.has(providerId),
+    isCircuitOpen: (providerId) => !getCircuitBreaker(providerId).canExecute(),
+  });
+}
+
 async function postHandler(request, context) {
   let rawBody;
   try {
@@ -122,21 +143,23 @@ async function postHandler(request, context) {
   const policy = await enforceApiKeyPolicy(request, body.model);
   if (policy.rejection) return policy.rejection;
 
+  // FREE_ONLY image generation — `auto/image-gen[:free]` can only ever reach a
+  // free-verified or self-hosted image generator, never a paid/credit-backed one.
+  if (body.model === FREE_IMAGE_ROUTE_ID || body.model === FREE_IMAGE_ROUTE_ID_FREE) {
+    const selection = await resolveFreeImageRouteSelection();
+    if (!selection.ok) {
+      return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, NO_FREE_IMAGE_PROVIDER_AVAILABLE);
+    }
+    body.model = `${selection.providerId}/${selection.modelId}`;
+  }
+
   // #9239: Detect combo name and divert to full image combo execution.
   // Checks before resolveImageRouteModel so we skip single-target flattening.
   if (body.model && typeof body.model === "string" && !body.model.includes("/")) {
     const combo = await getComboByName(body.model as string);
     if (combo) {
-      const { executeImageCombo } = await import(
-        "@omniroute/open-sse/services/imageCombo"
-      );
-      return executeImageCombo(
-        body.model as string,
-        body,
-        { request, policy },
-        startTime,
-        log
-      );
+      const { executeImageCombo } = await import("@omniroute/open-sse/services/imageCombo");
+      return executeImageCombo(body.model as string, body, { request, policy }, startTime, log);
     }
   }
 
@@ -246,7 +269,8 @@ async function postHandler(request, context) {
       provider,
       null,
       syncedEndpointRoute?.connectionIds ?? null,
-      requestedModel    );
+      requestedModel
+    );
     if (!credentials) {
       return errorResponse(
         HTTP_STATUS.BAD_REQUEST,
@@ -346,7 +370,10 @@ async function postHandler(request, context) {
     });
   }
 
-  const errorPayload = toJsonErrorPayload((result as any).error, "Image generation provider error") as {
+  const errorPayload = toJsonErrorPayload(
+    (result as any).error,
+    "Image generation provider error"
+  ) as {
     error?: { message?: string };
   };
   const message =

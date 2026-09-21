@@ -65,6 +65,8 @@ export const AUTO_SUFFIX_VARIANTS: string[] = [
   "auto/reasoning:pro",
   "auto/vision",
   "auto/multimodal",
+  "auto/vision:free",
+  "auto/multimodal:free",
 ];
 
 type ResolvedAutoVariant =
