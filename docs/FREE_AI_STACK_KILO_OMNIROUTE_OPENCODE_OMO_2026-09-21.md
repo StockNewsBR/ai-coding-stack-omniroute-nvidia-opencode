@@ -67,8 +67,11 @@ Local tool configuration changed, with secrets preserved and never printed:
 ~/.opencode/opencode.json
 ~/.config/opencode/opencode.json
 ~/.omo/omo.jsonc
-~/.omniroute/storage.sqlite               (settings API only)
+~/.omniroute/storage.sqlite               (settings and OpenCode key policy)
 ```
+
+The database change also updates only the OpenCode API-key policy metadata;
+the key material itself was not regenerated, revealed, or printed.
 
 Backups created before changes:
 
@@ -121,6 +124,23 @@ provider.whitelist=[
 ]
 ```
 
+The OmniRoute API key matched to the active OpenCode configuration is now
+restricted at the router boundary:
+
+```text
+model_access_mode=restricted
+allowed_models=[
+  oc/deepseek-v4-flash-free,
+  openrouter/cohere/north-mini-code:free
+]
+allowed_combos=[]
+OMNIROUTE_KEY_POLICY=PASS
+OMNIROUTE_STACK_FREE_ONLY=PASS
+```
+
+This prevents that key from selecting paid models or any existing combo,
+without changing other API keys or production-adjacent combo definitions.
+
 All OMO agent/category model entries use
 `omniroute/oc/deepseek-v4-flash-free`. OMO `model_fallback` and
 `runtime_fallback.enabled` are both `false`.
@@ -163,7 +183,7 @@ The global OmniRoute gate is not satisfied:
 ```text
 OMNIROUTE_FREE_ONLY=FAIL
 OMNIROUTE_PAID_FALLBACK=NO (background degradation disabled)
-OMNIROUTE_UNSAFE_COMBO_TARGETS=56
+OMNIROUTE_UNSAFE_COMBO_TARGETS=69 (not proven free by the active inventory)
 ```
 
 The active settings schema accepts `freeAccessPolicy` and `hidePaidModels`
@@ -172,6 +192,8 @@ catalog and persisted combo data therefore cannot be proved globally free.
 Existing combos were audited but not deleted or rewritten. In particular,
 the pre-existing `STOCKNEWSBR-FREE-CODE` combo includes
 `nvidia/nvidia/nemotron-3-super-120b-a12b`, whose live pricing is non-zero.
+The active OpenCode key cannot select any of those combos, but other existing
+API keys and production-adjacent routes were intentionally not changed.
 
 ## Tests
 

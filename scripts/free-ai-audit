@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const fs = require("node:fs");
+const crypto = require("node:crypto");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
@@ -10,6 +11,7 @@ const paths = {
   opencodeLocal: path.join(home, ".opencode/opencode.json"),
   opencodeGlobal: path.join(home, ".config/opencode/opencode.json"),
   omo: path.join(home, ".omo/omo.jsonc"),
+  omnirouteDb: path.join(home, ".omniroute/storage.sqlite"),
 };
 
 const result = {};
@@ -72,6 +74,39 @@ function configApiKey(config) {
   return value;
 }
 
+function sameValues(first, second) {
+  return first.length === second.length && [...first].sort().join("\n") === [...second].sort().join("\n");
+}
+
+function jsonArray(value) {
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function keyPolicyPass(apiKey, allowlist) {
+  if (!apiKey) return false;
+  const hash = crypto.createHash("sha256").update(apiKey).digest("hex");
+  const query = `SELECT model_access_mode, allowed_models, allowed_combos, is_active FROM api_keys WHERE key_hash='${hash}' OR key='${hash}';`;
+  const policy = run("sqlite3", ["-json", paths.omnirouteDb, query]);
+  if (policy.code !== 0) return false;
+  try {
+    const row = JSON.parse(policy.output.trim() || "[]")[0];
+    return Boolean(
+      row &&
+        row.is_active === 1 &&
+        row.model_access_mode === "restricted" &&
+        sameValues(jsonArray(row.allowed_models), allowlist) &&
+        jsonArray(row.allowed_combos).length === 0
+    );
+  } catch {
+    return false;
+  }
+}
+
 function zeroPrice(model) {
   return Number(model?.pricing?.input) === 0 && Number(model?.pricing?.output) === 0;
 }
@@ -128,6 +163,7 @@ async function main() {
   const freeIds = new Set(liveModels.filter(zeroPrice).map((model) => model.id));
   const allowlist = Array.isArray(provider?.whitelist) ? provider.whitelist : [];
   const expectedRouteIds = new Set(allowlist);
+  const keyPolicyIsFree = keyPolicyPass(apiKey, allowlist);
   const localProvider = local?.provider?.omniroute;
   const globalProvider = global?.provider?.omniroute;
   const opencodeConfigs = [local, global];
@@ -159,6 +195,16 @@ async function main() {
     "get-api-settings",
   ]);
   const settings = parseCommandJson(settingsCommand.output);
+  const managementModelsCommand = run("omniroute", [
+    "--quiet",
+    "--no-color",
+    "--output",
+    "json",
+    "api",
+    "models",
+    "get-api-models",
+  ]);
+  const managementModels = parseCommandJson(managementModelsCommand.output)?.models || [];
   const combosCommand = run("omniroute", [
     "--quiet",
     "--no-color",
@@ -169,10 +215,11 @@ async function main() {
     "get-api-combos",
   ]);
   const combos = parseCommandJson(combosCommand.output)?.combos || [];
+  const globalFreeIds = new Set(managementModels.filter(zeroPrice).map((model) => model.id));
   const unsafeComboTargets = combos.flatMap((combo) =>
     (Array.isArray(combo.models) ? combo.models : [])
       .map((model) => model.model)
-      .filter((model) => !freeIds.has(model))
+      .filter((model) => !globalFreeIds.has(model))
   );
 
   const omoSection = omo?.["[opencode]"];
@@ -220,9 +267,23 @@ async function main() {
     settings?.hidePaidModels === true &&
     settings?.hideAutoCombos === true &&
     paidFallbackDisabled;
+  const stackFreeOnly =
+    settings?.freeAccessPolicy === "strict" &&
+    settings?.hidePaidModels === true &&
+    paidFallbackDisabled &&
+    allowlistPass &&
+    keyPolicyIsFree;
   const kiloVersion = run("kilo", ["--version"]).output.trim().split(/\s+/).pop() || "UNKNOWN";
   const opencodeVersion = run("opencode", ["--version"]).output.trim().split(/\s+/).pop() || "UNKNOWN";
-  const configPass = Boolean(localProvider && globalProvider && opencodeConfigPass && omoPass && kiloConfigPass && autocompleteDisabled);
+  const configPass = Boolean(
+    localProvider &&
+      globalProvider &&
+      opencodeConfigPass &&
+      keyPolicyIsFree &&
+      omoPass &&
+      kiloConfigPass &&
+      autocompleteDisabled
+  );
   const stackPass = Boolean(
     result.OMNIROUTE_STATUS === "PASS" &&
       allowlistPass &&
@@ -243,11 +304,14 @@ async function main() {
   console.log(`KILO_AUTOCOMPLETE_FREE=${autocompleteDisabled ? "DISABLED" : "FAIL"}`);
   console.log(`KILO_AUTH=${kiloCredentialCount === 0 ? "BLOCKED_EXTERNAL_CREDENTIAL" : "PRESENT_OR_UNKNOWN"}`);
   console.log(`OPENCODE_VERSION=${opencodeVersion}`);
-  console.log(`OPENCODE_FREE_ONLY=${opencodeConfigPass ? "PASS" : "FAIL"}`);
+  console.log(`OPENCODE_FREE_ONLY=${opencodeConfigPass && keyPolicyIsFree ? "PASS" : "FAIL"}`);
   console.log(`OMO_FREE_ONLY=${omoPass ? "PASS" : "FAIL"}`);
   console.log(`OMNIROUTE_STATUS=${result.OMNIROUTE_STATUS}`);
   console.log(`OMNIROUTE_ENDPOINT=${endpoint || "MISSING"}`);
   console.log(`OMNIROUTE_FREE_MODELS=${[...allowlist].join(",") || "NONE"}`);
+  console.log(`OMNIROUTE_KEY_POLICY=${keyPolicyIsFree ? "PASS" : "FAIL"}`);
+  console.log(`OMNIROUTE_MANAGEMENT_MODELS=${managementModels.length}`);
+  console.log(`OMNIROUTE_STACK_FREE_ONLY=${stackFreeOnly ? "PASS" : "FAIL"}`);
   console.log(`OMNIROUTE_FREE_ONLY=${settingsPass && unsafeComboTargets.length === 0 ? "PASS" : "FAIL"}`);
   console.log(`OMNIROUTE_PAID_FALLBACK=${paidFallbackDisabled ? "NO" : "UNKNOWN"}`);
   console.log(`OMNIROUTE_UNSAFE_COMBO_TARGETS=${unsafeComboTargets.length}`);
