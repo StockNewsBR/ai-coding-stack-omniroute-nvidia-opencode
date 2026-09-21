@@ -1,288 +1,36 @@
 {
-  "generated_at": "2026-09-21T19:30:30.066Z",
+  "generated_at": "2026-09-21T22:54:05.806Z",
   "source": "scripts/routelab snapshot",
-  "inference_rows": 1201,
+  "inference_rows": 1196,
   "classes": {
-    "general": 956,
-    "vision": 137,
+    "general": 953,
     "coding": 100,
-    "search": 5,
+    "vision": 133,
+    "search": 7,
     "image": 3
   },
   "summary": {
     "class:general": {
-      "requests": 956,
-      "success": 203,
-      "failure": 753,
-      "success_rate": 0.212,
-      "avg_ms": 5458,
-      "p50_ms": 1574,
-      "p95_ms": 25692,
-      "combo_requests": 40,
-      "pinned_requests": 0,
-      "free_eligible_models": null
-    },
-    "provider:auto": {
-      "requests": 5,
-      "success": 0,
-      "failure": 5,
-      "success_rate": 0,
-      "avg_ms": 67852,
-      "p50_ms": 52095,
-      "p95_ms": 110986,
-      "combo_requests": 5,
-      "pinned_requests": 0,
-      "free_eligible_models": null
-    },
-    "model:auto/auto/pro-coding": {
-      "requests": 2,
-      "success": 0,
-      "failure": 2,
-      "success_rate": 0,
-      "avg_ms": 43996,
-      "p50_ms": 52095,
-      "p95_ms": 52095,
-      "combo_requests": 2,
-      "pinned_requests": 0,
-      "free_eligible_models": null
-    },
-    "profile:LEGACY_DEFAULT": {
-      "requests": 1201,
-      "success": 236,
-      "failure": 965,
-      "success_rate": 0.197,
-      "avg_ms": 4845,
-      "p50_ms": 1533,
-      "p95_ms": 16384,
-      "combo_requests": 42,
+      "requests": 953,
+      "success": 186,
+      "failure": 767,
+      "success_rate": 0.195,
+      "avg_ms": 5147,
+      "p50_ms": 1581,
+      "p95_ms": 20311,
+      "combo_requests": 30,
       "pinned_requests": 0,
       "free_eligible_models": null
     },
     "provider:openrouter": {
-      "requests": 135,
-      "success": 63,
-      "failure": 72,
-      "success_rate": 0.467,
-      "avg_ms": 6312,
-      "p50_ms": 4788,
-      "p95_ms": 15658,
-      "combo_requests": 3,
-      "pinned_requests": 0,
-      "free_eligible_models": null
-    },
-    "model:openrouter/nvidia/nemotron-3-ultra-550b-a55b:free": {
-      "requests": 19,
-      "success": 17,
-      "failure": 2,
-      "success_rate": 0.895,
-      "avg_ms": 11251,
-      "p50_ms": 5070,
-      "p95_ms": 52651,
-      "combo_requests": 3,
-      "pinned_requests": 0,
-      "free_eligible_models": null
-    },
-    "provider:opencode-zen": {
-      "requests": 427,
-      "success": 26,
-      "failure": 401,
-      "success_rate": 0.061,
-      "avg_ms": 1402,
-      "p50_ms": 681,
-      "p95_ms": 4085,
+      "requests": 133,
+      "success": 62,
+      "failure": 71,
+      "success_rate": 0.466,
+      "avg_ms": 5742,
+      "p50_ms": 4784,
+      "p95_ms": 11713,
       "combo_requests": 1,
-      "pinned_requests": 0,
-      "free_eligible_models": null
-    },
-    "model:opencode-zen/nemotron-3.5-lightning-free": {
-      "requests": 311,
-      "success": 25,
-      "failure": 286,
-      "success_rate": 0.08,
-      "avg_ms": 1656,
-      "p50_ms": 735,
-      "p95_ms": 5163,
-      "combo_requests": 0,
-      "pinned_requests": 0,
-      "free_eligible_models": null
-    },
-    "provider:nvidia": {
-      "requests": 15,
-      "success": 12,
-      "failure": 3,
-      "success_rate": 0.8,
-      "avg_ms": 1995,
-      "p50_ms": 1362,
-      "p95_ms": 6215,
-      "combo_requests": 3,
-      "pinned_requests": 0,
-      "free_eligible_models": null
-    },
-    "model:nvidia/nvidia/nemotron-3-super-120b-a12b": {
-      "requests": 1,
-      "success": 1,
-      "failure": 0,
-      "success_rate": 1,
-      "avg_ms": 1074,
-      "p50_ms": 1074,
-      "p95_ms": 1074,
-      "combo_requests": 1,
-      "pinned_requests": 0,
-      "free_eligible_models": null
-    },
-    "provider:cloudflare-ai": {
-      "requests": 27,
-      "success": 26,
-      "failure": 1,
-      "success_rate": 0.963,
-      "avg_ms": 3662,
-      "p50_ms": 902,
-      "p95_ms": 2663,
-      "combo_requests": 27,
-      "pinned_requests": 0,
-      "free_eligible_models": null
-    },
-    "model:cloudflare-ai/@cf/meta/llama-3.2-3b-instruct": {
-      "requests": 27,
-      "success": 26,
-      "failure": 1,
-      "success_rate": 0.963,
-      "avg_ms": 3662,
-      "p50_ms": 902,
-      "p95_ms": 2663,
-      "combo_requests": 27,
-      "pinned_requests": 0,
-      "free_eligible_models": null
-    },
-    "model:auto/auto/coding:free": {
-      "requests": 1,
-      "success": 0,
-      "failure": 1,
-      "success_rate": 0,
-      "avg_ms": 109446,
-      "p50_ms": 109446,
-      "p95_ms": 109446,
-      "combo_requests": 1,
-      "pinned_requests": 0,
-      "free_eligible_models": null
-    },
-    "class:vision": {
-      "requests": 137,
-      "success": 27,
-      "failure": 110,
-      "success_rate": 0.197,
-      "avg_ms": 3041,
-      "p50_ms": 926,
-      "p95_ms": 5901,
-      "combo_requests": 2,
-      "pinned_requests": 0,
-      "free_eligible_models": null
-    },
-    "provider:antigravity": {
-      "requests": 1,
-      "success": 0,
-      "failure": 1,
-      "success_rate": 0,
-      "avg_ms": 109357,
-      "p50_ms": 109357,
-      "p95_ms": 109357,
-      "combo_requests": 0,
-      "pinned_requests": 0,
-      "free_eligible_models": null
-    },
-    "model:antigravity/gemini-3-flash": {
-      "requests": 1,
-      "success": 0,
-      "failure": 1,
-      "success_rate": 0,
-      "avg_ms": 109357,
-      "p50_ms": 109357,
-      "p95_ms": 109357,
-      "combo_requests": 0,
-      "pinned_requests": 0,
-      "free_eligible_models": null
-    },
-    "model:auto/auto/best-free": {
-      "requests": 1,
-      "success": 0,
-      "failure": 1,
-      "success_rate": 0,
-      "avg_ms": 110986,
-      "p50_ms": 110986,
-      "p95_ms": 110986,
-      "combo_requests": 1,
-      "pinned_requests": 0,
-      "free_eligible_models": null
-    },
-    "provider:cloudflare-playground": {
-      "requests": 2,
-      "success": 0,
-      "failure": 2,
-      "success_rate": 0,
-      "avg_ms": 16805,
-      "p50_ms": 31794,
-      "p95_ms": 31794,
-      "combo_requests": 0,
-      "pinned_requests": 0,
-      "free_eligible_models": null
-    },
-    "model:cloudflare-playground/google/gemma-4-26b-a4b-it": {
-      "requests": 1,
-      "success": 0,
-      "failure": 1,
-      "success_rate": 0,
-      "avg_ms": 1816,
-      "p50_ms": 1816,
-      "p95_ms": 1816,
-      "combo_requests": 0,
-      "pinned_requests": 0,
-      "free_eligible_models": null
-    },
-    "model:cloudflare-playground/moonshotai/kimi-k2.6": {
-      "requests": 1,
-      "success": 0,
-      "failure": 1,
-      "success_rate": 0,
-      "avg_ms": 31794,
-      "p50_ms": 31794,
-      "p95_ms": 31794,
-      "combo_requests": 0,
-      "pinned_requests": 0,
-      "free_eligible_models": null
-    },
-    "provider:opencode": {
-      "requests": 102,
-      "success": 1,
-      "failure": 101,
-      "success_rate": 0.01,
-      "avg_ms": 1940,
-      "p50_ms": 1757,
-      "p95_ms": 3725,
-      "combo_requests": 0,
-      "pinned_requests": 0,
-      "free_eligible_models": null
-    },
-    "model:opencode/nemotron-3-ultra-free": {
-      "requests": 3,
-      "success": 1,
-      "failure": 2,
-      "success_rate": 0.333,
-      "avg_ms": 7234,
-      "p50_ms": 8047,
-      "p95_ms": 9987,
-      "combo_requests": 0,
-      "pinned_requests": 0,
-      "free_eligible_models": null
-    },
-    "model:opencode-zen/muse-spark-1.2-contributor-free": {
-      "requests": 15,
-      "success": 1,
-      "failure": 14,
-      "success_rate": 0.067,
-      "avg_ms": 723,
-      "p50_ms": 675,
-      "p95_ms": 2686,
-      "combo_requests": 0,
       "pinned_requests": 0,
       "free_eligible_models": null
     },
@@ -295,6 +43,30 @@
       "p50_ms": 950,
       "p95_ms": 1207,
       "combo_requests": 0,
+      "pinned_requests": 0,
+      "free_eligible_models": null
+    },
+    "profile:LEGACY_DEFAULT": {
+      "requests": 1196,
+      "success": 219,
+      "failure": 977,
+      "success_rate": 0.183,
+      "avg_ms": 4483,
+      "p50_ms": 1530,
+      "p95_ms": 13824,
+      "combo_requests": 32,
+      "pinned_requests": 0,
+      "free_eligible_models": null
+    },
+    "model:openrouter/nvidia/nemotron-3-ultra-550b-a55b:free": {
+      "requests": 17,
+      "success": 16,
+      "failure": 1,
+      "success_rate": 0.941,
+      "avg_ms": 7369,
+      "p50_ms": 3632,
+      "p95_ms": 30238,
+      "combo_requests": 1,
       "pinned_requests": 0,
       "free_eligible_models": null
     },
@@ -382,26 +154,50 @@
       "pinned_requests": 0,
       "free_eligible_models": null
     },
+    "provider:opencode-zen": {
+      "requests": 400,
+      "success": 1,
+      "failure": 399,
+      "success_rate": 0.003,
+      "avg_ms": 776,
+      "p50_ms": 667,
+      "p95_ms": 1344,
+      "combo_requests": 1,
+      "pinned_requests": 0,
+      "free_eligible_models": null
+    },
+    "model:opencode-zen/nemotron-3.5-lightning-free": {
+      "requests": 285,
+      "success": 1,
+      "failure": 284,
+      "success_rate": 0.004,
+      "avg_ms": 804,
+      "p50_ms": 708,
+      "p95_ms": 1235,
+      "combo_requests": 0,
+      "pinned_requests": 0,
+      "free_eligible_models": null
+    },
     "provider:zai": {
-      "requests": 388,
-      "success": 74,
-      "failure": 314,
-      "success_rate": 0.191,
-      "avg_ms": 8428,
-      "p50_ms": 5536,
-      "p95_ms": 35768,
+      "requests": 422,
+      "success": 85,
+      "failure": 337,
+      "success_rate": 0.201,
+      "avg_ms": 8830,
+      "p50_ms": 5765,
+      "p95_ms": 36020,
       "combo_requests": 2,
       "pinned_requests": 0,
       "free_eligible_models": null
     },
     "model:zai/glm-4.7-flash": {
-      "requests": 388,
-      "success": 74,
-      "failure": 314,
-      "success_rate": 0.191,
-      "avg_ms": 8428,
-      "p50_ms": 5536,
-      "p95_ms": 35768,
+      "requests": 422,
+      "success": 85,
+      "failure": 337,
+      "success_rate": 0.201,
+      "avg_ms": 8830,
+      "p50_ms": 5765,
+      "p95_ms": 36020,
       "combo_requests": 2,
       "pinned_requests": 0,
       "free_eligible_models": null
@@ -414,6 +210,30 @@
       "avg_ms": 52369,
       "p50_ms": 103074,
       "p95_ms": 103701,
+      "combo_requests": 0,
+      "pinned_requests": 0,
+      "free_eligible_models": null
+    },
+    "provider:opencode": {
+      "requests": 101,
+      "success": 1,
+      "failure": 100,
+      "success_rate": 0.01,
+      "avg_ms": 1860,
+      "p50_ms": 1756,
+      "p95_ms": 3673,
+      "combo_requests": 0,
+      "pinned_requests": 0,
+      "free_eligible_models": null
+    },
+    "model:opencode/nemotron-3-ultra-free": {
+      "requests": 2,
+      "success": 1,
+      "failure": 1,
+      "success_rate": 0.5,
+      "avg_ms": 5858,
+      "p50_ms": 8047,
+      "p95_ms": 8047,
       "combo_requests": 0,
       "pinned_requests": 0,
       "free_eligible_models": null
@@ -439,6 +259,30 @@
       "p50_ms": 1739,
       "p95_ms": 2348,
       "combo_requests": 0,
+      "pinned_requests": 0,
+      "free_eligible_models": null
+    },
+    "provider:cloudflare-ai": {
+      "requests": 24,
+      "success": 24,
+      "failure": 0,
+      "success_rate": 1,
+      "avg_ms": 945,
+      "p50_ms": 891,
+      "p95_ms": 2609,
+      "combo_requests": 24,
+      "pinned_requests": 0,
+      "free_eligible_models": null
+    },
+    "model:cloudflare-ai/@cf/meta/llama-3.2-3b-instruct": {
+      "requests": 24,
+      "success": 24,
+      "failure": 0,
+      "success_rate": 1,
+      "avg_ms": 945,
+      "p50_ms": 891,
+      "p95_ms": 2609,
+      "combo_requests": 24,
       "pinned_requests": 0,
       "free_eligible_models": null
     },
@@ -487,6 +331,18 @@
       "p50_ms": 119,
       "p95_ms": 119,
       "combo_requests": 0,
+      "pinned_requests": 0,
+      "free_eligible_models": null
+    },
+    "class:vision": {
+      "requests": 133,
+      "success": 26,
+      "failure": 107,
+      "success_rate": 0.195,
+      "avg_ms": 2037,
+      "p50_ms": 885,
+      "p95_ms": 5750,
+      "combo_requests": 2,
       "pinned_requests": 0,
       "free_eligible_models": null
     },
@@ -630,6 +486,18 @@
       "avg_ms": 3669,
       "p50_ms": 3669,
       "p95_ms": 3669,
+      "combo_requests": 1,
+      "pinned_requests": 0,
+      "free_eligible_models": null
+    },
+    "provider:auto": {
+      "requests": 1,
+      "success": 0,
+      "failure": 1,
+      "success_rate": 0,
+      "avg_ms": 30839,
+      "p50_ms": 30839,
+      "p95_ms": 30839,
       "combo_requests": 1,
       "pinned_requests": 0,
       "free_eligible_models": null
@@ -946,6 +814,18 @@
       "pinned_requests": 0,
       "free_eligible_models": null
     },
+    "model:opencode-zen/muse-spark-1.2-contributor-free": {
+      "requests": 14,
+      "success": 0,
+      "failure": 14,
+      "success_rate": 0,
+      "avg_ms": 582,
+      "p50_ms": 675,
+      "p95_ms": 838,
+      "combo_requests": 0,
+      "pinned_requests": 0,
+      "free_eligible_models": null
+    },
     "model:opencode-zen/muse-spark-1.3-contributor-free": {
       "requests": 8,
       "success": 0,
@@ -983,23 +863,23 @@
       "free_eligible_models": null
     },
     "class:search": {
-      "requests": 5,
-      "success": 3,
-      "failure": 2,
-      "success_rate": 0.6,
-      "avg_ms": 951,
-      "p50_ms": 1062,
+      "requests": 7,
+      "success": 4,
+      "failure": 3,
+      "success_rate": 0.571,
+      "avg_ms": 837,
+      "p50_ms": 722,
       "p95_ms": 1873,
       "combo_requests": 0,
       "pinned_requests": 0,
       "free_eligible_models": null
     },
     "provider:ollama-search": {
-      "requests": 5,
+      "requests": 6,
       "success": 3,
-      "failure": 2,
-      "success_rate": 0.6,
-      "avg_ms": 951,
+      "failure": 3,
+      "success_rate": 0.5,
+      "avg_ms": 856,
       "p50_ms": 1062,
       "p95_ms": 1873,
       "combo_requests": 0,
@@ -1007,11 +887,11 @@
       "free_eligible_models": null
     },
     "model:ollama-search/ollama-search": {
-      "requests": 5,
+      "requests": 6,
       "success": 3,
-      "failure": 2,
-      "success_rate": 0.6,
-      "avg_ms": 951,
+      "failure": 3,
+      "success_rate": 0.5,
+      "avg_ms": 856,
       "p50_ms": 1062,
       "p95_ms": 1873,
       "combo_requests": 0,
@@ -1222,6 +1102,18 @@
       "pinned_requests": 0,
       "free_eligible_models": null
     },
+    "provider:nvidia": {
+      "requests": 14,
+      "success": 11,
+      "failure": 3,
+      "success_rate": 0.786,
+      "avg_ms": 2061,
+      "p50_ms": 1433,
+      "p95_ms": 6215,
+      "combo_requests": 2,
+      "pinned_requests": 0,
+      "free_eligible_models": null
+    },
     "model:nvidia/google/gemma-4-31b-it": {
       "requests": 5,
       "success": 2,
@@ -1353,7 +1245,594 @@
       "combo_requests": 0,
       "pinned_requests": 0,
       "free_eligible_models": null
+    },
+    "provider:context7": {
+      "requests": 1,
+      "success": 1,
+      "failure": 0,
+      "success_rate": 1,
+      "avg_ms": 722,
+      "p50_ms": 722,
+      "p95_ms": 722,
+      "combo_requests": 0,
+      "pinned_requests": 0,
+      "free_eligible_models": null
+    },
+    "model:context7/context7": {
+      "requests": 1,
+      "success": 1,
+      "failure": 0,
+      "success_rate": 1,
+      "avg_ms": 722,
+      "p50_ms": 722,
+      "p95_ms": 722,
+      "combo_requests": 0,
+      "pinned_requests": 0,
+      "free_eligible_models": null
     }
   },
-  "smart": null
+  "smart": null,
+  "smart_live": {
+    "hide_paid_models": true,
+    "free_access_policy": "strict",
+    "dynamic_free_eligible_models": 44,
+    "dynamic_free_providers": [
+      "agnes",
+      "cerebras",
+      "groq",
+      "nvidia",
+      "oc",
+      "opencode",
+      "openrouter",
+      "siliconflow"
+    ],
+    "inventory_error": null,
+    "variants": {
+      "auto/best-chat": {
+        "candidate_providers": 2,
+        "candidates": [
+          {
+            "provider": "nvidia",
+            "candidates": 1,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          },
+          {
+            "provider": "antigravity",
+            "candidates": 7,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": false
+          }
+        ],
+        "all_healthy": true,
+        "any_circuit_open": false
+      },
+      "auto/best-coding": {
+        "candidate_providers": 9,
+        "candidates": [
+          {
+            "provider": "nvidia",
+            "candidates": 12,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          },
+          {
+            "provider": "opencode",
+            "candidates": 29,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          },
+          {
+            "provider": "cloudflare-ai",
+            "candidates": 1,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": false
+          },
+          {
+            "provider": "grok-cli",
+            "candidates": 12,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": false
+          },
+          {
+            "provider": "opencode-zen",
+            "candidates": 1,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": false
+          },
+          {
+            "provider": "zai",
+            "candidates": 4,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": false
+          },
+          {
+            "provider": "openrouter",
+            "candidates": 8,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          },
+          {
+            "provider": "antigravity",
+            "candidates": 6,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": false
+          },
+          {
+            "provider": "codex",
+            "candidates": 3,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": false
+          }
+        ],
+        "all_healthy": true,
+        "any_circuit_open": false
+      },
+      "auto/best-coding-fast": {
+        "candidate_providers": 2,
+        "candidates": [
+          {
+            "provider": "nvidia",
+            "candidates": 3,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          },
+          {
+            "provider": "antigravity",
+            "candidates": 4,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": false
+          }
+        ],
+        "all_healthy": true,
+        "any_circuit_open": false
+      },
+      "auto/best-fast": {
+        "candidate_providers": 2,
+        "candidates": [
+          {
+            "provider": "nvidia",
+            "candidates": 22,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          },
+          {
+            "provider": "antigravity",
+            "candidates": 33,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": false
+          }
+        ],
+        "all_healthy": true,
+        "any_circuit_open": false
+      },
+      "auto/best-free": {
+        "candidate_providers": 5,
+        "candidates": [
+          {
+            "provider": "nvidia",
+            "candidates": 20,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          },
+          {
+            "provider": "zai",
+            "candidates": 3,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": false
+          },
+          {
+            "provider": "opencode",
+            "candidates": 1,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          },
+          {
+            "provider": "openrouter",
+            "candidates": 4,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          },
+          {
+            "provider": "cloudflare-ai",
+            "candidates": 4,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": false
+          }
+        ],
+        "all_healthy": true,
+        "any_circuit_open": false
+      },
+      "auto/best-reasoning": {
+        "candidate_providers": 2,
+        "candidates": [
+          {
+            "provider": "nvidia",
+            "candidates": 2,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          },
+          {
+            "provider": "opencode",
+            "candidates": 2,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          }
+        ],
+        "all_healthy": true,
+        "any_circuit_open": false
+      },
+      "auto/best-vision": {
+        "candidate_providers": 2,
+        "candidates": [
+          {
+            "provider": "nvidia",
+            "candidates": 1,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          },
+          {
+            "provider": "antigravity",
+            "candidates": 2,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": false
+          }
+        ],
+        "all_healthy": true,
+        "any_circuit_open": false
+      },
+      "auto/chat": {
+        "candidate_providers": 1,
+        "candidates": [
+          {
+            "provider": "nvidia",
+            "candidates": 2,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          }
+        ],
+        "all_healthy": true,
+        "any_circuit_open": false
+      },
+      "auto/cheap": {
+        "candidate_providers": 5,
+        "candidates": [
+          {
+            "provider": "nvidia",
+            "candidates": 3,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          },
+          {
+            "provider": "antigravity",
+            "candidates": 11,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": false
+          },
+          {
+            "provider": "opencode",
+            "candidates": 1,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          },
+          {
+            "provider": "grok-cli",
+            "candidates": 2,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": false
+          },
+          {
+            "provider": "cloudflare-ai",
+            "candidates": 4,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": false
+          }
+        ],
+        "all_healthy": true,
+        "any_circuit_open": false
+      },
+      "auto/coding": {
+        "candidate_providers": 8,
+        "candidates": [
+          {
+            "provider": "groq",
+            "candidates": 2,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          },
+          {
+            "provider": "nvidia",
+            "candidates": 8,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          },
+          {
+            "provider": "felo-web",
+            "candidates": 3,
+            "health": "unknown",
+            "active": null,
+            "circuit": "CLOSED",
+            "free_eligible_provider": false
+          },
+          {
+            "provider": "opencode",
+            "candidates": 6,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          },
+          {
+            "provider": "codex",
+            "candidates": 9,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": false
+          },
+          {
+            "provider": "cloudflare-ai",
+            "candidates": 14,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": false
+          },
+          {
+            "provider": "antigravity",
+            "candidates": 2,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": false
+          },
+          {
+            "provider": "zai",
+            "candidates": 1,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": false
+          }
+        ],
+        "all_healthy": true,
+        "any_circuit_open": false
+      },
+      "auto/fast": {
+        "candidate_providers": 1,
+        "candidates": [
+          {
+            "provider": "nvidia",
+            "candidates": 2,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          }
+        ],
+        "all_healthy": true,
+        "any_circuit_open": false
+      },
+      "auto/gemini": {
+        "candidate_providers": 1,
+        "candidates": [
+          {
+            "provider": "antigravity",
+            "candidates": 7,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": false
+          }
+        ],
+        "all_healthy": true,
+        "any_circuit_open": false
+      },
+      "auto/glm": {
+        "candidate_providers": 3,
+        "candidates": [
+          {
+            "provider": "nvidia",
+            "candidates": 3,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          },
+          {
+            "provider": "openrouter",
+            "candidates": 1,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          },
+          {
+            "provider": "zai",
+            "candidates": 2,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": false
+          }
+        ],
+        "all_healthy": true,
+        "any_circuit_open": false
+      },
+      "auto/pro-chat": {
+        "candidate_providers": 1,
+        "candidates": [
+          {
+            "provider": "opencode",
+            "candidates": 2,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          }
+        ],
+        "all_healthy": true,
+        "any_circuit_open": false
+      },
+      "auto/pro-coding": {
+        "candidate_providers": 1,
+        "candidates": [
+          {
+            "provider": "nvidia",
+            "candidates": 3,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          }
+        ],
+        "all_healthy": true,
+        "any_circuit_open": false
+      },
+      "auto/pro-reasoning": {
+        "candidate_providers": 2,
+        "candidates": [
+          {
+            "provider": "nvidia",
+            "candidates": 1,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          },
+          {
+            "provider": "opencode",
+            "candidates": 2,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          }
+        ],
+        "all_healthy": true,
+        "any_circuit_open": false
+      },
+      "auto/reasoning": {
+        "candidate_providers": 1,
+        "candidates": [
+          {
+            "provider": "antigravity",
+            "candidates": 2,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": false
+          }
+        ],
+        "all_healthy": true,
+        "any_circuit_open": false
+      },
+      "auto/smart": {
+        "candidate_providers": 1,
+        "candidates": [
+          {
+            "provider": "nvidia",
+            "candidates": 2,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": true
+          }
+        ],
+        "all_healthy": true,
+        "any_circuit_open": false
+      },
+      "auto/vision": {
+        "candidate_providers": 1,
+        "candidates": [
+          {
+            "provider": "antigravity",
+            "candidates": 4,
+            "health": "active",
+            "active": true,
+            "circuit": "CLOSED",
+            "free_eligible_provider": false
+          }
+        ],
+        "all_healthy": true,
+        "any_circuit_open": false
+      }
+    },
+    "management_models": 101
+  },
+  "live_promotion": {
+    "promoted_at": "2026-09-21T22:54:56.563Z",
+    "live_build_sha": "7e5a2d80b",
+    "promoted_source_head": "7e5a2d80b23ea2e10b588581236abad1614a04a7",
+    "promoted_source_tree": "e83f412187bf46256fbe5429a6c80e85a16acb8e",
+    "artifact_sha256": "5899689363d8910a171fef65d28326bf9b26f16af95a74ff18d6db6492eb8bb3",
+    "free_access_policy": "strict",
+    "live_strict_pool_rows": 12,
+    "live_off_matrix_rows": 86,
+    "note": "RouteLab snapshot revalidated against the promoted live runtime (build 7e5a2d80b)"
+  }
 }
