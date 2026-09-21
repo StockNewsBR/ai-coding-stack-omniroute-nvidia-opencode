@@ -7,12 +7,18 @@ candidate as reviewable Git patches plus its provenance.
 
 - UPSTREAM_BASE_SHA=dea6bb8b6b64d3a3d9f639a044625c3452442c56
 - R1_SHA=864ddc1d57871827ab2be3a9235bab5f8c12bc48
+- R1_11_REPORT_SHA=26066ca07fab180f7f39d58abc56efe03205e28e
 - R2_SHA=af44c10b595cbe36d3e1168a9918d7f857ce5862
 - R3_SHA=309ae65f6976947ec74ac5998343d92ddf4e755e
 - R4_SHA=f7f739e661919452bd0fe8355e629ef223a33d51
 - FINAL_SOURCE_HEAD=7e5a2d80b23ea2e10b588581236abad1614a04a7
-- FINAL_SOURCE_TREE=e83f412187bf46256fbe5429a6a80e85a16acb8e
+- FINAL_SOURCE_TREE=e83f412187bf46256fbe5429a6c80e85a16acb8e
 - CERTIFICATION_COMMIT=bd994e3c1b8dd0c887fc6d988b785a083b753e3a
+
+> The mission brief spelled `FINAL_SOURCE_TREE` as `e83f412187bf46256fbe5429a6a80e85a16acb8e`
+> (single-character typo, `a6a80e` instead of `a6c80e`); that object does not exist in the
+> repository. The authoritative tree of `7e5a2d80b` is `e83f412187bf46256fbe5429a6c80e85a16acb8e`
+> as recorded above (and in the live closure report, limitation #4).
 
 Snapshot branch: `final/free-autopilot-2026-09-21`
 Snapshot branch HEAD: `bd994e3c1b8dd0c887fc6d988b785a083b753e3a`
@@ -30,6 +36,7 @@ Snapshot branch tree: `45a9effd3418a4128cf975aec249e84ad7af51c7`
 - `series/` — the same commits as 11 individual patches (`0001` … `0011`)
 - `COMMITS.txt` — branch name, HEAD SHA and the exact 11-commit list
 - `SOURCE_TREE.txt` — tree hash of the snapshot branch HEAD
+- `SHA256SUMS.txt` — SHA-256 of every file in this directory (including `series/`)
 
 ## Scope / exclusions
 
