@@ -40,6 +40,7 @@ export interface AutoComboCandidateView {
   provider: string;
   connectionId: string;
   model: string;
+  modelId: string;
   modelStr: string;
   excluded: boolean;
   reachable: boolean;
@@ -112,6 +113,7 @@ async function decorateCandidate(
     provider: string;
     connectionId: string;
     model: string;
+    modelId: string;
     modelStr: string;
   },
   freeOptions: FreeSentinelContext
@@ -136,12 +138,20 @@ async function decorateCandidate(
   }
 
   const modelLocked = isModelLocked(candidate.provider, candidate.connectionId, candidate.model);
-  const freeProjection = projectFreeEligibility(candidate, freeOptions);
+  const freeProjection = projectFreeEligibility(
+    {
+      provider: candidate.provider,
+      model: candidate.modelId,
+      connectionId: candidate.connectionId,
+    },
+    freeOptions
+  );
 
   return {
     provider: candidate.provider,
     connectionId: candidate.connectionId,
     model: candidate.model,
+    modelId: candidate.modelId,
     modelStr: candidate.modelStr,
     excluded: false,
     reachable: breakerReachable && !connectionCooldown && !modelLocked,
@@ -196,6 +206,7 @@ export async function getAutoComboCandidates(
     connectionId: string | null;
     allowedConnectionIds?: string[];
     model: string;
+    modelId?: string;
   }> = Array.isArray(virtualCombo?.models) ? virtualCombo.models : [];
   // Routing keeps one logical provider/model candidate, but the management API
   // remains account-oriented so operators can inspect and toggle each fallback.
@@ -214,6 +225,7 @@ export async function getAutoComboCandidates(
           provider: candidate.providerId,
           connectionId: candidate.connectionId,
           model: candidate.model,
+          modelId: candidate.modelId ?? candidate.model,
           modelStr: candidate.model,
         },
         freeOptions

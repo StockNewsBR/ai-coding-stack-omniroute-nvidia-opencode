@@ -902,6 +902,7 @@ export async function createVirtualAutoComboFromPrepared(
     id: `virtual-auto-${variant || "default"}-${index + 1}-${candidate.provider}`,
     kind: "model" as const,
     model: candidate.modelStr,
+    modelId: candidate.model,
     providerId: candidate.provider,
     connectionId: candidate.connectionId,
     ...(candidate.allowedConnectionIds
