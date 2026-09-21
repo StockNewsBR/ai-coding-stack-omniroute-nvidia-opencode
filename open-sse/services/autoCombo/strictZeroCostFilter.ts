@@ -23,6 +23,20 @@
  * handled automatically; one that doesn't is excluded automatically — see
  * `docs/routing/STRICT_ZERO_COST.md`.
  *
+ * ## Free cost classes (reconstruction, see `docs/routing/STRICT_ZERO_COST.md`)
+ *
+ * Admission is no longer "is it in FREE_MODEL_BUDGETS and freshly verified".
+ * `freeProviderSentinel.ts` classifies every candidate into exactly one of
+ * FREE_VERIFIED, SELF_HOSTED, FREE_UNKNOWN, UNKNOWN_COST, NULL_COST, PAID,
+ * CREDIT_BACKED or DISCONTINUED from catalog metadata plus the candidate's own
+ * connection shape; only FREE_VERIFIED and SELF_HOSTED are admissible. Live
+ * quota telemetry remains the headroom signal wherever it exists, but it is an
+ * optimization, NOT a gate, for routes with independent evidence they cannot
+ * spill into paid billing (self-hosted, keyless hard-free endpoint, or a
+ * `recurring-*` entry whose provider terms document a hard stop rather than
+ * pay-as-you-go billing). A positive EXHAUSTED reading still excludes, and
+ * every class outside the allowed set is rejected before any quota read runs.
+ *
  * ## Connection safety (fixed after code review, see `docs/routing/STRICT_ZERO_COST.md`)
  *
  * A candidate from `virtualFactory.ts`'s connection-based pool represents ONE
@@ -53,10 +67,7 @@ import {
   type FreeModelBudget,
 } from "@omniroute/open-sse/config/freeModelCatalog.ts";
 import { SYNTHETIC_NOAUTH_CONNECTION_ID } from "./resilienceCandidateFilter";
-
-/** Types whose allowance needs no runtime verification: no credential exists
- * for the candidate at all, so no request against it can ever be billed. */
-const KEYLESS_FREE_TYPES = new Set<FreeModelBudget["freeType"]>(["keyless"]);
+import { evaluateFreeSentinel, findFreeCatalogEntry } from "./freeProviderSentinel";
 
 export type FreeAccessStatus = "SAFE" | "EXHAUSTED" | "UNKNOWN";
 
@@ -128,40 +139,36 @@ export function findBudgetEntry(
   candidate: Pick<StrictZeroCostCandidate, "provider" | "model">,
   catalog: readonly FreeModelBudget[] = FREE_MODEL_BUDGETS
 ): FreeModelBudget | undefined {
-  return catalog.find((m) => m.provider === candidate.provider && m.modelId === candidate.model);
-}
-
-function isConnectionStateSafe(
-  provider: string,
-  connectionId: string,
-  resolveFreeAccessState: StrictZeroCostOptions["resolveFreeAccessState"],
-  options: Pick<StrictZeroCostOptions, "minRemainingAllowance" | "maxStateAgeMs" | "now">
-): boolean {
-  const state = resolveFreeAccessState(provider, connectionId);
-  if (!state) return false; // no usage adapter for this provider, or lookup never ran/is stale
-  if (state.status !== "SAFE") return false;
-
-  const now = (options.now ?? Date.now)();
-  const checkedAtMs = Date.parse(state.checkedAt);
-  if (!Number.isFinite(checkedAtMs) || now - checkedAtMs > options.maxStateAgeMs) return false;
-
-  if (state.remainingFreeAllowance === null) return false;
-  // A negative threshold would let a negative/garbage reading pass; a caller
-  // that genuinely wants "any allowance greater than zero" should pass 0.
-  if (options.minRemainingAllowance < 0) return false;
-  return state.remainingFreeAllowance > options.minRemainingAllowance;
+  return findFreeCatalogEntry(candidate, catalog);
 }
 
 /**
  * Decide which of a candidate's connections satisfy STRICT_ZERO_COST. Pure —
- * `resolveFreeAccessState` is the only injected side-effecting dependency,
- * and it's a synchronous cache read (see `StrictZeroCostOptions` above).
+ * `resolveFreeAccessState` is the only injected side-effecting dependency, and
+ * it's a synchronous cache read (see `StrictZeroCostOptions` above).
  *
- * Returns the list of connection ids proven SAFE right now:
+ * Admission is delegated to `freeProviderSentinel.ts`, which classifies the
+ * candidate into exactly one free-cost class and returns the connection ids
+ * that may be dispatched:
+ *   - `FREE_VERIFIED` — a genuine no-auth keyless endpoint, or a `recurring-*`
+ *     catalog entry with `hardStopGuaranteed: true`. A live quota reading is
+ *     honoured whenever it is fresh and usable: EXHAUSTED excludes that
+ *     connection, and a SAFE reading below the headroom threshold excludes it
+ *     too. An ABSENT / stale / UNKNOWN reading is advisory, not a gate — the
+ *     provider's own terms make free-tier exhaustion a hard stop, so the route
+ *     cannot spill into paid billing, and refusing it while telemetry is
+ *     missing would fail closed for no safety benefit.
+ *   - `SELF_HOSTED` — self-hosted/local provider ids: always dispatchable, no
+ *     cloud quota row exists or is required.
+ *   - every other class (FREE_UNKNOWN, UNKNOWN_COST, NULL_COST, PAID,
+ *     CREDIT_BACKED, DISCONTINUED) — excluded, and excluded BEFORE any quota
+ *     lookup runs, so an untrusted entry never costs a usage read.
+ *
+ * Returns the list of connection ids proven dispatchable right now:
  *   - `[SYNTHETIC_NOAUTH_CONNECTION_ID]` for a genuine no-auth candidate whose
  *     catalog entry is `keyless` — no live check needed or possible.
  *   - a (possibly empty) subset of the candidate's real connection id(s) for
- *     every other case, each individually verified.
+ *     every other case, each individually evaluated.
  * An empty array means the caller must exclude the candidate entirely.
  */
 export function evaluateCandidateConnections(
@@ -170,42 +177,14 @@ export function evaluateCandidateConnections(
   resolveFreeAccessState: StrictZeroCostOptions["resolveFreeAccessState"],
   options: Pick<StrictZeroCostOptions, "minRemainingAllowance" | "maxStateAgeMs" | "now">
 ): string[] {
-  if (!budgetEntry) return []; // not in the catalog at all → paid, or genuinely unknown
-
-  const isGenuineNoAuthCandidate = candidate.connectionId === SYNTHETIC_NOAUTH_CONNECTION_ID;
-  if (KEYLESS_FREE_TYPES.has(budgetEntry.freeType)) {
-    // The keyless shortcut is trustworthy ONLY when this specific candidate
-    // instance actually has no credential behind it. A `keyless`-catalogued
-    // model reached through a real DB connection (connectionId is a real id,
-    // or the candidate carries allowedConnectionIds at all) must NOT take
-    // this shortcut — it falls through to the quota-based check below like
-    // any other freeType, and is excluded there unless hardStopGuaranteed is
-    // also set for it (which the curated catalog does not do for keyless
-    // entries today, so it will correctly exclude).
-    if (isGenuineNoAuthCandidate) return [SYNTHETIC_NOAUTH_CONNECTION_ID];
-  }
-  if (budgetEntry.freeType === "discontinued") return [];
-  if (isGenuineNoAuthCandidate) return []; // no-auth path but a non-keyless catalog entry: contradictory metadata, fail closed
-
-  // Every remaining freeType (recurring-*, one-time-initial, a keyless entry
-  // reached via a real connection, and any future type this module doesn't
-  // special-case) requires a documented hard stop before any live check even
-  // runs — no point burning a quota lookup on a connection we could never
-  // trust regardless of its answer.
-  if (budgetEntry.hardStopGuaranteed !== true) return [];
-
-  const candidateConnectionIds = candidate.connectionId
-    ? [candidate.connectionId]
-    : (candidate.allowedConnectionIds ?? []);
-
-  const safe: string[] = [];
-  for (const connectionId of candidateConnectionIds) {
-    if (connectionId === SYNTHETIC_NOAUTH_CONNECTION_ID) continue; // never reachable here, defensive
-    if (isConnectionStateSafe(candidate.provider, connectionId, resolveFreeAccessState, options)) {
-      safe.push(connectionId);
-    }
-  }
-  return safe;
+  const facts = evaluateFreeSentinel(candidate, {
+    entry: budgetEntry,
+    resolveFreeAccessState,
+    minRemainingAllowance: options.minRemainingAllowance,
+    maxStateAgeMs: options.maxStateAgeMs,
+    now: options.now,
+  });
+  return facts.safeConnectionIds;
 }
 
 /**

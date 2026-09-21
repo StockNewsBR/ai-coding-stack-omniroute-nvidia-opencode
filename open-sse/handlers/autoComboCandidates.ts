@@ -14,12 +14,27 @@
  *     provider_connections row (no-auth synthetic connections have no row —
  *     treated as always reachable on this axis).
  *   - model lockout: `isModelLocked(provider, connectionId, model)`.
+ *   - free-cost class: `evaluateFreeSentinel(...)` projects the cost class
+ *     (`FREE_VERIFIED` / `SELF_HOSTED` / ...), whether AUTO FREE routing may
+ *     pick the candidate, the reason code and the cached quota status — via the
+ *     cache-only quota read, so listing candidates never probes a provider.
  */
 import { buildErrorBody } from "@omniroute/open-sse/utils/error.ts";
 import { getCircuitBreaker } from "@/shared/utils/circuitBreaker";
 import { isModelLocked } from "@omniroute/open-sse/services/accountFallback.ts";
 import { getProviderConnectionById } from "@/lib/db/providers";
 import { getExcludedConnectionIds } from "@/lib/db/autoCandidateOverrides";
+import { getSettings } from "@/lib/db/settings";
+import { toNumber } from "@/shared/utils/numeric";
+import { FREE_MODEL_BUDGETS } from "@omniroute/open-sse/config/freeModelCatalog.ts";
+import {
+  evaluateFreeSentinel,
+  type FreeCostClass,
+  type FreeQuotaStatus,
+  type FreeSentinelContext,
+  type FreeSentinelReason,
+} from "@omniroute/open-sse/services/autoCombo/freeProviderSentinel.ts";
+import { readFreeAccessStateCached } from "@omniroute/open-sse/services/autoCombo/freeAccessQuota.ts";
 
 export interface AutoComboCandidateView {
   provider: string;
@@ -31,6 +46,12 @@ export interface AutoComboCandidateView {
   breakerState: string;
   connectionCooldown: boolean;
   modelLocked: boolean;
+  /** Free-cost class from `freeProviderSentinel.ts` (advisory, read-only). */
+  freeCostClass: FreeCostClass;
+  autoFreeEligible: boolean;
+  autoFreeReason: FreeSentinelReason;
+  /** Cached quota status: SAFE | EXHAUSTED | UNKNOWN | ABSENT (no telemetry). */
+  quotaStatus: FreeQuotaStatus;
 }
 
 export interface AutoComboCandidatesResult {
@@ -44,12 +65,57 @@ function hasFutureRateLimit(value: unknown): boolean {
   return Number.isFinite(time) && time > Date.now();
 }
 
-async function decorateCandidate(candidate: {
-  provider: string;
-  connectionId: string;
-  model: string;
-  modelStr: string;
-}): Promise<AutoComboCandidateView> {
+interface FreeCostProjection {
+  freeCostClass: FreeCostClass;
+  autoFreeEligible: boolean;
+  autoFreeReason: FreeSentinelReason;
+  quotaStatus: FreeQuotaStatus;
+}
+
+/**
+ * Projects the free-cost classification for one account-oriented candidate.
+ * Read-only: `options.resolveFreeAccessState` must be the cache-only reader, so
+ * this never triggers a provider request. Fails open to "not eligible" so an
+ * unexpected sentinel error cannot break the listing.
+ */
+function projectFreeEligibility(
+  candidate: { provider: string; model: string; connectionId: string },
+  options: FreeSentinelContext
+): FreeCostProjection {
+  try {
+    const facts = evaluateFreeSentinel(
+      {
+        provider: candidate.provider,
+        model: candidate.model,
+        connectionId: candidate.connectionId,
+      },
+      options
+    );
+    return {
+      freeCostClass: facts.costClass,
+      autoFreeEligible: facts.autoFreeAllowed,
+      autoFreeReason: facts.reason,
+      quotaStatus: facts.quotaStatus,
+    };
+  } catch {
+    return {
+      freeCostClass: "UNKNOWN_COST",
+      autoFreeEligible: false,
+      autoFreeReason: "UNKNOWN_COST_EXCLUDED",
+      quotaStatus: "ABSENT",
+    };
+  }
+}
+
+async function decorateCandidate(
+  candidate: {
+    provider: string;
+    connectionId: string;
+    model: string;
+    modelStr: string;
+  },
+  freeOptions: FreeSentinelContext
+): Promise<AutoComboCandidateView> {
   const breaker = getCircuitBreaker(candidate.provider);
   const breakerStatus = breaker.getStatus();
   const breakerReachable = breaker.canExecute();
@@ -70,6 +136,7 @@ async function decorateCandidate(candidate: {
   }
 
   const modelLocked = isModelLocked(candidate.provider, candidate.connectionId, candidate.model);
+  const freeProjection = projectFreeEligibility(candidate, freeOptions);
 
   return {
     provider: candidate.provider,
@@ -81,6 +148,7 @@ async function decorateCandidate(candidate: {
     breakerState: String(breakerStatus.state),
     connectionCooldown,
     modelLocked,
+    ...freeProjection,
   };
 }
 
@@ -114,6 +182,15 @@ export async function getAutoComboCandidates(
     ? await getExcludedConnectionIds(apiKeyId, modelStr).catch(() => new Set<string>())
     : new Set<string>();
 
+  // Same 1pp headroom / settings TTL as virtualFactory's strict filter (keep in sync).
+  const settings = await getSettings().catch(() => null);
+  const freeOptions: FreeSentinelContext = {
+    catalog: FREE_MODEL_BUDGETS,
+    resolveFreeAccessState: readFreeAccessStateCached,
+    minRemainingAllowance: 1,
+    maxStateAgeMs: toNumber(settings?.autoRefreshProviderQuotaInterval, 180) * 1000,
+  };
+
   const models: Array<{
     providerId: string;
     connectionId: string | null;
@@ -132,12 +209,15 @@ export async function getAutoComboCandidates(
 
   const candidates = await Promise.all(
     accountCandidates.map(async (candidate) => {
-      const decorated = await decorateCandidate({
-        provider: candidate.providerId,
-        connectionId: candidate.connectionId,
-        model: candidate.model,
-        modelStr: candidate.model,
-      });
+      const decorated = await decorateCandidate(
+        {
+          provider: candidate.providerId,
+          connectionId: candidate.connectionId,
+          model: candidate.model,
+          modelStr: candidate.model,
+        },
+        freeOptions
+      );
       return { ...decorated, excluded: excludedConnectionIds.has(candidate.connectionId) };
     })
   );

@@ -142,39 +142,62 @@ test("EXHAUSTED status excludes even with a fresh checkedAt", () => {
   );
 });
 
-// 7. usage adapter absent (no state resolvable) → EXCLUDE
-test("quota-based candidate with no resolvable state is excluded, not assumed safe", () => {
+// 7. no live telemetry (adapter cold / never fetched) → ADMITTED for a
+// hardStopGuaranteed route: the catalog entry documents that exceeding the free
+// allowance is a hard stop, not billing, so the route cannot spill into paid
+// spend. Live telemetry is an optimization, not a gate (R1 reconstruction).
+test("hard-stop-verified candidate with no resolvable telemetry stays admitted", () => {
   const entry = FREE_MODEL_BUDGETS.find(
     (m) => m.provider === "groq" && m.modelId === "llama-3.3-70b-versatile"
   );
   assert.deepEqual(
     evaluateCandidateConnections(QUOTA_SAFE, entry, () => undefined, BASE_OPTIONS),
-    []
+    [REAL_CONN]
   );
 });
 
-// 8. usage API error → EXCLUDE (modeled as UNKNOWN status; freeAccessQuota.ts
-// deletes the cache entry on a failed refresh, which resolves to `undefined`
-// here — same assertion as #7, the important contract is "never falls back to SAFE").
-test("UNKNOWN status excludes", () => {
+// 8. usage API error → telemetry unusable (freeAccessQuota.ts deletes the cache
+// entry on a failed refresh, which also resolves to `undefined`). For a
+// hardStopGuaranteed route this means "telemetry unavailable", not "exhausted".
+test("UNKNOWN status stays admitted for a hard-stop-verified route", () => {
   const entry = FREE_MODEL_BUDGETS.find(
     (m) => m.provider === "groq" && m.modelId === "llama-3.3-70b-versatile"
   );
   const state = freshState({ status: "UNKNOWN", remainingFreeAllowance: null });
   assert.deepEqual(
     evaluateCandidateConnections(QUOTA_SAFE, entry, () => state, BASE_OPTIONS),
-    []
+    [REAL_CONN]
   );
 });
 
-// 9. usage state stale → EXCLUDE
-test("stale checkedAt excludes even when status is SAFE", () => {
+// 9. usage state stale → telemetry unusable, same as #7/#8: a hard-stop-verified
+// route stays admitted rather than failing closed on a stale sample.
+test("stale checkedAt stays admitted for a hard-stop-verified route", () => {
   const entry = FREE_MODEL_BUDGETS.find(
     (m) => m.provider === "groq" && m.modelId === "llama-3.3-70b-versatile"
   );
   const stale = freshState({ checkedAt: "2026-08-19T00:00:00.000Z" }); // >24h before NOW
   assert.deepEqual(
     evaluateCandidateConnections(QUOTA_SAFE, entry, () => stale, BASE_OPTIONS),
+    [REAL_CONN]
+  );
+});
+
+// Compensating guard (R1): the same missing telemetry must NOT admit a route
+// with no hard-stop proof — unproven metadata still fails closed.
+test("no telemetry still excludes a route without hard-stop proof", () => {
+  const entry = {
+    provider: "synthetic-unproven",
+    modelId: "synthetic-model",
+    displayName: "Synthetic unproven tier",
+    monthlyTokens: 1_000_000,
+    creditTokens: 0,
+    freeType: "recurring-daily" as const,
+    poolKey: null,
+    tos: "ok" as const,
+  };
+  assert.deepEqual(
+    evaluateCandidateConnections(QUOTA_SAFE, entry, () => undefined, BASE_OPTIONS),
     []
   );
 });

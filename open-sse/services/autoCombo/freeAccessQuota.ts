@@ -13,6 +13,11 @@
  * fail-closed) and kicks off a background refresh for the *next* read —
  * nothing here can make `strictZeroCostFilter.ts`'s pool build block on a
  * network call.
+ *
+ * `readFreeAccessStateCached()` is the cache-only sibling used by read-only
+ * inspection paths (`autoComboCandidates.ts`): same gates, same freshness
+ * rule, but it NEVER triggers a refresh, so merely listing candidates cannot
+ * cause a provider request. A miss/stale entry reads as `undefined`.
  */
 import {
   getUsageForProvider,
@@ -196,6 +201,28 @@ export function resolveFreeAccessState(
     void refresh(provider, connectionId);
   }
   return fresh ? entry.state : undefined;
+}
+
+/**
+ * Cache-only sibling of `resolveFreeAccessState()` for read-only inspection
+ * paths. Applies the exact same gates (usage-adapter presence, connection id)
+ * and the same freshness rule, but it never calls `refresh()`: a read-only
+ * endpoint must not trigger a provider request as a side effect of being
+ * called. Anything cold or stale simply reads as `undefined` (→ ABSENT/UNKNOWN
+ * for the caller), which the sentinel treats as "no telemetry available"
+ * rather than "exhausted".
+ */
+export function readFreeAccessStateCached(
+  provider: string,
+  connectionId: string | undefined
+): FreeAccessState | undefined {
+  sweepIfDue();
+  if (!USAGE_FETCHER_PROVIDER_SET.has(provider as UsageFetcherProvider)) return undefined;
+  if (!connectionId) return undefined;
+
+  const entry = cache.get(cacheKey(provider, connectionId));
+  if (!entry) return undefined;
+  return Date.now() - entry.fetchedAtMs <= ttlMs() ? entry.state : undefined;
 }
 
 /** Called by `accountFallback.ts` the moment a 402/403/quota-exhausted
