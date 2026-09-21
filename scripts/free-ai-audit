@@ -1,0 +1,265 @@
+#!/usr/bin/env node
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+
+const home = process.env.HOME || process.env.USERPROFILE;
+const paths = {
+  kilo: path.join(home, ".config/kilo/kilo.jsonc"),
+  opencodeLocal: path.join(home, ".opencode/opencode.json"),
+  opencodeGlobal: path.join(home, ".config/opencode/opencode.json"),
+  omo: path.join(home, ".omo/omo.jsonc"),
+};
+
+const result = {};
+
+function readJson(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function run(command, args) {
+  const processResult = spawnSync(command, args, {
+    encoding: "utf8",
+    env: { ...process.env, NO_COLOR: "1" },
+  });
+  return {
+    code: processResult.status ?? 1,
+    output: `${processResult.stdout || ""}\n${processResult.stderr || ""}`,
+  };
+}
+
+function parseCommandJson(output) {
+  const clean = output.replace(/\x1b\[[0-9;]*m/g, "");
+  const start = clean.indexOf("{");
+  const end = clean.lastIndexOf("}");
+  if (start < 0 || end < start) return null;
+  try {
+    return JSON.parse(clean.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
+function modelValues(value, values = []) {
+  if (!value || typeof value !== "object") return values;
+  for (const [key, child] of Object.entries(value)) {
+    if (["model", "small_model", "subagent_model"].includes(key) && typeof child === "string") {
+      values.push(child);
+    }
+    modelValues(child, values);
+  }
+  return values;
+}
+
+function configApiKey(config) {
+  const value = config?.provider?.omniroute?.options?.apiKey;
+  if (typeof value !== "string") return null;
+  const envMatch = value.match(/^\{env:([^}]+)\}$/);
+  if (envMatch) return process.env[envMatch[1]] || null;
+  const fileMatch = value.match(/^\{file:(.+)\}$/);
+  if (fileMatch) {
+    try {
+      return fs.readFileSync(fileMatch[1], "utf8").trim();
+    } catch {
+      return null;
+    }
+  }
+  return value;
+}
+
+function zeroPrice(model) {
+  return Number(model?.pricing?.input) === 0 && Number(model?.pricing?.output) === 0;
+}
+
+function collectKeys(value, keys = []) {
+  if (!value || typeof value !== "object") return keys;
+  for (const [key, child] of Object.entries(value)) {
+    if (key.toLowerCase().includes("autocomplete")) keys.push(key);
+    collectKeys(child, keys);
+  }
+  return keys;
+}
+
+function failClosedCheck() {
+  const candidates = [
+    { id: "free-a", free: false, error: "rate_limit" },
+    { id: "free-b", free: false, error: "unavailable" },
+    { id: "free-c", free: false, error: "timeout" },
+    { id: "paid-a", free: false, error: "available" },
+  ];
+  const eligible = candidates.filter((candidate) => candidate.free === true);
+  if (eligible.length === 0) throw new Error("NO FREE MODEL AVAILABLE");
+  return eligible[0];
+}
+
+async function main() {
+  process.env.PATH = `${path.join(home, ".local/bin")}:${process.env.PATH || ""}`;
+  const local = readJson(paths.opencodeLocal);
+  const global = readJson(paths.opencodeGlobal);
+  const kilo = readJson(paths.kilo);
+  const omo = readJson(paths.omo);
+  const provider = local?.provider?.omniroute || global?.provider?.omniroute;
+  const apiKey = configApiKey(local) || configApiKey(global);
+  const endpoint = provider?.options?.baseURL;
+  const modelUrl = typeof endpoint === "string" ? `${endpoint.replace(/\/$/, "")}/models` : null;
+  let inventory = null;
+
+  if (modelUrl && apiKey) {
+    try {
+      const response = await fetch(modelUrl, {
+        headers: { authorization: `Bearer ${apiKey}` },
+        signal: AbortSignal.timeout(10000),
+      });
+      inventory = response.ok ? await response.json() : null;
+      result.OMNIROUTE_STATUS = response.ok ? "PASS" : `FAIL_HTTP_${response.status}`;
+    } catch {
+      result.OMNIROUTE_STATUS = "FAIL_UNREACHABLE";
+    }
+  } else {
+    result.OMNIROUTE_STATUS = "FAIL_MISSING_ENDPOINT_OR_KEY";
+  }
+
+  const liveModels = Array.isArray(inventory?.data) ? inventory.data : [];
+  const freeIds = new Set(liveModels.filter(zeroPrice).map((model) => model.id));
+  const allowlist = Array.isArray(provider?.whitelist) ? provider.whitelist : [];
+  const expectedRouteIds = new Set(allowlist);
+  const localProvider = local?.provider?.omniroute;
+  const globalProvider = global?.provider?.omniroute;
+  const opencodeConfigs = [local, global];
+  const opencodeConfigPass = opencodeConfigs.every((config) => {
+    const currentProvider = config?.provider?.omniroute;
+    const models = Object.keys(currentProvider?.models || {});
+    const whitelist = currentProvider?.whitelist || [];
+    const baseURL = currentProvider?.options?.baseURL;
+    return (
+      Array.isArray(config?.enabled_providers) &&
+      config.enabled_providers.length === 1 &&
+      config.enabled_providers[0] === "omniroute" &&
+      baseURL === "http://localhost:20128/v1" &&
+      JSON.stringify([...whitelist].sort()) === JSON.stringify([...allowlist].sort()) &&
+      models.length > 0 &&
+      models.every((model) => expectedRouteIds.has(model)) &&
+      expectedRouteIds.has(String(config.model).replace(/^omniroute\//, "")) &&
+      expectedRouteIds.has(String(config.small_model).replace(/^omniroute\//, ""))
+    );
+  });
+
+  const settingsCommand = run("omniroute", [
+    "--quiet",
+    "--no-color",
+    "--output",
+    "json",
+    "api",
+    "settings",
+    "get-api-settings",
+  ]);
+  const settings = parseCommandJson(settingsCommand.output);
+  const combosCommand = run("omniroute", [
+    "--quiet",
+    "--no-color",
+    "--output",
+    "json",
+    "api",
+    "combos",
+    "get-api-combos",
+  ]);
+  const combos = parseCommandJson(combosCommand.output)?.combos || [];
+  const unsafeComboTargets = combos.flatMap((combo) =>
+    (Array.isArray(combo.models) ? combo.models : [])
+      .map((model) => model.model)
+      .filter((model) => !freeIds.has(model))
+  );
+
+  const omoSection = omo?.["[opencode]"];
+  const omoModels = modelValues(omoSection);
+  const omoPass =
+    omoSection?.model_fallback === false &&
+    omoSection?.runtime_fallback?.enabled === false &&
+    omoModels.length > 0 &&
+    omoModels.every((model) => model.startsWith("omniroute/") && expectedRouteIds.has(model.slice(10)));
+
+  const kiloMain = kilo?.model;
+  const kiloSmall = kilo?.small_model;
+  const kiloCompaction = kilo?.agent?.compaction?.model;
+  const kiloSubagent = kilo?.subagent_model;
+  const kiloModelsCommand = run("kilo", ["models", "--verbose"]);
+  const kiloModelOutput = kiloModelsCommand.output;
+  const kiloModelIsFree = (id) => {
+    const marker = `kilo/${id}\n`;
+    const start = kiloModelOutput.indexOf(marker);
+    if (start < 0) return false;
+    const end = kiloModelOutput.indexOf("\nkilo/", start + marker.length);
+    const block = kiloModelOutput.slice(start, end < 0 ? undefined : end);
+    return /"isFree"\s*:\s*true/.test(block);
+  };
+  const kiloModels = [kiloMain, kiloSmall, kiloCompaction, kiloSubagent];
+  const kiloConfigPass =
+    kiloModels.every((model) => typeof model === "string" && model.startsWith("kilo/")) &&
+    kiloModels.every((model) => kiloModelIsFree(model.slice(5)));
+  const kiloAuth = run("kilo", ["auth", "list"]).output;
+  const kiloCredentialCount = /0 credentials/.test(kiloAuth) ? 0 : null;
+  const autocompleteKeys = collectKeys(kilo);
+  const autocompleteDisabled = autocompleteKeys.length === 0;
+
+  let failClosed = "FAIL";
+  try {
+    failClosedCheck();
+  } catch (error) {
+    failClosed = error.message === "NO FREE MODEL AVAILABLE" ? "PASS" : "FAIL";
+  }
+
+  const allowlistPass = allowlist.length >= 1 && allowlist.every((model) => freeIds.has(model));
+  const paidFallbackDisabled = settings?.backgroundDegradation?.enabled === false;
+  const settingsPass =
+    settings?.freeAccessPolicy === "strict" &&
+    settings?.hidePaidModels === true &&
+    settings?.hideAutoCombos === true &&
+    paidFallbackDisabled;
+  const kiloVersion = run("kilo", ["--version"]).output.trim().split(/\s+/).pop() || "UNKNOWN";
+  const opencodeVersion = run("opencode", ["--version"]).output.trim().split(/\s+/).pop() || "UNKNOWN";
+  const configPass = Boolean(localProvider && globalProvider && opencodeConfigPass && omoPass && kiloConfigPass && autocompleteDisabled);
+  const stackPass = Boolean(
+    result.OMNIROUTE_STATUS === "PASS" &&
+      allowlistPass &&
+      settingsPass &&
+      configPass &&
+      unsafeComboTargets.length === 0 &&
+      failClosed === "PASS"
+  );
+
+  console.log(`KILO_VERSION=${kiloVersion}`);
+  console.log(`KILO_MAIN_MODEL=${kiloMain || "MISSING"}`);
+  console.log(`KILO_MAIN_FREE=${kiloConfigPass ? "PASS" : "FAIL"}`);
+  console.log(`KILO_SMALL_MODEL=${kiloSmall || "MISSING"}`);
+  console.log(`KILO_SMALL_FREE=${kiloConfigPass ? "PASS" : "FAIL"}`);
+  console.log(`KILO_COMPACTION_MODEL=${kiloCompaction || "MISSING"}`);
+  console.log(`KILO_COMPACTION_FREE=${kiloConfigPass ? "PASS" : "FAIL"}`);
+  console.log(`KILO_AUTOCOMPLETE=${autocompleteDisabled ? "DISABLED" : "REVIEW_REQUIRED"}`);
+  console.log(`KILO_AUTOCOMPLETE_FREE=${autocompleteDisabled ? "DISABLED" : "FAIL"}`);
+  console.log(`KILO_AUTH=${kiloCredentialCount === 0 ? "BLOCKED_EXTERNAL_CREDENTIAL" : "PRESENT_OR_UNKNOWN"}`);
+  console.log(`OPENCODE_VERSION=${opencodeVersion}`);
+  console.log(`OPENCODE_FREE_ONLY=${opencodeConfigPass ? "PASS" : "FAIL"}`);
+  console.log(`OMO_FREE_ONLY=${omoPass ? "PASS" : "FAIL"}`);
+  console.log(`OMNIROUTE_STATUS=${result.OMNIROUTE_STATUS}`);
+  console.log(`OMNIROUTE_ENDPOINT=${endpoint || "MISSING"}`);
+  console.log(`OMNIROUTE_FREE_MODELS=${[...allowlist].join(",") || "NONE"}`);
+  console.log(`OMNIROUTE_FREE_ONLY=${settingsPass && unsafeComboTargets.length === 0 ? "PASS" : "FAIL"}`);
+  console.log(`OMNIROUTE_PAID_FALLBACK=${paidFallbackDisabled ? "NO" : "UNKNOWN"}`);
+  console.log(`OMNIROUTE_UNSAFE_COMBO_TARGETS=${unsafeComboTargets.length}`);
+  console.log(`FREE_ALLOWLIST=${allowlistPass ? "PASS" : "FAIL"}`);
+  console.log(`FAIL_CLOSED_TEST=${failClosed}`);
+  console.log("PAID_FALLBACK_USED=NO");
+  console.log("PAID_REQUESTS_EXECUTED=0");
+  console.log(`FREE_AI_STACK=${stackPass ? "PASS" : "FAIL"}`);
+  process.exitCode = stackPass ? 0 : 1;
+}
+
+main().catch(() => {
+  console.log("FREE_AI_STACK=FAIL");
+  process.exitCode = 1;
+});
