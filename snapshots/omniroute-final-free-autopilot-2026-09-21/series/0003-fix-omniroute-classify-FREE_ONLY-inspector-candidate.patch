@@ -1,0 +1,84 @@
+From 2e10170e8a481ef40af4bdda9f0fb390eab96bc7 Mon Sep 17 00:00:00 2001
+From: StockNewsBR <264292956+StockNewsBR@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 18:24:50 -0300
+Subject: [PATCH 03/11] fix(omniroute): classify FREE_ONLY inspector candidates
+ by bare model id
+
+---
+ open-sse/handlers/autoComboCandidates.ts      | 14 +++++++++++++-
+ open-sse/services/autoCombo/virtualFactory.ts |  1 +
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/open-sse/handlers/autoComboCandidates.ts b/open-sse/handlers/autoComboCandidates.ts
+index 14ccc4aed..7e461f9f3 100644
+--- a/open-sse/handlers/autoComboCandidates.ts
++++ b/open-sse/handlers/autoComboCandidates.ts
+@@ -40,6 +40,7 @@ export interface AutoComboCandidateView {
+   provider: string;
+   connectionId: string;
+   model: string;
++  modelId: string;
+   modelStr: string;
+   excluded: boolean;
+   reachable: boolean;
+@@ -112,6 +113,7 @@ async function decorateCandidate(
+     provider: string;
+     connectionId: string;
+     model: string;
++    modelId: string;
+     modelStr: string;
+   },
+   freeOptions: FreeSentinelContext
+@@ -136,12 +138,20 @@ async function decorateCandidate(
+   }
+ 
+   const modelLocked = isModelLocked(candidate.provider, candidate.connectionId, candidate.model);
+-  const freeProjection = projectFreeEligibility(candidate, freeOptions);
++  const freeProjection = projectFreeEligibility(
++    {
++      provider: candidate.provider,
++      model: candidate.modelId,
++      connectionId: candidate.connectionId,
++    },
++    freeOptions
++  );
+ 
+   return {
+     provider: candidate.provider,
+     connectionId: candidate.connectionId,
+     model: candidate.model,
++    modelId: candidate.modelId,
+     modelStr: candidate.modelStr,
+     excluded: false,
+     reachable: breakerReachable && !connectionCooldown && !modelLocked,
+@@ -196,6 +206,7 @@ export async function getAutoComboCandidates(
+     connectionId: string | null;
+     allowedConnectionIds?: string[];
+     model: string;
++    modelId?: string;
+   }> = Array.isArray(virtualCombo?.models) ? virtualCombo.models : [];
+   // Routing keeps one logical provider/model candidate, but the management API
+   // remains account-oriented so operators can inspect and toggle each fallback.
+@@ -214,6 +225,7 @@ export async function getAutoComboCandidates(
+           provider: candidate.providerId,
+           connectionId: candidate.connectionId,
+           model: candidate.model,
++          modelId: candidate.modelId ?? candidate.model,
+           modelStr: candidate.model,
+         },
+         freeOptions
+diff --git a/open-sse/services/autoCombo/virtualFactory.ts b/open-sse/services/autoCombo/virtualFactory.ts
+index ccadba995..7c2d36e38 100644
+--- a/open-sse/services/autoCombo/virtualFactory.ts
++++ b/open-sse/services/autoCombo/virtualFactory.ts
+@@ -902,6 +902,7 @@ export async function createVirtualAutoComboFromPrepared(
+     id: `virtual-auto-${variant || "default"}-${index + 1}-${candidate.provider}`,
+     kind: "model" as const,
+     model: candidate.modelStr,
++    modelId: candidate.model,
+     providerId: candidate.provider,
+     connectionId: candidate.connectionId,
+     ...(candidate.allowedConnectionIds
+-- 
+2.53.0
+

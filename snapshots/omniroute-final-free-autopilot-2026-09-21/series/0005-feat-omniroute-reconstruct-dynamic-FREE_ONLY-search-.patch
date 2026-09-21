@@ -1,0 +1,841 @@
+From af44c10b595cbe36d3e1168a9918d7f857ce5862 Mon Sep 17 00:00:00 2001
+From: StockNewsBR <264292956+StockNewsBR@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 18:33:57 -0300
+Subject: [PATCH 05/11] feat(omniroute): reconstruct dynamic FREE_ONLY search
+ routing
+
+---
+ open-sse/services/searchFreeRouting.ts | 293 +++++++++++++++++++
+ src/app/api/v1/search/route.ts         | 133 ++++++++-
+ tests/unit/search-free-routing.test.ts | 371 +++++++++++++++++++++++++
+ 3 files changed, 796 insertions(+), 1 deletion(-)
+ create mode 100644 open-sse/services/searchFreeRouting.ts
+ create mode 100644 tests/unit/search-free-routing.test.ts
+
+diff --git a/open-sse/services/searchFreeRouting.ts b/open-sse/services/searchFreeRouting.ts
+new file mode 100644
+index 000000000..4e2421202
+--- /dev/null
++++ b/open-sse/services/searchFreeRouting.ts
+@@ -0,0 +1,293 @@
++/**
++ * FREE_ONLY search routing for `POST /v1/search`.
++ *
++ * Search counterpart to the model-side FREE_ONLY admission in
++ * `autoCombo/freeProviderSentinel.ts`: it does NOT open a parallel search
++ * gateway — the native route keeps owning credentials, cache and execution —
++ * it only (a) classifies the search providers already declared in
++ * `SEARCH_PROVIDERS` from their registry metadata (cost + quota + auth),
++ * (b) orders the eligible free providers into a bounded chain, and (c) provides
++ * the deterministic quality gate and URL dedup applied to each leg.
++ *
++ * Free eligibility is metadata-only and shortlist-free: any provider that is
++ * provably no-cost (FREE_VERIFIED) or self-hosted (SELF_HOSTED) is eligible;
++ * paid / credit-backed / unknown-cost / free-unknown providers never are.
++ */
++import {
++  isUnconfiguredLoopbackSearchProvider,
++  supportsSearchType,
++  type SearchProviderConfig,
++} from "../config/searchRegistry.ts";
++import type { FreeCostClass } from "./autoCombo/freeProviderSentinel.ts";
++import type { SearchResult } from "../handlers/search.ts";
++
++/** Provider selector that opts a `/v1/search` request into FREE_ONLY routing. */
++export const FREE_ONLY_SEARCH_SELECTOR = "auto/search:free";
++
++/** Terminal error when no eligible free provider remains — never a paid fallback. */
++export const NO_FREE_SEARCH_PROVIDER_AVAILABLE = "NO_FREE_SEARCH_PROVIDER_AVAILABLE";
++
++/** Circuit-breaker name namespace so search legs never collide with model legs. */
++export const FREE_SEARCH_BREAKER_PREFIX = "search:";
++
++export type SearchFreeStatus = FreeCostClass;
++
++export const FREE_ELIGIBLE_SEARCH_STATUSES: readonly SearchFreeStatus[] = [
++  "FREE_VERIFIED",
++  "SELF_HOSTED",
++];
++
++const SELF_HOSTED_HOST_PREFIXES = [
++  "localhost",
++  "127.",
++  "10.",
++  "192.168.",
++  "0.0.0.0",
++  "::1",
++  "[::1]",
++] as const;
++
++const SELF_HOSTED_HOST_SUFFIXES = [".local", ".internal", ".localhost"] as const;
++
++function isPrivateIpv4(host: string): boolean {
++  if (!host.startsWith("172.")) return false;
++  const second = Number(host.split(".")[1]);
++  return Number.isFinite(second) && second >= 16 && second <= 31;
++}
++
++export function isSelfHostedBaseUrl(baseUrl: string | undefined | null): boolean {
++  if (!baseUrl || typeof baseUrl !== "string") return false;
++  let host = "";
++  try {
++    host = new URL(baseUrl).hostname.toLowerCase();
++  } catch {
++    host =
++      baseUrl
++        .trim()
++        .toLowerCase()
++        .replace(/^[a-z]+:\/\//, "")
++        .split("/")[0]
++        ?.split(":")[0] ?? "";
++  }
++  if (!host) return false;
++  if (isPrivateIpv4(host)) return true;
++  return (
++    SELF_HOSTED_HOST_PREFIXES.some((prefix) => host === prefix || host.startsWith(prefix)) ||
++    SELF_HOSTED_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix))
++  );
++}
++
++export function classifySearchProviderFreeStatus(
++  provider: Pick<SearchProviderConfig, "baseUrl" | "authType" | "costPerQuery" | "freeMonthlyQuota">
++): SearchFreeStatus {
++  const cost = provider.costPerQuery;
++  if (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0) return "UNKNOWN_COST";
++  if (cost === 0) {
++    if (isSelfHostedBaseUrl(provider.baseUrl)) return "SELF_HOSTED";
++    if (provider.authType === "none") return "FREE_VERIFIED";
++    return (provider.freeMonthlyQuota ?? 0) > 0 ? "FREE_VERIFIED" : "FREE_UNKNOWN";
++  }
++  return (provider.freeMonthlyQuota ?? 0) > 0 ? "CREDIT_BACKED" : "PAID";
++}
++
++export function isFreeEligibleStatus(status: SearchFreeStatus): boolean {
++  return FREE_ELIGIBLE_SEARCH_STATUSES.includes(status);
++}
++
++export interface FreeSearchChainEntry {
++  config: SearchProviderConfig;
++  freeStatus: SearchFreeStatus;
++}
++
++export function buildFreeSearchChain(
++  providers: readonly SearchProviderConfig[],
++  options: { searchType: string; isBlocked?: (providerId: string) => boolean }
++): FreeSearchChainEntry[] {
++  const isBlocked = options.isBlocked ?? (() => false);
++  const ordered: Array<FreeSearchChainEntry & { order: number }> = [];
++  providers.forEach((config, order) => {
++    if (config.disabled) return;
++    if (!supportsSearchType(config, options.searchType)) return;
++    if (isBlocked(config.id)) return;
++    if (isUnconfiguredLoopbackSearchProvider(config)) return;
++    const freeStatus = classifySearchProviderFreeStatus(config);
++    if (!isFreeEligibleStatus(freeStatus)) return;
++    ordered.push({ config, freeStatus, order });
++  });
++  ordered.sort(
++    (a, b) =>
++      Number(Boolean(a.config.fallbackOnly)) - Number(Boolean(b.config.fallbackOnly)) ||
++      (a.config.costPerQuery ?? Number.POSITIVE_INFINITY) -
++        (b.config.costPerQuery ?? Number.POSITIVE_INFINITY) ||
++      a.order - b.order
++  );
++  return ordered.map(({ config, freeStatus }) => ({ config, freeStatus }));
++}
++
++export interface SearchQualityAssessment {
++  valid: boolean;
++  resultCount: number;
++  validUrlCount: number;
++  freshnessCount: number;
++  reason?: "empty" | "no-valid-urls";
++}
++
++export function isValidResultUrl(url: unknown): boolean {
++  if (typeof url !== "string" || url.trim() === "") return false;
++  try {
++    const parsed = new URL(url);
++    return parsed.protocol === "http:" || parsed.protocol === "https:";
++  } catch {
++    return false;
++  }
++}
++
++export function assessSearchResultQuality(
++  data: { results?: unknown } | null | undefined
++): SearchQualityAssessment {
++  const results = Array.isArray(data?.results) ? (data?.results as SearchResult[]) : [];
++  if (results.length === 0) {
++    return { valid: false, resultCount: 0, validUrlCount: 0, freshnessCount: 0, reason: "empty" };
++  }
++  let validUrlCount = 0;
++  let freshnessCount = 0;
++  for (const result of results) {
++    if (isValidResultUrl((result as { url?: unknown })?.url)) validUrlCount += 1;
++    const published = (result as { published_at?: unknown })?.published_at;
++    if (typeof published === "string" && published.trim() !== "") freshnessCount += 1;
++  }
++  if (validUrlCount === 0) {
++    return {
++      valid: false,
++      resultCount: results.length,
++      validUrlCount,
++      freshnessCount,
++      reason: "no-valid-urls",
++    };
++  }
++  return { valid: true, resultCount: results.length, validUrlCount, freshnessCount };
++}
++
++export function normalizeResultUrl(url: string): string {
++  const trimmed = url.trim();
++  if (!trimmed) return "";
++  try {
++    const parsed = new URL(trimmed);
++    const protocol = parsed.protocol.toLowerCase();
++    const host = parsed.hostname.toLowerCase();
++    const port = parsed.port ? `:${parsed.port}` : "";
++    const pathname = parsed.pathname.replace(/\/+$/, "");
++    return `${protocol}//${host}${port}${pathname}${parsed.search}`;
++  } catch {
++    return trimmed.toLowerCase();
++  }
++}
++
++export function dedupeSearchResults<T extends { url?: string }>(results: readonly T[]): T[] {
++  const seen = new Set<string>();
++  const deduped: T[] = [];
++  for (const result of results) {
++    const key = normalizeResultUrl(String(result?.url ?? ""));
++    if (!key) continue;
++    if (seen.has(key)) continue;
++    seen.add(key);
++    deduped.push(result);
++  }
++  return deduped;
++}
++
++export type FreeSearchLegOutcome =
++  | { kind: "ok"; data: { results?: SearchResult[]; [key: string]: unknown } }
++  | { kind: "empty" }
++  | { kind: "failed"; error: string; status?: number }
++  | { kind: "skipped"; reason: "no-credentials" | "rate-limited" | "circuit-open" };
++
++export interface FreeSearchLegAttempt {
++  providerId: string;
++  outcome: "ok" | "empty" | "failed" | "skipped" | "quality-failed";
++  skipReason?: string;
++  error?: string;
++}
++
++export interface FreeSearchChainOutcome {
++  ok: boolean;
++  providerId?: string;
++  data?: { results?: SearchResult[]; [key: string]: unknown };
++  attempts: FreeSearchLegAttempt[];
++  allRateLimited: boolean;
++  exhausted: boolean;
++}
++
++export interface FreeSearchChainDeps {
++  executeLeg: (entry: FreeSearchChainEntry) => Promise<FreeSearchLegOutcome>;
++  assessQuality?: (data: { results?: unknown }) => SearchQualityAssessment;
++  dedupe?: <T extends { url?: string }>(results: readonly T[]) => T[];
++}
++
++/**
++ * Runs one bounded pass over the ordered free chain: every provider is tried at
++ * most once, a leg only wins when it returns data that passes the deterministic
++ * quality gate, and the runner never escalates outside the chain it was given
++ * (the route builds that chain exclusively from FREE_VERIFIED / SELF_HOSTED
++ * providers, so a paid provider can never be reached from here).
++ */
++export async function runFreeSearchChain(
++  chain: readonly FreeSearchChainEntry[],
++  deps: FreeSearchChainDeps
++): Promise<FreeSearchChainOutcome> {
++  const assessQuality = deps.assessQuality ?? assessSearchResultQuality;
++  const dedupe = deps.dedupe ?? dedupeSearchResults;
++  const attempts: FreeSearchLegAttempt[] = [];
++  let rateLimitedOnly = chain.length > 0;
++
++  for (const entry of chain) {
++    const outcome = await deps.executeLeg(entry);
++
++    if (outcome.kind === "ok") {
++      const quality = assessQuality(outcome.data);
++      if (quality.valid) {
++        const results = dedupe((outcome.data?.results ?? []) as Array<{ url?: string }>);
++        attempts.push({ providerId: entry.config.id, outcome: "ok" });
++        return {
++          ok: true,
++          providerId: entry.config.id,
++          data: { ...outcome.data, results: results as SearchResult[] },
++          attempts,
++          allRateLimited: false,
++          exhausted: false,
++        };
++      }
++      attempts.push({
++        providerId: entry.config.id,
++        outcome: "quality-failed",
++        error: quality.reason,
++      });
++      rateLimitedOnly = false;
++      continue;
++    }
++
++    if (outcome.kind === "skipped") {
++      attempts.push({
++        providerId: entry.config.id,
++        outcome: "skipped",
++        skipReason: outcome.reason,
++      });
++      if (outcome.reason !== "rate-limited") rateLimitedOnly = false;
++      continue;
++    }
++
++    attempts.push({
++      providerId: entry.config.id,
++      outcome: outcome.kind,
++      error: outcome.kind === "failed" ? outcome.error : undefined,
++    });
++    rateLimitedOnly = false;
++  }
++
++  return {
++    ok: false,
++    attempts,
++    allRateLimited: rateLimitedOnly && attempts.length > 0,
++    exhausted: true,
++  };
++}
+diff --git a/src/app/api/v1/search/route.ts b/src/app/api/v1/search/route.ts
+index ceb78643e..99cc6c80e 100644
+--- a/src/app/api/v1/search/route.ts
++++ b/src/app/api/v1/search/route.ts
+@@ -1,4 +1,12 @@
+-import { handleSearch } from "@omniroute/open-sse/handlers/search.ts";
++import { handleSearch, type SearchResult } from "@omniroute/open-sse/handlers/search.ts";
++import {
++  FREE_ONLY_SEARCH_SELECTOR,
++  FREE_SEARCH_BREAKER_PREFIX,
++  NO_FREE_SEARCH_PROVIDER_AVAILABLE,
++  buildFreeSearchChain,
++  runFreeSearchChain,
++} from "@omniroute/open-sse/services/searchFreeRouting.ts";
++import { getCircuitBreaker } from "@/shared/utils/circuitBreaker";
+ import {
+   getProviderCredentialsWithQuotaPreflight,
+   extractApiKey,
+@@ -142,6 +150,129 @@ async function postHandler(request: Request, context: unknown) {
+   const settings = await getSettings().catch(() => ({}) as any);
+   const blockedProviders = settings?.blockedProviders || [];
+ 
++  // FREE_ONLY search routing — `auto/search:free` can only ever reach providers
++  // classified FREE_VERIFIED or SELF_HOSTED; the bounded chain below never
++  // escalates to a paid/credit-backed/unknown-cost provider.
++  if (body.provider === FREE_ONLY_SEARCH_SELECTOR) {
++    const freeChain = buildFreeSearchChain(Object.values(SEARCH_PROVIDERS), {
++      searchType: body.search_type,
++      isBlocked: (providerId) => isProviderBlockedByIdOrAlias(providerId, blockedProviders),
++    });
++    const firstFree = freeChain[0];
++    if (!firstFree) {
++      return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, NO_FREE_SEARCH_PROVIDER_AVAILABLE);
++    }
++
++    const requestedMax = body.max_results ?? firstFree.config.defaultMaxResults;
++    const freeCacheKey = computeCacheKey(
++      body.query,
++      FREE_ONLY_SEARCH_SELECTOR,
++      body.search_type,
++      Math.min(requestedMax, firstFree.config.maxMaxResults),
++      body.country,
++      body.language,
++      {
++        filters: body.filters,
++        offset: body.offset,
++        time_range: body.time_range,
++        content: body.content,
++        provider_options: body.provider_options,
++      }
++    );
++    const freeTtl = firstFree.config.cacheTTLMs ?? SEARCH_CACHE_DEFAULT_TTL_MS;
++
++    let freeCached = true;
++    try {
++      const freeData = await getOrCoalesce(freeCacheKey, freeTtl, async () => {
++        freeCached = false;
++        const outcome = await runFreeSearchChain(freeChain, {
++          executeLeg: async (entry) => {
++            const legCredentials = await resolveSearchExecutionCredentials(entry.config);
++            if (!legCredentials) {
++              return { kind: "skipped", reason: "no-credentials" };
++            }
++            if (isAllRateLimitedCredentials(legCredentials)) {
++              return { kind: "skipped", reason: "rate-limited" };
++            }
++            const breaker = getCircuitBreaker(`${FREE_SEARCH_BREAKER_PREFIX}${entry.config.id}`, {
++              failureThreshold: 3,
++              resetTimeout: 30_000,
++            });
++            if (!breaker.canExecute()) {
++              return { kind: "skipped", reason: "circuit-open" };
++            }
++
++            const legResult = await handleSearch({
++              query: body.query,
++              provider: entry.config.id,
++              maxResults: Math.min(requestedMax, entry.config.maxMaxResults),
++              searchType: body.search_type,
++              country: body.country,
++              language: body.language,
++              timeRange: body.time_range,
++              offset: body.offset,
++              domainFilter: buildDomainFilter(body.filters),
++              contentOptions: body.content,
++              strictFilters: body.strict_filters,
++              providerOptions: body.provider_options,
++              credentials: legCredentials,
++              log,
++              connectionId: legCredentials.connectionId || undefined,
++              apiKeyId: policy.apiKeyInfo?.id || undefined,
++            });
++            if (!legResult.success) {
++              return {
++                kind: "failed",
++                error: legResult.error || "Search failed",
++                status: legResult.status,
++              };
++            }
++            const legResults = (legResult.data as { results?: unknown[] } | undefined)?.results;
++            if (!Array.isArray(legResults) || legResults.length === 0) {
++              return { kind: "empty" };
++            }
++            return { kind: "ok", data: legResult.data as { results?: SearchResult[] } };
++          },
++        });
++
++        if (!outcome.ok) {
++          throw new SearchError(
++            NO_FREE_SEARCH_PROVIDER_AVAILABLE,
++            outcome.allRateLimited ? HTTP_STATUS.TOO_MANY_REQUESTS : HTTP_STATUS.SERVICE_UNAVAILABLE
++          );
++        }
++        return outcome.data;
++      });
++
++      const response = {
++        id: `search-${crypto.randomUUID()}`,
++        ...freeData,
++        cached: freeCached,
++        usage: freeCached ? { queries_used: 0, search_cost_usd: 0 } : freeData.usage,
++      };
++
++      return new Response(JSON.stringify(response), {
++        status: 200,
++        headers: { "Content-Type": "application/json", ...CORS_HEADERS },
++      });
++    } catch (err: unknown) {
++      if (err instanceof SearchError) {
++        const errorPayload = toJsonErrorPayload(err.message, "Search provider error");
++        return new Response(JSON.stringify(errorPayload), {
++          status: err.statusCode,
++          headers: { "Content-Type": "application/json", ...CORS_HEADERS },
++        });
++      }
++      const message = err instanceof Error ? err.message : String(err);
++      log.error("SEARCH", `Unexpected free-search error: ${message}`);
++      const errorPayload = toJsonErrorPayload(message, "Internal search error");
++      return new Response(JSON.stringify(errorPayload), {
++        status: 500,
++        headers: { "Content-Type": "application/json", ...CORS_HEADERS },
++      });
++    }
++  }
++
+   // Resolve provider and credentials
+   if (body.provider) {
+     if (isProviderBlockedByIdOrAlias(body.provider, blockedProviders)) {
+diff --git a/tests/unit/search-free-routing.test.ts b/tests/unit/search-free-routing.test.ts
+new file mode 100644
+index 000000000..1607e2005
+--- /dev/null
++++ b/tests/unit/search-free-routing.test.ts
+@@ -0,0 +1,371 @@
++/**
++ * R2 reconstruction — FREE_ONLY search routing: metadata-only cost classification,
++ * dynamic discovery, deterministic quality gate and the bounded free→free chain.
++ *
++ * Node:test scope: top-level tests/unit/*.test.ts runs under the built-in runner
++ * (tests/unit/autoCombo/** is the vitest-only scope).
++ */
++import { test } from "node:test";
++import assert from "node:assert/strict";
++
++import type { SearchProviderConfig } from "../../open-sse/config/searchRegistry.ts";
++import {
++  FREE_ELIGIBLE_SEARCH_STATUSES,
++  NO_FREE_SEARCH_PROVIDER_AVAILABLE,
++  assessSearchResultQuality,
++  buildFreeSearchChain,
++  classifySearchProviderFreeStatus,
++  dedupeSearchResults,
++  isFreeEligibleStatus,
++  isSelfHostedBaseUrl,
++  normalizeResultUrl,
++  runFreeSearchChain,
++  type FreeSearchChainEntry,
++  type SearchFreeStatus,
++} from "../../open-sse/services/searchFreeRouting.ts";
++
++function provider(overrides: Partial<SearchProviderConfig> & { id: string }): SearchProviderConfig {
++  const { id, ...rest } = overrides;
++  return {
++    id,
++    name: id,
++    baseUrl: `https://${id}.example.com/search`,
++    method: "POST",
++    authType: "apikey",
++    authHeader: "authorization",
++    costPerQuery: 0,
++    freeMonthlyQuota: 1000,
++    searchTypes: ["web"],
++    defaultMaxResults: 5,
++    maxMaxResults: 100,
++    timeoutMs: 10_000,
++    cacheTTLMs: 60_000,
++    ...rest,
++  };
++}
++
++function entry(config: SearchProviderConfig): FreeSearchChainEntry {
++  return { config, freeStatus: classifySearchProviderFreeStatus(config) };
++}
++
++test("classification: cost and auth evidence decide the free status", () => {
++  const base = { baseUrl: "https://x.test/search", freeMonthlyQuota: 0 } as const;
++  assert.equal(
++    classifySearchProviderFreeStatus({ ...base, authType: "none", costPerQuery: 0 }),
++    "FREE_VERIFIED"
++  );
++  assert.equal(
++    classifySearchProviderFreeStatus({
++      ...base,
++      authType: "apikey",
++      costPerQuery: 0,
++      freeMonthlyQuota: 1000,
++    }),
++    "FREE_VERIFIED"
++  );
++  assert.equal(
++    classifySearchProviderFreeStatus({ ...base, authType: "apikey", costPerQuery: 0 }),
++    "FREE_UNKNOWN"
++  );
++  assert.equal(
++    classifySearchProviderFreeStatus({
++      ...base,
++      authType: "apikey",
++      costPerQuery: 0.001,
++      freeMonthlyQuota: 2500,
++    }),
++    "CREDIT_BACKED"
++  );
++  assert.equal(
++    classifySearchProviderFreeStatus({
++      ...base,
++      authType: "apikey",
++      costPerQuery: 0.005,
++      freeMonthlyQuota: 0,
++    }),
++    "PAID"
++  );
++  assert.equal(
++    classifySearchProviderFreeStatus({
++      ...base,
++      authType: "apikey",
++      costPerQuery: 0,
++      baseUrl: "http://localhost:8888/search",
++    }),
++    "SELF_HOSTED"
++  );
++  assert.equal(
++    classifySearchProviderFreeStatus({ ...base, authType: "none", costPerQuery: Number.NaN }),
++    "UNKNOWN_COST"
++  );
++  assert.equal(
++    classifySearchProviderFreeStatus({ ...base, authType: "none", costPerQuery: -1 }),
++    "UNKNOWN_COST"
++  );
++});
++
++test("self-hosted detection covers loopback, private ranges and internal suffixes", () => {
++  const selfHosted = [
++    "http://localhost:8888/search",
++    "http://127.0.0.1:8080/v1",
++    "http://0.0.0.0:8080/search",
++    "http://[::1]:1234/search",
++    "http://10.1.2.3/search",
++    "http://192.168.0.9/search",
++    "http://172.20.5.5/search",
++    "http://searx.internal/search",
++    "http://box.local/search",
++  ];
++  for (const url of selfHosted) {
++    assert.equal(isSelfHostedBaseUrl(url), true, `${url} must be self-hosted`);
++  }
++  assert.equal(isSelfHostedBaseUrl("https://api.example.com/search"), false);
++  assert.equal(isSelfHostedBaseUrl(undefined), false);
++});
++
++test("eligibility is exactly FREE_VERIFIED plus SELF_HOSTED", () => {
++  assert.deepEqual([...FREE_ELIGIBLE_SEARCH_STATUSES], ["FREE_VERIFIED", "SELF_HOSTED"]);
++  const denied: SearchFreeStatus[] = [
++    "FREE_UNKNOWN",
++    "UNKNOWN_COST",
++    "NULL_COST",
++    "PAID",
++    "CREDIT_BACKED",
++    "DISCONTINUED",
++  ];
++  for (const status of denied) {
++    assert.equal(isFreeEligibleStatus(status), false, `${status} must not be auto-eligible`);
++  }
++});
++
++test("chain: discovery filters non-free, blocked, unsupported, disabled and unconfigured-loopback providers", () => {
++  const providers = [
++    provider({ id: "paid-search", costPerQuery: 0.01, freeMonthlyQuota: 0 }),
++    provider({ id: "credit-search", costPerQuery: 0.005, freeMonthlyQuota: 1000 }),
++    provider({ id: "unknown-search", costPerQuery: 0, freeMonthlyQuota: 0 }),
++    provider({ id: "disabled-free", authType: "none", freeMonthlyQuota: 0, disabled: true }),
++    provider({
++      id: "news-only-free",
++      authType: "none",
++      freeMonthlyQuota: 0,
++      searchTypes: ["news"],
++    }),
++    provider({ id: "blocked-free", authType: "none", freeMonthlyQuota: 0 }),
++    provider({
++      id: "searxng-search",
++      baseUrl: "http://localhost:8888/search",
++      authType: "apikey",
++      freeMonthlyQuota: 0,
++    }),
++    provider({ id: "plain-free", authType: "none", freeMonthlyQuota: 0 }),
++  ];
++  const chain = buildFreeSearchChain(providers, {
++    searchType: "web",
++    isBlocked: (id) => id === "blocked-free",
++  });
++  assert.deepEqual(
++    chain.map((item) => item.config.id),
++    ["plain-free"]
++  );
++  for (const item of chain) {
++    assert.equal(isFreeEligibleStatus(item.freeStatus), true);
++  }
++});
++
++test("chain: ordering keeps non-fallbackOnly providers first, then registry order", () => {
++  const chain = buildFreeSearchChain(
++    [
++      provider({ id: "fallback-free", authType: "none", freeMonthlyQuota: 0, fallbackOnly: true }),
++      provider({ id: "alpha-free", authType: "none", freeMonthlyQuota: 0 }),
++      provider({ id: "beta-free", authType: "none", freeMonthlyQuota: 0 }),
++    ],
++    { searchType: "web" }
++  );
++  assert.deepEqual(
++    chain.map((item) => item.config.id),
++    ["alpha-free", "beta-free", "fallback-free"]
++  );
++});
++
++test("quality gate: empty, url-less and healthy result sets", () => {
++  assert.deepEqual(assessSearchResultQuality(undefined), {
++    valid: false,
++    resultCount: 0,
++    validUrlCount: 0,
++    freshnessCount: 0,
++    reason: "empty",
++  });
++  const noUrls = assessSearchResultQuality({ results: [{ title: "no url here" }] });
++  assert.equal(noUrls.valid, false);
++  assert.equal(noUrls.reason, "no-valid-urls");
++  const healthy = assessSearchResultQuality({
++    results: [
++      { url: "https://a.test/one", published_at: "2026-09-01" },
++      { url: "http://b.test/two" },
++    ],
++  });
++  assert.equal(healthy.valid, true);
++  assert.equal(healthy.resultCount, 2);
++  assert.equal(healthy.validUrlCount, 2);
++  assert.equal(healthy.freshnessCount, 1);
++});
++
++test("url normalization strips hashes and trailing slashes and dedupe keeps the first hit", () => {
++  assert.equal(
++    normalizeResultUrl("https://Example.com:8443/Path/#frag"),
++    "https://example.com:8443/Path"
++  );
++  const deduped = dedupeSearchResults([
++    { url: "https://a.test/x/" },
++    { url: "https://A.test/x" },
++    { url: "https://a.test/x#fragment" },
++    { url: "https://b.test/y" },
++  ]);
++  assert.deepEqual(
++    deduped.map((item) => item.url),
++    ["https://a.test/x/", "https://b.test/y"]
++  );
++});
++
++test("failover: the bounded chain stops at the first quality-passing free leg", async () => {
++  const attempts: string[] = [];
++  const outcome = await runFreeSearchChain(
++    [
++      entry(provider({ id: "leg-a", authType: "none", freeMonthlyQuota: 0 })),
++      entry(provider({ id: "leg-b", authType: "none", freeMonthlyQuota: 0 })),
++      entry(provider({ id: "leg-c", authType: "none", freeMonthlyQuota: 0 })),
++    ],
++    {
++      executeLeg: async (item) => {
++        attempts.push(item.config.id);
++        if (item.config.id === "leg-a") {
++          return { kind: "failed", error: "upstream 503", status: 503 };
++        }
++        return { kind: "ok", data: {} };
++      },
++      dedupe: (results) => results,
++      assessQuality: () => ({ valid: true, resultCount: 1, validUrlCount: 1, freshnessCount: 0 }),
++    }
++  );
++  assert.equal(outcome.ok, true);
++  assert.equal(outcome.providerId, "leg-b");
++  assert.deepEqual(attempts, ["leg-a", "leg-b"]);
++  assert.deepEqual(
++    outcome.attempts.map((item) => item.outcome),
++    ["failed", "ok"]
++  );
++});
++
++test("failover: a leg failing the quality gate hands off to the next free provider", async () => {
++  let qualityCalls = 0;
++  const outcome = await runFreeSearchChain(
++    [
++      entry(provider({ id: "leg-empty", authType: "none", freeMonthlyQuota: 0 })),
++      entry(provider({ id: "leg-good", authType: "none", freeMonthlyQuota: 0 })),
++    ],
++    {
++      executeLeg: async () => ({ kind: "ok", data: {} }),
++      dedupe: (results) => results,
++      assessQuality: () => {
++        qualityCalls += 1;
++        return qualityCalls === 1
++          ? {
++              valid: false,
++              resultCount: 0,
++              validUrlCount: 0,
++              freshnessCount: 0,
++              reason: "no-valid-urls",
++            }
++          : { valid: true, resultCount: 1, validUrlCount: 1, freshnessCount: 0 };
++      },
++    }
++  );
++  assert.equal(outcome.ok, true);
++  assert.equal(outcome.providerId, "leg-good");
++  assert.deepEqual(
++    outcome.attempts.map((item) => item.outcome),
++    ["quality-failed", "ok"]
++  );
++});
++test("skips: exhausted free legs report their reasons without executing", async () => {
++  const executed: string[] = [];
++  const outcome = await runFreeSearchChain(
++    [
++      entry(provider({ id: "leg-noauth", authType: "none", freeMonthlyQuota: 0 })),
++      entry(provider({ id: "leg-cool", authType: "none", freeMonthlyQuota: 0 })),
++      entry(provider({ id: "leg-open", authType: "none", freeMonthlyQuota: 0 })),
++    ],
++    {
++      executeLeg: async (item) => {
++        executed.push(item.config.id);
++        const reason =
++          item.config.id === "leg-noauth"
++            ? ("no-credentials" as const)
++            : item.config.id === "leg-cool"
++              ? ("rate-limited" as const)
++              : ("circuit-open" as const);
++        return { kind: "skipped", reason };
++      },
++      assessQuality: () => ({ valid: true, resultCount: 1, validUrlCount: 1, freshnessCount: 0 }),
++    }
++  );
++  assert.equal(outcome.ok, false);
++  assert.equal(outcome.exhausted, true);
++  assert.equal(outcome.allRateLimited, false);
++  assert.deepEqual(
++    outcome.attempts.map((item) => item.skipReason),
++    ["no-credentials", "rate-limited", "circuit-open"]
++  );
++  assert.equal(executed.length, 3);
++});
++
++test("exhaustion: all rate-limited legs surface allRateLimited and never leave the chain", async () => {
++  const outcome = await runFreeSearchChain(
++    [
++      entry(provider({ id: "leg-r1", authType: "none", freeMonthlyQuota: 0 })),
++      entry(provider({ id: "leg-r2", authType: "none", freeMonthlyQuota: 0 })),
++    ],
++    {
++      executeLeg: async () => ({ kind: "skipped", reason: "rate-limited" }),
++    }
++  );
++  assert.equal(outcome.ok, false);
++  assert.equal(outcome.exhausted, true);
++  assert.equal(outcome.allRateLimited, true);
++  assert.equal(outcome.attempts.length, 2);
++});
++
++test("exhaustion: every failing leg is attempted exactly once and the terminal error is stable", async () => {
++  const outcome = await runFreeSearchChain(
++    [
++      entry(provider({ id: "leg-x", authType: "none", freeMonthlyQuota: 0 })),
++      entry(provider({ id: "leg-y", authType: "none", freeMonthlyQuota: 0 })),
++    ],
++    {
++      executeLeg: async () => ({ kind: "failed", error: "boom", status: 500 }),
++    }
++  );
++  assert.equal(outcome.ok, false);
++  assert.equal(outcome.exhausted, true);
++  assert.equal(outcome.allRateLimited, false);
++  assert.equal(outcome.attempts.length, 2);
++  assert.equal(NO_FREE_SEARCH_PROVIDER_AVAILABLE, "NO_FREE_SEARCH_PROVIDER_AVAILABLE");
++});
++
++test("dedupe: the winning leg's results are normalised and deduplicated", async () => {
++  const outcome = await runFreeSearchChain(
++    [entry(provider({ id: "leg-dedupe", authType: "none", freeMonthlyQuota: 0 }))],
++    {
++      executeLeg: async () => ({
++        kind: "ok",
++        data: {
++          results: [{ url: "https://dup.test/x" }, { url: "https://dup.test/x#again" }],
++        },
++      }),
++    }
++  );
++  assert.equal(outcome.ok, true);
++  assert.equal(outcome.providerId, "leg-dedupe");
++  const results = (outcome.data as { results?: unknown[] } | undefined)?.results ?? [];
++  assert.equal(results.length, 1);
++});
+-- 
+2.53.0
+

@@ -1,0 +1,128 @@
+# OmniRoute — Final Free Autopilot: R1.11 Isolated Canary (redo)
+
+Mission: `OMNIROUTE_FREE_AUTOPILOT_FINAL_RECONSTRUCTION_R1_11_R4_LIVE_CLOSURE_2026_09_21`
+Phase: 3B — R1.11 canary redo (isolated; NOT deployed; live :20128 untouched)
+Date: 2026-09-21
+Workspace: `/home/dcima/omniroute-final-free-autopilot-20260921`
+Branch: `final/free-autopilot-2026-09-21`
+
+```
+UPSTREAM_BASE_SHA=dea6bb8b6b64d3a3d9f639a044625c3452442c56
+R1_CANDIDATE_SHA=864ddc1d57871827ab2be3a9235bab5f8c12bc48
+R1_REPORT_COMMIT=3f4d1219b542cfcaf5c5991f7053eb8117632aa4
+R1_INSPECTOR_FIX_SHA=2e10170e8a481ef40af4bdda9f0fb390eab96bc7
+CANARY_PORT=22128
+CANARY_DATA_DIR=/tmp/omniroute-final-r1-11-canary
+CANARY_MODE=node scripts/dev/run-next.mjs start (source-tree production path, NEXT_DIST_DIR=.build/next)
+```
+
+The canary ran the candidate built with the canonical `npm run build` (exit 0, twice) and reused an
+isolated DATA_DIR/DB. Live `127.0.0.1:20128` remained LISTENING and untouched for the whole phase;
+no OpenCode/IAMM/StockNewsBR/Hermes/Harness file or credential was modified; no paid inference was
+issued anywhere (no credit-backed spend, PAID_SPEND=0).
+
+## 1. Gate matrix
+
+| Gate                          | Value                        | Evidence level                                                                                                                                                                                                                                                      |
+| ----------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| R1_11_CANARY                  | PASS                         | isolated canary, see below                                                                                                                                                                                                                                          |
+| CANARY_ONLY                   | YES                          | separate port + DATA_DIR; live listeners verified present throughout                                                                                                                                                                                                |
+| LIVE_20128_CHANGED            | NO                           | live service never restarted, no deploy, no settings/DB/key writes                                                                                                                                                                                                  |
+| FREE_VERIFIED_ALLOW           | PASS                         | live: 5 groq hard-stop models admitted with zero quota telemetry + 2 opencode / 5 felo-web keyless admitted                                                                                                                                                         |
+| SELF_HOSTED_ALLOW             | PASS                         | live: `ollama-local` candidate `SELF_HOSTED                                                                                                                                                                                                                         | eligible=true | SELF_HOSTED_NO_BILLING`; auto chat served by the local mock     |
+| FREE_UNKNOWN_DENY             | PASS                         | live: `glm-4.7-flash` → `FREE_UNKNOWN                                                                                                                                                                                                                               | false         | FREE_UNKNOWN_NO_HARD_STOP_PROOF`, excluded from the strict pool |
+| UNKNOWN_COST_DENY             | PASS                         | live: all uncatalogued models denied and removed in strict mode (openai 19, glm 16, groq 2, opencode 6 rows)                                                                                                                                                        |
+| NULL_COST_DENY                | PASS                         | unit: sentinel policy matrix (explicit null cost → `NULL_COST_EXCLUDED`)                                                                                                                                                                                            |
+| PAID_AUTO_DENY                | PASS                         | no paid-class candidate is admitted; `gpt-4o` → `UNKNOWN_COST_EXCLUDED`; strict pool contains only FREE_VERIFIED/SELF_HOSTED                                                                                                                                        |
+| CREDIT_BACKED_AUTO_DENY       | PASS                         | live: 3 agentrouter rows → `CREDIT_BACKED                                                                                                                                                                                                                           | false         | CREDIT_BACKED_EXCLUDED`, removed in strict mode                 |
+| PAID_AUTO_FALLBACK            | NO                           | strict-mode `auto` pool held 12 then 13 candidates, all FREE_VERIFIED/SELF_HOSTED                                                                                                                                                                                   |
+| MANUAL_PINNED_BYPASS          | PASS                         | live: pinned `ollama-local/mock-local-1` → HTTP 200 (explicit path unchanged)                                                                                                                                                                                       |
+| HEALTH_FILTER                 | PASS                         | live: an unhealthy/cooldown connection is dropped from the pool; the 429-locked model disappears and returns after recovery                                                                                                                                         |
+| QUOTA_FILTER                  | PASS                         | live: ABSENT/UNKNOWN telemetry no longer excludes a provably hard-free route; unit: EXHAUSTED/headroom/no-telemetry matrix green                                                                                                                                    |
+| CIRCUIT_BREAKER               | PASS_COMPONENT + live wiring | 52/52 native breaker tests green (half-open recovery, failure kinds, 429, ECONNREFUSED); live DB row `domain_circuit_breakers` for `ollama-local` (threshold 12, reset 30 s, halfOpen 1) is consulted by the read-only inspector. Live limitation documented in §3. |
+| COOLDOWN                      | PASS                         | live: forced 429 → `error_code 429.0`, `last_error_type rate_limited` ("Model mock-local-1 rate_limited"), candidate removed, subsequent calls failed fast (`503`, `503`)                                                                                           |
+| AUTO_RECOVERY                 | PASS                         | live: after the mock recovered, a call returned 200 and the candidate returned with intact eligibility                                                                                                                                                              |
+| STREAMING                     | PASS                         | live: SSE deltas (`canary-` + `mock-ok`), `finish_reason: stop`, `data: [DONE]`                                                                                                                                                                                     |
+| TOOL_CALLS                    | PASS                         | live: `finish_reason: tool_calls`, `tool_calls[0].function.name = canary_noop`, arguments `{"value":42}`                                                                                                                                                            |
+| OPENAI_COMPAT                 | PASS                         | live: OpenAI chat-completions request/response schema honored (non-stream + stream + tools)                                                                                                                                                                         |
+| CANDIDATE_ENDPOINT_CACHE_ONLY | PASS                         | live: repeated candidate reads produced no provider requests (mock request log clean)                                                                                                                                                                               |
+
+Gate detail for the policy matrix (canary :22128):
+
+- strict mode, `GET /api/v1/auto-combo/auto/candidates` → 12→13 rows, every row
+  `FREE_VERIFIED | eligible=true | reachable=true | breakerState=CLOSED`, reasons
+  `HARD_STOP_FREE_TIER_VERIFIED` (5 groq) or `KEYLESS_HARD_FREE_ENDPOINT` (2 opencode + 5 felo-web),
+  plus `ollama-local | SELF_HOSTED | SELF_HOSTED_NO_BILLING` once its model was synced.
+- `freeAccessPolicy=off` → 59 rows with per-class labels: agentrouter `CREDIT_BACKED`;
+  glm `FREE_UNKNOWN` (glm-4.7-flash) + `UNKNOWN_COST`; groq `FREE_VERIFIED` + `UNKNOWN_COST`;
+  openai `UNKNOWN_COST`; opencode `FREE_VERIFIED` + `UNKNOWN_COST`; felo-web `FREE_VERIFIED`.
+- strict mode again → only the FREE_VERIFIED/SELF_HOSTED rows survive; every denied class is removed.
+
+## 2. Findings (all real, none inferred)
+
+- **F1 — R1 inspector defect (found by this canary, fixed in `2e10170e8`).** The read-only
+  inspector classified candidates with the provider-prefixed routing id (`groq/llama-3.3-70b-versatile`)
+  instead of the bare catalog id (`llama-3.3-70b-versatile`), so every row rendered
+  `UNKNOWN_COST_EXCLUDED`. The dispatch-side strict filter was always correct — the strict pool kept
+  exactly the catalog-proven routes even before the fix. Fix: `virtualFactory` now exposes
+  `modelId: candidate.model` on built config entries and `autoComboCandidates` classifies with it.
+  Regression suites green after the fix.
+- **F2 — exact-identity matching is upstream behavior.** `git show dea6bb8b6:…/strictZeroCostFilter.ts`
+  shows `findBudgetEntry` comparing `provider` + `modelId` exactly, with no prefix normalization, so
+  the reconstruction preserves upstream semantics; classification must use the bare id (see F1).
+- **F3 — static no-auth keyless ids carry route prefixes** (`oc/…`, `felo/…`) while the catalog uses
+  bare ids; the dispatch pool resolves them correctly (2 opencode + 5 felo-web survive strict mode).
+- **F4 — self-hosted connections need a placeholder apiKey in this build.** The pool credential filter
+  requires a credential (apiKey/OAuth/web-session) or a `*-compatible-*` provider id, so a
+  credential-less `ollama-local` connection was dropped before policy admission. Patching the
+  documented placeholder (`sk-no-key-required`) surfaced the candidate as `SELF_HOSTED`. Not a policy
+  defect; worth an operator note.
+- **F5 — provider breaker could not be forced OPEN from the canary.** 16 consecutive forced 500s
+  updated `last_failure_time` but left `failure_count=0`, `lastFailureKind=null`,
+  `openCycleCount=0`; the component contract itself is verified by the native test suite (52/52).
+
+## 3. Resilience detail
+
+- 429 path (live): `echo 429 > mock-fail-mode` → call 1 `429` → calls 2-3 `503` (fail-fast, no retry
+  storm) → candidate removed from the pool → DB records `429.0 / rate_limited`.
+- Recovery (live): failure mode cleared → `200` → candidate returns with `SELF_HOSTED | eligible=true`.
+- Breaker (component): `tests/unit/provider-breaker-halfopen-recovery.test.ts`,
+  `circuit-breaker-failure-kind.test.ts`, `resilience-settings-upstream429-breaker.test.ts`,
+  `circuit-breaker-abort-provider-trip-7907.test.ts`, `8376-econnrefused-breaker.test.ts`,
+  `breaker-network-error-guard.test.ts` → 52 tests, 52 pass, exit 0.
+- Quota semantics (unit): `free-provider-sentinel-r1.test.ts` covers absent/stale/UNKNOWN telemetry,
+  fresh SAFE with/without headroom, EXHAUSTED narrowing and multi-account allowlist rewrites.
+
+## 4. Test evidence for this phase
+
+- autoCombo suites (`vitest.mcp.config.ts`): 4 files / 56 tests PASS (pre-fix and post-fix).
+- circuit-breaker component suites (`node --test`): 6 files / 52 tests PASS.
+- `npm run typecheck:core`: PASS. `npm run check:open-sse-typecheck`: only the pre-existing
+  `src/app/api/v1/models/catalog.ts TS2367` baseline error (proven pre-existing at `dea6bb8b6` via the
+  stash experiment) — no new candidate type error.
+- scoped ESLint + lint-staged (prettier/eslint --fix) PASS on every committed change.
+
+## 5. Data-safety statement
+
+```
+SECRETS_EXPOSED=NO
+PAID_INFERENCE_TRIGGERED=NO
+PROVIDERS_DELETED=0
+CONNECTIONS_DELETED=0
+CREDENTIALS_DELETED=0
+OPENCODE_CHANGED=NO
+LIVE_20128_CHANGED=NO
+```
+
+All synthetic providers/connections/keys live exclusively inside the isolated canary DATA_DIR
+(`/tmp/omniroute-final-r1-11-canary`) and the canary-only harness (`/tmp/omniroute-canary-harness`).
+No canary artifact was promoted anywhere; live production remains packaged v3.8.50 (`BUILD_SHA=dea6bb8`)
+with its settings untouched.
+
+## 6. Verdict
+
+`R1_11_CANARY=PASS` and `R1_11_REDONE=YES` for the policy surface: dynamic FREE_ONLY admission,
+the full cost-class matrix, SELF_HOSTED admission, pinned bypass, streaming/tool/OpenAI compatibility
+and the live cooldown/fail-fast/recovery path are all proven on an isolated canary running the clean
+candidate, with the two limitations documented above (F4 operator note; F5 live breaker opening not
+forceable — component contract verified by 52/52 native tests).

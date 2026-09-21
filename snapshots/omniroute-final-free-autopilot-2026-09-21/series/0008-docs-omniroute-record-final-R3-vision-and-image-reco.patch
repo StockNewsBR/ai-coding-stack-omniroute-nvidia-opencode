@@ -1,0 +1,119 @@
+From ed30d298e17fa9ca45777c43a759dcd52cded7de Mon Sep 17 00:00:00 2001
+From: StockNewsBR <264292956+StockNewsBR@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 18:47:10 -0300
+Subject: [PATCH 08/11] docs(omniroute): record final R3 vision and image
+ reconstruction
+
+---
+ ...IROUTE_FINAL_R3_VISION_IMAGE_2026-09-21.md | 99 +++++++++++++++++++
+ 1 file changed, 99 insertions(+)
+ create mode 100644 docs/OMNIROUTE_FINAL_R3_VISION_IMAGE_2026-09-21.md
+
+diff --git a/docs/OMNIROUTE_FINAL_R3_VISION_IMAGE_2026-09-21.md b/docs/OMNIROUTE_FINAL_R3_VISION_IMAGE_2026-09-21.md
+new file mode 100644
+index 000000000..73db57584
+--- /dev/null
++++ b/docs/OMNIROUTE_FINAL_R3_VISION_IMAGE_2026-09-21.md
+@@ -0,0 +1,99 @@
++# OmniRoute — Final Free Autopilot: R3 FREE_ONLY Vision + Image Generation (redo)
++
++Mission: `OMNIROUTE_FREE_AUTOPILOT_FINAL_RECONSTRUCTION_R1_11_R4_LIVE_CLOSURE_2026_09_21`
++Phase: 5 (isolated candidate; not deployed)
++Date: 2026-09-21
++Workspace: `/home/dcima/omniroute-final-free-autopilot-20260921`
++Branch: `final/free-autopilot-2026-09-21`
++UPSTREAM_BASE_SHA=dea6bb8b6b64d3a3d9f639a044625c3452442c56
++R3_SHA=309ae65f6976947ec74ac5998343d92ddf4e755e
++R3_COMMIT=`309ae65f6 feat(omniroute): reconstruct FREE_ONLY vision and image routing` (4 files, +441/-12)
++
++## 1. Required fields
++
++| field                              | value                                                                                       |
++| ---------------------------------- | ------------------------------------------------------------------------------------------- |
++| R3                                 | PASS                                                                                        |
++| AUTO_VISION_FREE                   | PASS (alias advertised; vision admission is the native strict FREE_ONLY prepared-pool gate) |
++| AUTO_IMAGE_GEN_FREE                | CONTROLLED_UNAVAILABLE (correct controlled outcome — see §3/§5)                             |
++| VISION_IMAGE_SEPARATION            | PASS                                                                                        |
++| PAID_VISION_AUTO_USED              | NO                                                                                          |
++| PAID_IMAGE_AUTO_USED               | NO                                                                                          |
++| IMAGE_FREE_CLASSIFICATION_EVIDENCE | PASS                                                                                        |
++
++## 2. What was reconstructed
++
++**VISION (native reuse, no new code path).** `open-sse/services/autoCombo/builtinCatalog.ts::AUTO_SUFFIX_VARIANTS`
++now advertises `auto/vision:free` and `auto/multimodal:free` (2 added lines). Vision capability stays defined
++ONLY by `src/lib/modelCapabilities.ts::getResolvedModelCapabilities().supportsVision`, and admission is the
++existing strict FREE_ONLY prepared-pool gate (FREE_VERIFIED / SELF_HOSTED only) when
++`freeAccessPolicy === "strict"`. The image registry is never consulted for vision and vice versa.
++
++**IMAGE GENERATION.** New `open-sse/config/freeImageRouting.ts` (159 lines, pure, no I/O):
++
++- `FREE_IMAGE_ROUTE_ID = "auto/image-gen"`, `FREE_IMAGE_ROUTE_ID_FREE = "auto/image-gen:free"`,
++  `NO_FREE_IMAGE_PROVIDER_AVAILABLE`.
++- Metadata-only classification over the image registry (`IMAGE_PROVIDERS`, 43 providers / 235 models) and the
++  free-budget catalog — no hardcoded provider names, no chat/vision lookup:
++  - **SELF_HOSTED** — `authType === "none"` AND `isSelfHostedBaseUrl(baseUrl)` (loopback / private range /
++    `.internal` / `.local`) AND an active connection (the ComfyUI / SD WebUI pattern).
++  - **FREE_VERIFIED** — an explicit hard-free budget row (`keyless` | `recurring-daily` | `recurring-monthly` |
++    `recurring-uncapped`) with `hardStopGuaranteed === true`.
++  - **CREDIT_BACKED** — `one-time-initial` / `recurring-credit` rows; **DISCONTINUED** — discontinued rows.
++  - **FREE_UNKNOWN / NO_HARD_FREE_IMAGE_EVIDENCE** — everything else, including a remote price-0 provider.
++- `resolveFreeImageProvider(...)` iterates the registry in order, skips circuit-open providers and providers
++  without an active connection, and returns the first eligible generator as
++  `{ ok: true, providerId, modelId, status, reason }`; otherwise it returns the controlled failure
++  `{ ok: false, code: NO_FREE_IMAGE_PROVIDER_AVAILABLE, reason: NO_ELIGIBLE_FREE_IMAGE_PROVIDER | ALL_FREE_IMAGE_PROVIDERS_CIRCUIT_OPEN, considered }`.
++
++**ROUTE.** `src/app/api/v1/images/generations/route.ts` resolves the alias immediately after API-key policy
++enforcement and before combo detection: ineligible → `503 NO_FREE_IMAGE_PROVIDER_AVAILABLE`; eligible →
++`body.model` is rewritten to `<provider>/<model>` and continues through the native capability-specific image
++handler (`imageGeneration.ts` / `executeImageCombo`). It never dispatches to a chat/vision model and never falls
++back to a paid or credit-backed generator.
++
++## 3. AI Horde / R5 contradiction resolution
++
++Old R5 observed `aihorde/stable_diffusion` answering HTTP 200 live; old R3 had concluded there was no eligible
++free image generator. Resolution per the mission's rule — a remote provider must NOT be classified FREE_VERIFIED
++merely because its price is 0 or a previous probe succeeded:
++
++- `aihorde` has `authType: "none"` but a **remote** base URL and **no hard-free budget row** →
++  `FREE_UNKNOWN / NO_HARD_FREE_IMAGE_EVIDENCE` → **DENY** → the controlled
++  `503 NO_FREE_IMAGE_PROVIDER_AVAILABLE`. It is never treated as a paid fallback and never silently admitted.
++- An earlier draft of the resolver classified any `authType === "none"` provider with a connection as
++  SELF_HOSTED; that was corrected by additionally requiring a local/private base URL
++  (`isSelfHostedBaseUrl`), and the case now has a regression test.
++
++## 4. Test and gate evidence
++
++- `tests/unit/free-image-routing.test.ts` (node:test): **12/12 PASS** — classification matrix, the aihorde
++  remote-price-0 denial, credit-backed/discontinued denials, resolver ordering, connection/circuit skips,
++  `considered[]` population, controlled unavailability, vision≠image separation, alias constants.
++- autoCombo regression (`vitest.mcp.config.ts`): **4 files / 56 tests PASS**.
++- `npm run check:open-sse-typecheck`: no new errors — only the pre-existing
++  `src/app/api/v1/models/catalog.ts TS2367` (proven pre-existing at `dea6bb8` by the stash experiment).
++  One self-inflicted `TS2459` (importing the module-local, non-exported `ImageProviderConfig` interface) was
++  found and fixed before the commit.
++- scoped `eslint` + lint-staged (`prettier --write`, `eslint --fix`) clean; `docs-sync` PASS;
++  `check:any-budget:t11` PASS; `check:tracked-artifacts` OK; secret scan clean.
++
++## 5. Honest limitations
++
++- **No remote FREE_VERIFIED image generator exists** in `FREE_MODEL_BUDGETS`: every hard-free row is a
++  chat/text model. The free image path therefore requires a self-hosted ComfyUI / SD WebUI connection (or a new
++  explicit hard-stop free budget row). Without one, `AUTO_IMAGE_GEN_FREE` is a
++  **CONTROLLED_UNAVAILABLE** — which the mission explicitly allows as a valid PASS for policy correctness
++  ("do not weaken FREE_ONLY merely to turn image generation green").
++- Live end-to-end image generation was consequently not exercised (no eligible provider, and paid generation is
++  forbidden); Phase 8's final canary will re-verify the controlled 503 and the advertised aliases.
++- The free image resolver **consults** the native provider circuit breaker (`canExecute()`) but does not
++  implement failure recording — no parallel breaker implementation (upstream owns recording), consistent with
++  the R2/R4 approach.
++
++## 6. Data safety
++
++No paid/credit-backed/unknown-cost image or vision provider is reachable from the alias; no provider was
++called; AWS and Meta image integrations untouched; live `:20128` untouched; OpenCode / Hermes / Harness / IAMM /
++StockNewsBR untouched. `PROVIDERS_DELETED=0`, `CONNECTIONS_DELETED=0`, `CREDENTIALS_DELETED=0`,
++`PAID_INFERENCE_TRIGGERED=NO`, `SECRETS_EXPOSED=NO`.
+-- 
+2.53.0
+

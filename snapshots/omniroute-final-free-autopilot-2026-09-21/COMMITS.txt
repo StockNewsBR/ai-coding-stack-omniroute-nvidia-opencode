@@ -1,0 +1,13 @@
+branch=final/free-autopilot-2026-09-21
+head=bd994e3c1b8dd0c887fc6d988b785a083b753e3a
+bd994e3c1b8dd0c887fc6d988b785a083b753e3a docs(omniroute): certify final FREE_ONLY candidate (phases 3-8)
+7e5a2d80b23ea2e10b588581236abad1614a04a7 docs(omniroute): record final R4 quota circuit and workload isolation
+f7f739e661919452bd0fe8355e629ef223a33d51 feat(omniroute): harden quota circuit and workload isolation
+ed30d298e17fa9ca45777c43a759dcd52cded7de docs(omniroute): record final R3 vision and image reconstruction
+309ae65f6976947ec74ac5998343d92ddf4e755e feat(omniroute): reconstruct FREE_ONLY vision and image routing
+f0e40d9697ea8e8b63b0ffd0fc0b06afbdf80576 docs(omniroute): record final R2 search reconstruction
+af44c10b595cbe36d3e1168a9918d7f857ce5862 feat(omniroute): reconstruct dynamic FREE_ONLY search routing
+26066ca07fab180f7f39d58abc56efe03205e28e docs(omniroute): record final R1.11 isolated canary
+2e10170e8a481ef40af4bdda9f0fb390eab96bc7 fix(omniroute): classify FREE_ONLY inspector candidates by bare model id
+3f4d1219b542cfcaf5c5991f7053eb8117632aa4 docs(omniroute): record final R1 reconstruction evidence
+864ddc1d57871827ab2be3a9235bab5f8c12bc48 feat(omniroute): reconstruct strict dynamic FREE_ONLY routing

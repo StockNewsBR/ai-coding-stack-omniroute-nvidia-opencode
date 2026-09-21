@@ -1,0 +1,1389 @@
+From 864ddc1d57871827ab2be3a9235bab5f8c12bc48 Mon Sep 17 00:00:00 2001
+From: StockNewsBR <264292956+StockNewsBR@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 17:47:38 -0300
+Subject: [PATCH 01/11] feat(omniroute): reconstruct strict dynamic FREE_ONLY
+ routing
+
+---
+ open-sse/handlers/autoComboCandidates.ts      | 104 ++++-
+ .../services/autoCombo/freeAccessQuota.ts     |  27 ++
+ .../autoCombo/freeProviderSentinel.ts         | 358 +++++++++++++++++
+ .../autoCombo/strictZeroCostFilter.ts         | 111 +++---
+ .../free-provider-sentinel-r1.test.ts         | 366 ++++++++++++++++++
+ ...strict-zero-cost-connection-safety.test.ts | 120 ++++--
+ .../autoCombo/strict-zero-cost-filter.test.ts |  43 +-
+ 7 files changed, 1006 insertions(+), 123 deletions(-)
+ create mode 100644 open-sse/services/autoCombo/freeProviderSentinel.ts
+ create mode 100644 tests/unit/autoCombo/free-provider-sentinel-r1.test.ts
+
+diff --git a/open-sse/handlers/autoComboCandidates.ts b/open-sse/handlers/autoComboCandidates.ts
+index c13303230..14ccc4aed 100644
+--- a/open-sse/handlers/autoComboCandidates.ts
++++ b/open-sse/handlers/autoComboCandidates.ts
+@@ -14,12 +14,27 @@
+  *     provider_connections row (no-auth synthetic connections have no row —
+  *     treated as always reachable on this axis).
+  *   - model lockout: `isModelLocked(provider, connectionId, model)`.
++ *   - free-cost class: `evaluateFreeSentinel(...)` projects the cost class
++ *     (`FREE_VERIFIED` / `SELF_HOSTED` / ...), whether AUTO FREE routing may
++ *     pick the candidate, the reason code and the cached quota status — via the
++ *     cache-only quota read, so listing candidates never probes a provider.
+  */
+ import { buildErrorBody } from "@omniroute/open-sse/utils/error.ts";
+ import { getCircuitBreaker } from "@/shared/utils/circuitBreaker";
+ import { isModelLocked } from "@omniroute/open-sse/services/accountFallback.ts";
+ import { getProviderConnectionById } from "@/lib/db/providers";
+ import { getExcludedConnectionIds } from "@/lib/db/autoCandidateOverrides";
++import { getSettings } from "@/lib/db/settings";
++import { toNumber } from "@/shared/utils/numeric";
++import { FREE_MODEL_BUDGETS } from "@omniroute/open-sse/config/freeModelCatalog.ts";
++import {
++  evaluateFreeSentinel,
++  type FreeCostClass,
++  type FreeQuotaStatus,
++  type FreeSentinelContext,
++  type FreeSentinelReason,
++} from "@omniroute/open-sse/services/autoCombo/freeProviderSentinel.ts";
++import { readFreeAccessStateCached } from "@omniroute/open-sse/services/autoCombo/freeAccessQuota.ts";
+ 
+ export interface AutoComboCandidateView {
+   provider: string;
+@@ -31,6 +46,12 @@ export interface AutoComboCandidateView {
+   breakerState: string;
+   connectionCooldown: boolean;
+   modelLocked: boolean;
++  /** Free-cost class from `freeProviderSentinel.ts` (advisory, read-only). */
++  freeCostClass: FreeCostClass;
++  autoFreeEligible: boolean;
++  autoFreeReason: FreeSentinelReason;
++  /** Cached quota status: SAFE | EXHAUSTED | UNKNOWN | ABSENT (no telemetry). */
++  quotaStatus: FreeQuotaStatus;
+ }
+ 
+ export interface AutoComboCandidatesResult {
+@@ -44,12 +65,57 @@ function hasFutureRateLimit(value: unknown): boolean {
+   return Number.isFinite(time) && time > Date.now();
+ }
+ 
+-async function decorateCandidate(candidate: {
+-  provider: string;
+-  connectionId: string;
+-  model: string;
+-  modelStr: string;
+-}): Promise<AutoComboCandidateView> {
++interface FreeCostProjection {
++  freeCostClass: FreeCostClass;
++  autoFreeEligible: boolean;
++  autoFreeReason: FreeSentinelReason;
++  quotaStatus: FreeQuotaStatus;
++}
++
++/**
++ * Projects the free-cost classification for one account-oriented candidate.
++ * Read-only: `options.resolveFreeAccessState` must be the cache-only reader, so
++ * this never triggers a provider request. Fails open to "not eligible" so an
++ * unexpected sentinel error cannot break the listing.
++ */
++function projectFreeEligibility(
++  candidate: { provider: string; model: string; connectionId: string },
++  options: FreeSentinelContext
++): FreeCostProjection {
++  try {
++    const facts = evaluateFreeSentinel(
++      {
++        provider: candidate.provider,
++        model: candidate.model,
++        connectionId: candidate.connectionId,
++      },
++      options
++    );
++    return {
++      freeCostClass: facts.costClass,
++      autoFreeEligible: facts.autoFreeAllowed,
++      autoFreeReason: facts.reason,
++      quotaStatus: facts.quotaStatus,
++    };
++  } catch {
++    return {
++      freeCostClass: "UNKNOWN_COST",
++      autoFreeEligible: false,
++      autoFreeReason: "UNKNOWN_COST_EXCLUDED",
++      quotaStatus: "ABSENT",
++    };
++  }
++}
++
++async function decorateCandidate(
++  candidate: {
++    provider: string;
++    connectionId: string;
++    model: string;
++    modelStr: string;
++  },
++  freeOptions: FreeSentinelContext
++): Promise<AutoComboCandidateView> {
+   const breaker = getCircuitBreaker(candidate.provider);
+   const breakerStatus = breaker.getStatus();
+   const breakerReachable = breaker.canExecute();
+@@ -70,6 +136,7 @@ async function decorateCandidate(candidate: {
+   }
+ 
+   const modelLocked = isModelLocked(candidate.provider, candidate.connectionId, candidate.model);
++  const freeProjection = projectFreeEligibility(candidate, freeOptions);
+ 
+   return {
+     provider: candidate.provider,
+@@ -81,6 +148,7 @@ async function decorateCandidate(candidate: {
+     breakerState: String(breakerStatus.state),
+     connectionCooldown,
+     modelLocked,
++    ...freeProjection,
+   };
+ }
+ 
+@@ -114,6 +182,15 @@ export async function getAutoComboCandidates(
+     ? await getExcludedConnectionIds(apiKeyId, modelStr).catch(() => new Set<string>())
+     : new Set<string>();
+ 
++  // Same 1pp headroom / settings TTL as virtualFactory's strict filter (keep in sync).
++  const settings = await getSettings().catch(() => null);
++  const freeOptions: FreeSentinelContext = {
++    catalog: FREE_MODEL_BUDGETS,
++    resolveFreeAccessState: readFreeAccessStateCached,
++    minRemainingAllowance: 1,
++    maxStateAgeMs: toNumber(settings?.autoRefreshProviderQuotaInterval, 180) * 1000,
++  };
++
+   const models: Array<{
+     providerId: string;
+     connectionId: string | null;
+@@ -132,12 +209,15 @@ export async function getAutoComboCandidates(
+ 
+   const candidates = await Promise.all(
+     accountCandidates.map(async (candidate) => {
+-      const decorated = await decorateCandidate({
+-        provider: candidate.providerId,
+-        connectionId: candidate.connectionId,
+-        model: candidate.model,
+-        modelStr: candidate.model,
+-      });
++      const decorated = await decorateCandidate(
++        {
++          provider: candidate.providerId,
++          connectionId: candidate.connectionId,
++          model: candidate.model,
++          modelStr: candidate.model,
++        },
++        freeOptions
++      );
+       return { ...decorated, excluded: excludedConnectionIds.has(candidate.connectionId) };
+     })
+   );
+diff --git a/open-sse/services/autoCombo/freeAccessQuota.ts b/open-sse/services/autoCombo/freeAccessQuota.ts
+index 515ec57a8..e8d37e151 100644
+--- a/open-sse/services/autoCombo/freeAccessQuota.ts
++++ b/open-sse/services/autoCombo/freeAccessQuota.ts
+@@ -13,6 +13,11 @@
+  * fail-closed) and kicks off a background refresh for the *next* read —
+  * nothing here can make `strictZeroCostFilter.ts`'s pool build block on a
+  * network call.
++ *
++ * `readFreeAccessStateCached()` is the cache-only sibling used by read-only
++ * inspection paths (`autoComboCandidates.ts`): same gates, same freshness
++ * rule, but it NEVER triggers a refresh, so merely listing candidates cannot
++ * cause a provider request. A miss/stale entry reads as `undefined`.
+  */
+ import {
+   getUsageForProvider,
+@@ -198,6 +203,28 @@ export function resolveFreeAccessState(
+   return fresh ? entry.state : undefined;
+ }
+ 
++/**
++ * Cache-only sibling of `resolveFreeAccessState()` for read-only inspection
++ * paths. Applies the exact same gates (usage-adapter presence, connection id)
++ * and the same freshness rule, but it never calls `refresh()`: a read-only
++ * endpoint must not trigger a provider request as a side effect of being
++ * called. Anything cold or stale simply reads as `undefined` (→ ABSENT/UNKNOWN
++ * for the caller), which the sentinel treats as "no telemetry available"
++ * rather than "exhausted".
++ */
++export function readFreeAccessStateCached(
++  provider: string,
++  connectionId: string | undefined
++): FreeAccessState | undefined {
++  sweepIfDue();
++  if (!USAGE_FETCHER_PROVIDER_SET.has(provider as UsageFetcherProvider)) return undefined;
++  if (!connectionId) return undefined;
++
++  const entry = cache.get(cacheKey(provider, connectionId));
++  if (!entry) return undefined;
++  return Date.now() - entry.fetchedAtMs <= ttlMs() ? entry.state : undefined;
++}
++
+ /** Called by `accountFallback.ts` the moment a 402/403/quota-exhausted
+  * response is classified for a connection — drops the cached entry
+  * immediately instead of waiting out the TTL, so the very next candidate-pool
+diff --git a/open-sse/services/autoCombo/freeProviderSentinel.ts b/open-sse/services/autoCombo/freeProviderSentinel.ts
+new file mode 100644
+index 000000000..ddde1565c
+--- /dev/null
++++ b/open-sse/services/autoCombo/freeProviderSentinel.ts
+@@ -0,0 +1,358 @@
++/**
++ * Free-provider sentinel: dynamic, evidence-based cost classification for AUTO FREE routing.
++ *
++ * Mission context (STRICT POLICY DESIGN REVIEW):
++ * - AUTO FREE must be dynamic. There is no static provider shortlist: every discovered
++ *   provider/model is classified from current evidence and may join the pool when it satisfies
++ *   the policy, health, capability and circuit requirements.
++ * - Live quota telemetry improves selection/headroom when it is available, but its ABSENCE must
++ *   not automatically exclude a route that is provably unable to spill into paid billing
++ *   (self-hosted hardware, keyless hard-free endpoint, or a curated hard-stop free tier that
++ *   returns 429/limit exhaustion instead of billing). That is why quota state is advisory for
++ *   proof classes and authoritative only when it carries positive evidence of exhaustion.
++ *
++ * Policy (automatic FREE admission):
++ *   ALLOW  FREE_VERIFIED  curated catalog entry with proven no-billing semantics
++ *                         (keyless hard-free endpoint, or hard-stop free tier).
++ *   ALLOW  SELF_HOSTED    provider runs on operator-controlled hardware; cannot bill.
++ *   DENY   FREE_UNKNOWN   free-looking but no proof that exceeding the allowance is a hard stop.
++ *   DENY   UNKNOWN_COST   no catalog entry and no zero-cost evidence.
++ *   DENY   NULL_COST      cost metadata is null; never assumed free.
++ *   DENY   PAID           known positive cost.
++ *   DENY   CREDIT_BACKED  trial/one-time/recurring credits that can spill into billing.
++ *   DENY   DISCONTINUED   model retired by the provider.
++ *
++ * This module is pure (no DB, no network). It is used by:
++ *   - strictZeroCostFilter.ts — admission into auto/* pools when settings.freeAccessPolicy is "strict";
++ *   - autoComboCandidates.ts  — read-only inspector projection using cached state only.
++ * Explicit/pinned provider+model requests never consult this module; their semantics are unchanged.
++ */
++
++import type { FreeModelBudget } from "@omniroute/open-sse/config/freeModelCatalog.ts";
++import { isLocalProvider, isSelfHostedChatProvider } from "@/shared/constants/providers";
++import { SYNTHETIC_NOAUTH_CONNECTION_ID } from "./resilienceCandidateFilter";
++
++export type FreeCostClass =
++  | "FREE_VERIFIED"
++  | "SELF_HOSTED"
++  | "FREE_UNKNOWN"
++  | "UNKNOWN_COST"
++  | "NULL_COST"
++  | "PAID"
++  | "CREDIT_BACKED"
++  | "DISCONTINUED";
++
++/** The only cost classes AUTO FREE may select. Everything else is denied automatically. */
++export const AUTO_FREE_ALLOWED_COST_CLASSES: ReadonlySet<FreeCostClass> = new Set<FreeCostClass>([
++  "FREE_VERIFIED",
++  "SELF_HOSTED",
++]);
++
++/** Stable machine-readable explanation codes (safe to expose in read-only diagnostics). */
++export type FreeSentinelReason =
++  | "SELF_HOSTED_NO_BILLING"
++  | "KEYLESS_HARD_FREE_ENDPOINT"
++  | "HARD_STOP_FREE_TIER_VERIFIED"
++  | "NOAUTH_METADATA_CONFLICT_EXCLUDED"
++  | "KEYLESS_REQUIRES_NOAUTH_CONNECTION"
++  | "CREDIT_BACKED_EXCLUDED"
++  | "FREE_UNKNOWN_NO_HARD_STOP_PROOF"
++  | "NULL_COST_EXCLUDED"
++  | "UNKNOWN_COST_EXCLUDED"
++  | "PAID_COST_EXCLUDED"
++  | "DISCONTINUED_EXCLUDED"
++  | "QUOTA_EXHAUSTED"
++  | "NO_SAFE_CONNECTION";
++
++export interface FreeCostCandidate {
++  provider: string;
++  model: string;
++  connectionId?: string | null;
++  allowedConnectionIds?: string[];
++  costPer1MTokens?: number | null;
++}
++
++/** Structural subset of FreeAccessState (kept local to avoid a circular import). */
++export interface FreeQuotaReading {
++  status: "SAFE" | "EXHAUSTED" | "UNKNOWN";
++  remainingFreeAllowance: number | null;
++  resetAt?: string | null;
++  checkedAt: string;
++}
++
++export type FreeQuotaStatus = "SAFE" | "EXHAUSTED" | "UNKNOWN" | "ABSENT";
++
++export interface FreeCostVerdict {
++  costClass: FreeCostClass;
++  autoFreeAllowed: boolean;
++  /** True when the class is proven unable to spill into paid billing. */
++  hardStopProven: boolean;
++  /** True when a live quota/headroom reading can refine selection (but not gate it). */
++  telemetryAdvisory: boolean;
++  reason: FreeSentinelReason;
++}
++
++export interface FreeSentinelFacts extends FreeCostVerdict {
++  quotaStatus: FreeQuotaStatus;
++  quotaRemaining: number | null;
++  /** Connections this candidate may be dispatched on; empty means the candidate is not eligible. */
++  safeConnectionIds: string[];
++}
++
++export interface FreeSentinelContext {
++  /** Explicit catalog entry (the strict filter resolves it and passes it through). */
++  entry?: FreeModelBudget | null;
++  /** Catalog to resolve the entry from when `entry` is not provided. */
++  catalog?: readonly FreeModelBudget[];
++  /** Synchronous, cache-only free-access reader. Never triggers a provider request. */
++  resolveFreeAccessState?: (provider: string, connectionId: string) => FreeQuotaReading | undefined;
++  minRemainingAllowance?: number;
++  maxStateAgeMs?: number;
++  now?: () => number;
++}
++
++interface VerdictFlags {
++  hardStopProven: boolean;
++  telemetryAdvisory: boolean;
++  reason: FreeSentinelReason;
++}
++
++function allow(costClass: FreeCostClass, flags: VerdictFlags): FreeCostVerdict {
++  return {
++    costClass,
++    autoFreeAllowed: true,
++    hardStopProven: flags.hardStopProven,
++    telemetryAdvisory: flags.telemetryAdvisory,
++    reason: flags.reason,
++  };
++}
++
++function deny(costClass: FreeCostClass, reason: FreeSentinelReason): FreeCostVerdict {
++  return {
++    costClass,
++    autoFreeAllowed: false,
++    hardStopProven: false,
++    telemetryAdvisory: false,
++    reason,
++  };
++}
++
++const HARD_STOP_FREE_TYPES = new Set<FreeModelBudget["freeType"]>([
++  "recurring-daily",
++  "recurring-monthly",
++  "recurring-uncapped",
++]);
++
++/** Credits, trials and one-time balances can spill into billing — never auto-selected. */
++const CREDIT_BACKED_FREE_TYPES = new Set<FreeModelBudget["freeType"]>([
++  "one-time-initial",
++  "recurring-credit",
++]);
++
++/**
++ * Self-hosted signal: the provider executes on hardware the operator controls, so no request can
++ * ever generate provider billing. This reads the native self-hosted/local provider constants; it is
++ * a capability class, not a free-provider allowlist. Generic `*-compatible-*` endpoints are
++ * deliberately NOT included: a user-defined endpoint may front a paid remote service, so those
++ * models stay UNKNOWN_COST until a catalog entry proves otherwise.
++ */
++export function isSelfHostedFreeProvider(providerId: string): boolean {
++  return isSelfHostedChatProvider(providerId) || isLocalProvider(providerId);
++}
++
++export function findFreeCatalogEntry(
++  candidate: Pick<FreeCostCandidate, "provider" | "model">,
++  catalog: readonly FreeModelBudget[] | undefined
++): FreeModelBudget | undefined {
++  if (!catalog) return undefined;
++  return catalog.find(
++    (item) => item.provider === candidate.provider && item.modelId === candidate.model
++  );
++}
++
++/**
++ * Pure cost classification from catalog/credential evidence. No provider is classified as free by
++ * name, and no quota reading is consulted here (see evaluateFreeSentinel for the quota dimension).
++ */
++export function classifyFreeCost(
++  candidate: FreeCostCandidate,
++  entry?: FreeModelBudget
++): FreeCostVerdict {
++  if (isSelfHostedFreeProvider(candidate.provider)) {
++    return allow("SELF_HOSTED", {
++      hardStopProven: true,
++      telemetryAdvisory: false,
++      reason: "SELF_HOSTED_NO_BILLING",
++    });
++  }
++
++  if (entry) {
++    const freeType = entry.freeType;
++
++    if (candidate.connectionId === SYNTHETIC_NOAUTH_CONNECTION_ID && freeType !== "keyless") {
++      // A credential-less candidate pointing at a credential-backed catalog entry is contradictory
++      // metadata. Fail closed instead of trusting either side.
++      return deny("FREE_UNKNOWN", "NOAUTH_METADATA_CONFLICT_EXCLUDED");
++    }
++
++    if (freeType === "discontinued") {
++      return deny("DISCONTINUED", "DISCONTINUED_EXCLUDED");
++    }
++
++    if (freeType === "keyless") {
++      // The endpoint itself needs no credential, so it cannot bill. The shortcut is only valid on
++      // the genuine no-auth path: a real DB connection holding a credential must not inherit
++      // keyless semantics (connection-safety invariant #1).
++      if (candidate.connectionId === SYNTHETIC_NOAUTH_CONNECTION_ID) {
++        return allow("FREE_VERIFIED", {
++          hardStopProven: true,
++          telemetryAdvisory: false,
++          reason: "KEYLESS_HARD_FREE_ENDPOINT",
++        });
++      }
++      return deny("FREE_UNKNOWN", "KEYLESS_REQUIRES_NOAUTH_CONNECTION");
++    }
++
++    if (CREDIT_BACKED_FREE_TYPES.has(freeType)) {
++      return deny("CREDIT_BACKED", "CREDIT_BACKED_EXCLUDED");
++    }
++
++    if (HARD_STOP_FREE_TYPES.has(freeType)) {
++      if (entry.hardStopGuaranteed === true) {
++        return allow("FREE_VERIFIED", {
++          hardStopProven: true,
++          telemetryAdvisory: true,
++          reason: "HARD_STOP_FREE_TIER_VERIFIED",
++        });
++      }
++      return deny("FREE_UNKNOWN", "FREE_UNKNOWN_NO_HARD_STOP_PROOF");
++    }
++
++    return deny("FREE_UNKNOWN", "FREE_UNKNOWN_NO_HARD_STOP_PROOF");
++  }
++
++  const cost = candidate.costPer1MTokens;
++  if (cost === null) return deny("NULL_COST", "NULL_COST_EXCLUDED");
++  if (typeof cost === "number" && Number.isFinite(cost) && cost > 0) {
++    return deny("PAID", "PAID_COST_EXCLUDED");
++  }
++  // An uncatalogued zero price is not evidence of a hard-free endpoint.
++  return deny("UNKNOWN_COST", "UNKNOWN_COST_EXCLUDED");
++}
++
++function collectConnectionIds(candidate: FreeCostCandidate): string[] {
++  if (typeof candidate.connectionId === "string" && candidate.connectionId.length > 0) {
++    return [candidate.connectionId];
++  }
++  const allowed = candidate.allowedConnectionIds;
++  if (Array.isArray(allowed) && allowed.length > 0) return [...allowed];
++  return [];
++}
++
++function isUsableSafeReading(
++  reading: FreeQuotaReading,
++  now: () => number,
++  maxAgeMs: number
++): boolean {
++  if (reading.status !== "SAFE") return false;
++  if (reading.remainingFreeAllowance === null) return false;
++  if (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0) return false;
++  const checkedAtMs = Date.parse(reading.checkedAt);
++  if (!Number.isFinite(checkedAtMs)) return false;
++  return now() - checkedAtMs <= maxAgeMs;
++}
++
++/**
++ * Full eligibility projection: cost class + per-connection safety.
++ *
++ * Quota semantics for proof classes (FREE_VERIFIED via hard stop):
++ *   - a fresh SAFE reading with headroom above the margin keeps the connection and reports headroom;
++ *   - a reading that positively reports EXHAUSTED, or a fresh SAFE reading without headroom, drops
++ *     the connection (negative evidence must never be dispatched);
++ *   - an ABSENT, stale or UNKNOWN reading does not exclude the connection, because the hard stop
++ *     itself prevents billing (worst case the provider returns 429 and the existing resilience
++ *     layer cools the connection down).
++ * SELF_HOSTED and keyless candidates never resolve quota state at all.
++ */
++export function evaluateFreeSentinel(
++  candidate: FreeCostCandidate,
++  context: FreeSentinelContext = {}
++): FreeSentinelFacts {
++  const entry =
++    context.entry === undefined
++      ? findFreeCatalogEntry(candidate, context.catalog)
++      : (context.entry ?? undefined);
++  const verdict = classifyFreeCost(candidate, entry);
++
++  const facts: FreeSentinelFacts = {
++    ...verdict,
++    quotaStatus: "ABSENT",
++    quotaRemaining: null,
++    safeConnectionIds: [],
++  };
++
++  if (!verdict.autoFreeAllowed) return facts;
++
++  const connectionIds = collectConnectionIds(candidate);
++  if (connectionIds.length === 0) return facts;
++
++  if (verdict.costClass === "SELF_HOSTED" || verdict.reason === "KEYLESS_HARD_FREE_ENDPOINT") {
++    return { ...facts, safeConnectionIds: [...connectionIds] };
++  }
++
++  const resolve = context.resolveFreeAccessState;
++  const minRemaining =
++    typeof context.minRemainingAllowance === "number" ? context.minRemainingAllowance : 0;
++  const maxAgeMs = typeof context.maxStateAgeMs === "number" ? context.maxStateAgeMs : 0;
++  const now = context.now ?? (() => Date.now());
++
++  const safeConnectionIds: string[] = [];
++  let bestStatus: FreeQuotaStatus = "ABSENT";
++  let bestRemaining: number | null = null;
++  let exhaustedRemaining: number | null = null;
++
++  for (const connectionId of connectionIds) {
++    const reading = resolve ? resolve(candidate.provider, connectionId) : undefined;
++
++    if (!reading) {
++      // Telemetry absent: advisory only for a provably hard-free route.
++      if (bestStatus !== "SAFE") bestStatus = "UNKNOWN";
++      safeConnectionIds.push(connectionId);
++      continue;
++    }
++
++    if (reading.status === "EXHAUSTED") {
++      exhaustedRemaining = reading.remainingFreeAllowance;
++      continue;
++    }
++
++    if (!isUsableSafeReading(reading, now, maxAgeMs)) {
++      if (bestStatus !== "SAFE") bestStatus = "UNKNOWN";
++      safeConnectionIds.push(connectionId);
++      continue;
++    }
++
++    const remaining = reading.remainingFreeAllowance as number;
++    if (minRemaining < 0 || remaining > minRemaining) {
++      bestStatus = "SAFE";
++      bestRemaining = remaining;
++      safeConnectionIds.push(connectionId);
++    }
++  }
++
++  if (safeConnectionIds.length === 0) {
++    return {
++      ...facts,
++      quotaStatus: exhaustedRemaining === null ? "ABSENT" : "EXHAUSTED",
++      quotaRemaining: exhaustedRemaining,
++      reason: exhaustedRemaining === null ? "NO_SAFE_CONNECTION" : "QUOTA_EXHAUSTED",
++    };
++  }
++
++  return {
++    ...facts,
++    quotaStatus: bestStatus,
++    quotaRemaining: bestRemaining,
++    safeConnectionIds,
++  };
++}
+diff --git a/open-sse/services/autoCombo/strictZeroCostFilter.ts b/open-sse/services/autoCombo/strictZeroCostFilter.ts
+index c9bc601bc..80d13fc6b 100644
+--- a/open-sse/services/autoCombo/strictZeroCostFilter.ts
++++ b/open-sse/services/autoCombo/strictZeroCostFilter.ts
+@@ -23,6 +23,20 @@
+  * handled automatically; one that doesn't is excluded automatically — see
+  * `docs/routing/STRICT_ZERO_COST.md`.
+  *
++ * ## Free cost classes (reconstruction, see `docs/routing/STRICT_ZERO_COST.md`)
++ *
++ * Admission is no longer "is it in FREE_MODEL_BUDGETS and freshly verified".
++ * `freeProviderSentinel.ts` classifies every candidate into exactly one of
++ * FREE_VERIFIED, SELF_HOSTED, FREE_UNKNOWN, UNKNOWN_COST, NULL_COST, PAID,
++ * CREDIT_BACKED or DISCONTINUED from catalog metadata plus the candidate's own
++ * connection shape; only FREE_VERIFIED and SELF_HOSTED are admissible. Live
++ * quota telemetry remains the headroom signal wherever it exists, but it is an
++ * optimization, NOT a gate, for routes with independent evidence they cannot
++ * spill into paid billing (self-hosted, keyless hard-free endpoint, or a
++ * `recurring-*` entry whose provider terms document a hard stop rather than
++ * pay-as-you-go billing). A positive EXHAUSTED reading still excludes, and
++ * every class outside the allowed set is rejected before any quota read runs.
++ *
+  * ## Connection safety (fixed after code review, see `docs/routing/STRICT_ZERO_COST.md`)
+  *
+  * A candidate from `virtualFactory.ts`'s connection-based pool represents ONE
+@@ -53,10 +67,7 @@ import {
+   type FreeModelBudget,
+ } from "@omniroute/open-sse/config/freeModelCatalog.ts";
+ import { SYNTHETIC_NOAUTH_CONNECTION_ID } from "./resilienceCandidateFilter";
+-
+-/** Types whose allowance needs no runtime verification: no credential exists
+- * for the candidate at all, so no request against it can ever be billed. */
+-const KEYLESS_FREE_TYPES = new Set<FreeModelBudget["freeType"]>(["keyless"]);
++import { evaluateFreeSentinel, findFreeCatalogEntry } from "./freeProviderSentinel";
+ 
+ export type FreeAccessStatus = "SAFE" | "EXHAUSTED" | "UNKNOWN";
+ 
+@@ -128,40 +139,36 @@ export function findBudgetEntry(
+   candidate: Pick<StrictZeroCostCandidate, "provider" | "model">,
+   catalog: readonly FreeModelBudget[] = FREE_MODEL_BUDGETS
+ ): FreeModelBudget | undefined {
+-  return catalog.find((m) => m.provider === candidate.provider && m.modelId === candidate.model);
+-}
+-
+-function isConnectionStateSafe(
+-  provider: string,
+-  connectionId: string,
+-  resolveFreeAccessState: StrictZeroCostOptions["resolveFreeAccessState"],
+-  options: Pick<StrictZeroCostOptions, "minRemainingAllowance" | "maxStateAgeMs" | "now">
+-): boolean {
+-  const state = resolveFreeAccessState(provider, connectionId);
+-  if (!state) return false; // no usage adapter for this provider, or lookup never ran/is stale
+-  if (state.status !== "SAFE") return false;
+-
+-  const now = (options.now ?? Date.now)();
+-  const checkedAtMs = Date.parse(state.checkedAt);
+-  if (!Number.isFinite(checkedAtMs) || now - checkedAtMs > options.maxStateAgeMs) return false;
+-
+-  if (state.remainingFreeAllowance === null) return false;
+-  // A negative threshold would let a negative/garbage reading pass; a caller
+-  // that genuinely wants "any allowance greater than zero" should pass 0.
+-  if (options.minRemainingAllowance < 0) return false;
+-  return state.remainingFreeAllowance > options.minRemainingAllowance;
++  return findFreeCatalogEntry(candidate, catalog);
+ }
+ 
+ /**
+  * Decide which of a candidate's connections satisfy STRICT_ZERO_COST. Pure —
+- * `resolveFreeAccessState` is the only injected side-effecting dependency,
+- * and it's a synchronous cache read (see `StrictZeroCostOptions` above).
++ * `resolveFreeAccessState` is the only injected side-effecting dependency, and
++ * it's a synchronous cache read (see `StrictZeroCostOptions` above).
+  *
+- * Returns the list of connection ids proven SAFE right now:
++ * Admission is delegated to `freeProviderSentinel.ts`, which classifies the
++ * candidate into exactly one free-cost class and returns the connection ids
++ * that may be dispatched:
++ *   - `FREE_VERIFIED` — a genuine no-auth keyless endpoint, or a `recurring-*`
++ *     catalog entry with `hardStopGuaranteed: true`. A live quota reading is
++ *     honoured whenever it is fresh and usable: EXHAUSTED excludes that
++ *     connection, and a SAFE reading below the headroom threshold excludes it
++ *     too. An ABSENT / stale / UNKNOWN reading is advisory, not a gate — the
++ *     provider's own terms make free-tier exhaustion a hard stop, so the route
++ *     cannot spill into paid billing, and refusing it while telemetry is
++ *     missing would fail closed for no safety benefit.
++ *   - `SELF_HOSTED` — self-hosted/local provider ids: always dispatchable, no
++ *     cloud quota row exists or is required.
++ *   - every other class (FREE_UNKNOWN, UNKNOWN_COST, NULL_COST, PAID,
++ *     CREDIT_BACKED, DISCONTINUED) — excluded, and excluded BEFORE any quota
++ *     lookup runs, so an untrusted entry never costs a usage read.
++ *
++ * Returns the list of connection ids proven dispatchable right now:
+  *   - `[SYNTHETIC_NOAUTH_CONNECTION_ID]` for a genuine no-auth candidate whose
+  *     catalog entry is `keyless` — no live check needed or possible.
+  *   - a (possibly empty) subset of the candidate's real connection id(s) for
+- *     every other case, each individually verified.
++ *     every other case, each individually evaluated.
+  * An empty array means the caller must exclude the candidate entirely.
+  */
+ export function evaluateCandidateConnections(
+@@ -170,42 +177,14 @@ export function evaluateCandidateConnections(
+   resolveFreeAccessState: StrictZeroCostOptions["resolveFreeAccessState"],
+   options: Pick<StrictZeroCostOptions, "minRemainingAllowance" | "maxStateAgeMs" | "now">
+ ): string[] {
+-  if (!budgetEntry) return []; // not in the catalog at all → paid, or genuinely unknown
+-
+-  const isGenuineNoAuthCandidate = candidate.connectionId === SYNTHETIC_NOAUTH_CONNECTION_ID;
+-  if (KEYLESS_FREE_TYPES.has(budgetEntry.freeType)) {
+-    // The keyless shortcut is trustworthy ONLY when this specific candidate
+-    // instance actually has no credential behind it. A `keyless`-catalogued
+-    // model reached through a real DB connection (connectionId is a real id,
+-    // or the candidate carries allowedConnectionIds at all) must NOT take
+-    // this shortcut — it falls through to the quota-based check below like
+-    // any other freeType, and is excluded there unless hardStopGuaranteed is
+-    // also set for it (which the curated catalog does not do for keyless
+-    // entries today, so it will correctly exclude).
+-    if (isGenuineNoAuthCandidate) return [SYNTHETIC_NOAUTH_CONNECTION_ID];
+-  }
+-  if (budgetEntry.freeType === "discontinued") return [];
+-  if (isGenuineNoAuthCandidate) return []; // no-auth path but a non-keyless catalog entry: contradictory metadata, fail closed
+-
+-  // Every remaining freeType (recurring-*, one-time-initial, a keyless entry
+-  // reached via a real connection, and any future type this module doesn't
+-  // special-case) requires a documented hard stop before any live check even
+-  // runs — no point burning a quota lookup on a connection we could never
+-  // trust regardless of its answer.
+-  if (budgetEntry.hardStopGuaranteed !== true) return [];
+-
+-  const candidateConnectionIds = candidate.connectionId
+-    ? [candidate.connectionId]
+-    : (candidate.allowedConnectionIds ?? []);
+-
+-  const safe: string[] = [];
+-  for (const connectionId of candidateConnectionIds) {
+-    if (connectionId === SYNTHETIC_NOAUTH_CONNECTION_ID) continue; // never reachable here, defensive
+-    if (isConnectionStateSafe(candidate.provider, connectionId, resolveFreeAccessState, options)) {
+-      safe.push(connectionId);
+-    }
+-  }
+-  return safe;
++  const facts = evaluateFreeSentinel(candidate, {
++    entry: budgetEntry,
++    resolveFreeAccessState,
++    minRemainingAllowance: options.minRemainingAllowance,
++    maxStateAgeMs: options.maxStateAgeMs,
++    now: options.now,
++  });
++  return facts.safeConnectionIds;
+ }
+ 
+ /**
+diff --git a/tests/unit/autoCombo/free-provider-sentinel-r1.test.ts b/tests/unit/autoCombo/free-provider-sentinel-r1.test.ts
+new file mode 100644
+index 000000000..5ae08fb78
+--- /dev/null
++++ b/tests/unit/autoCombo/free-provider-sentinel-r1.test.ts
+@@ -0,0 +1,366 @@
++/**
++ * R1 reconstruction — policy matrix for the AUTO FREE cost sentinel.
++ *
++ * `tests/unit/autoCombo/` is a vitest-only scope (see vitest.mcp.config.ts).
++ *
++ * The sentinel is the single source of truth for AUTO FREE admission: only
++ * FREE_VERIFIED (a keyless hard-free endpoint, or a recurring free tier whose
++ * provider terms document a hard stop) and SELF_HOSTED may be auto-selected.
++ * Paid, credit-backed, unknown-cost, null-cost, free-unknown and discontinued
++ * candidates are always excluded, and there is no paid fallback.
++ */
++import { test } from "vitest";
++import assert from "node:assert/strict";
++
++import {
++  AUTO_FREE_ALLOWED_COST_CLASSES,
++  classifyFreeCost,
++  evaluateFreeSentinel,
++  findFreeCatalogEntry,
++  isSelfHostedFreeProvider,
++  type FreeCostClass,
++  type FreeQuotaReading,
++} from "../../../open-sse/services/autoCombo/freeProviderSentinel.ts";
++import {
++  FREE_MODEL_BUDGETS,
++  type FreeModelBudget,
++} from "../../../open-sse/config/freeModelCatalog.ts";
++import { SYNTHETIC_NOAUTH_CONNECTION_ID } from "../../../open-sse/services/autoCombo/resilienceCandidateFilter.ts";
++
++const NOW = "2026-08-20T00:00:00.000Z";
++const REAL_CONN = "sentinel-conn-1";
++const OPTIONS = { minRemainingAllowance: 1, maxStateAgeMs: 180_000, now: () => Date.parse(NOW) };
++
++const HARD_STOP = { provider: "groq", model: "llama-3.3-70b-versatile" } as const;
++const KEYLESS = { provider: "felo-web", model: "felo-chat" } as const;
++
++function entryFor(provider: string, modelId: string): FreeModelBudget {
++  const entry = FREE_MODEL_BUDGETS.find((m) => m.provider === provider && m.modelId === modelId);
++  assert.ok(entry, `catalog entry ${provider}/${modelId} must exist`);
++  return entry;
++}
++
++function syntheticEntry(overrides: Partial<FreeModelBudget>): FreeModelBudget {
++  return { ...entryFor("groq", "llama-3.3-70b-versatile"), ...overrides };
++}
++
++function reading(
++  overrides: {
++    status?: FreeQuotaReading["status"];
++    remainingFreeAllowance?: number | null;
++    checkedAt?: string;
++  } = {}
++): FreeQuotaReading {
++  return {
++    status: overrides.status ?? "SAFE",
++    remainingFreeAllowance:
++      overrides.remainingFreeAllowance === undefined ? 40 : overrides.remainingFreeAllowance,
++    resetAt: null,
++    checkedAt: overrides.checkedAt ?? NOW,
++  };
++}
++
++const GROQ_ENTRY = entryFor("groq", "llama-3.3-70b-versatile");
++const FELO_ENTRY = entryFor("felo-web", "felo-chat");
++
++test("fixtures: the catalog entries used by this suite keep their documented shape", () => {
++  assert.equal(GROQ_ENTRY.hardStopGuaranteed, true);
++  assert.equal(GROQ_ENTRY.freeType, "recurring-daily");
++  assert.equal(FELO_ENTRY.freeType, "keyless");
++});
++
++test("classify: recurring free tier with a documented hard stop is FREE_VERIFIED", () => {
++  const verdict = classifyFreeCost(HARD_STOP, GROQ_ENTRY);
++  assert.equal(verdict.costClass, "FREE_VERIFIED");
++  assert.equal(verdict.autoFreeAllowed, true);
++  assert.equal(verdict.hardStopProven, true);
++  assert.equal(verdict.telemetryAdvisory, true);
++  assert.equal(verdict.reason, "HARD_STOP_FREE_TIER_VERIFIED");
++});
++
++test("classify: keyless endpoint is FREE_VERIFIED only through the no-auth connection", () => {
++  const noauth = classifyFreeCost(
++    { ...KEYLESS, connectionId: SYNTHETIC_NOAUTH_CONNECTION_ID },
++    FELO_ENTRY
++  );
++  assert.equal(noauth.costClass, "FREE_VERIFIED");
++  assert.equal(noauth.autoFreeAllowed, true);
++  assert.equal(noauth.telemetryAdvisory, false);
++  assert.equal(noauth.reason, "KEYLESS_HARD_FREE_ENDPOINT");
++
++  const credentialed = classifyFreeCost({ ...KEYLESS, connectionId: REAL_CONN }, FELO_ENTRY);
++  assert.equal(credentialed.costClass, "FREE_UNKNOWN");
++  assert.equal(credentialed.autoFreeAllowed, false);
++  assert.equal(credentialed.reason, "KEYLESS_REQUIRES_NOAUTH_CONNECTION");
++});
++
++test("classify: signup and recurring credit grants are CREDIT_BACKED", () => {
++  const trial = classifyFreeCost(
++    { provider: "synthetic-trial", model: "trial-model" },
++    syntheticEntry({ freeType: "one-time-initial" })
++  );
++  assert.equal(trial.costClass, "CREDIT_BACKED");
++  assert.equal(trial.autoFreeAllowed, false);
++  assert.equal(trial.reason, "CREDIT_BACKED_EXCLUDED");
++
++  const credit = classifyFreeCost(
++    { provider: "synthetic-credit", model: "credit-model" },
++    syntheticEntry({ freeType: "recurring-credit" })
++  );
++  assert.equal(credit.costClass, "CREDIT_BACKED");
++  assert.equal(credit.reason, "CREDIT_BACKED_EXCLUDED");
++});
++
++test("classify: recurring free tier without a hard-stop proof is FREE_UNKNOWN", () => {
++  for (const hardStopGuaranteed of [undefined, false]) {
++    const verdict = classifyFreeCost(
++      { provider: "synthetic-unproven", model: "unproven-model" },
++      syntheticEntry({ freeType: "recurring-monthly", hardStopGuaranteed })
++    );
++    assert.equal(verdict.costClass, "FREE_UNKNOWN");
++    assert.equal(verdict.autoFreeAllowed, false);
++    assert.equal(verdict.reason, "FREE_UNKNOWN_NO_HARD_STOP_PROOF");
++  }
++});
++
++test("classify: discontinued free tiers are DISCONTINUED", () => {
++  const verdict = classifyFreeCost(
++    { provider: "synthetic-dead", model: "dead-model" },
++    syntheticEntry({ freeType: "discontinued" })
++  );
++  assert.equal(verdict.costClass, "DISCONTINUED");
++  assert.equal(verdict.autoFreeAllowed, false);
++  assert.equal(verdict.reason, "DISCONTINUED_EXCLUDED");
++});
++
++test("classify: unknown, null and paid costs are excluded", () => {
++  const unknown = classifyFreeCost({ provider: "unlisted-provider", model: "unlisted-model" });
++  assert.equal(unknown.costClass, "UNKNOWN_COST");
++  assert.equal(unknown.autoFreeAllowed, false);
++  assert.equal(unknown.reason, "UNKNOWN_COST_EXCLUDED");
++
++  const nullCost = classifyFreeCost({
++    provider: "unlisted-provider",
++    model: "unlisted-model",
++    costPer1MTokens: null,
++  });
++  assert.equal(nullCost.costClass, "NULL_COST");
++  assert.equal(nullCost.reason, "NULL_COST_EXCLUDED");
++
++  const paid = classifyFreeCost({
++    provider: "unlisted-provider",
++    model: "unlisted-model",
++    costPer1MTokens: 15,
++  });
++  assert.equal(paid.costClass, "PAID");
++  assert.equal(paid.reason, "PAID_COST_EXCLUDED");
++});
++
++test("classify: no-auth connection carrying non-keyless metadata fails closed", () => {
++  const verdict = classifyFreeCost(
++    { ...HARD_STOP, connectionId: SYNTHETIC_NOAUTH_CONNECTION_ID },
++    GROQ_ENTRY
++  );
++  assert.equal(verdict.costClass, "FREE_UNKNOWN");
++  assert.equal(verdict.autoFreeAllowed, false);
++  assert.equal(verdict.reason, "NOAUTH_METADATA_CONFLICT_EXCLUDED");
++});
++
++test("classify: self-hosted and local providers are SELF_HOSTED without quota telemetry", () => {
++  for (const provider of ["ollama-local", "lm-studio", "llama-cpp", "vllm"]) {
++    assert.equal(isSelfHostedFreeProvider(provider), true);
++    const verdict = classifyFreeCost({ provider, model: "any-local-model" });
++    assert.equal(verdict.costClass, "SELF_HOSTED");
++    assert.equal(verdict.autoFreeAllowed, true);
++    assert.equal(verdict.telemetryAdvisory, false);
++    assert.equal(verdict.reason, "SELF_HOSTED_NO_BILLING");
++  }
++  assert.equal(isSelfHostedFreeProvider("totally-unheard-of-provider-xyz"), false);
++});
++
++test("AUTO FREE admission set is exactly FREE_VERIFIED and SELF_HOSTED", () => {
++  assert.deepEqual([...AUTO_FREE_ALLOWED_COST_CLASSES].sort(), ["FREE_VERIFIED", "SELF_HOSTED"]);
++  const denied: FreeCostClass[] = [
++    "FREE_UNKNOWN",
++    "UNKNOWN_COST",
++    "NULL_COST",
++    "PAID",
++    "CREDIT_BACKED",
++    "DISCONTINUED",
++  ];
++  for (const costClass of denied) {
++    assert.equal(AUTO_FREE_ALLOWED_COST_CLASSES.has(costClass), false);
++  }
++});
++
++test("sentinel: hard-stop route without telemetry stays eligible", () => {
++  const facts = evaluateFreeSentinel(
++    { ...HARD_STOP, connectionId: REAL_CONN },
++    { entry: GROQ_ENTRY, resolveFreeAccessState: () => undefined, ...OPTIONS }
++  );
++  assert.equal(facts.autoFreeAllowed, true);
++  assert.deepEqual(facts.safeConnectionIds, [REAL_CONN]);
++  assert.equal(facts.quotaStatus, "UNKNOWN");
++  assert.equal(facts.quotaRemaining, null);
++  assert.equal(facts.reason, "HARD_STOP_FREE_TIER_VERIFIED");
++});
++
++test("sentinel: EXHAUSTED telemetry empties the safe set", () => {
++  const facts = evaluateFreeSentinel(
++    { ...HARD_STOP, connectionId: REAL_CONN },
++    {
++      entry: GROQ_ENTRY,
++      resolveFreeAccessState: () => reading({ status: "EXHAUSTED", remainingFreeAllowance: 0 }),
++      ...OPTIONS,
++    }
++  );
++  assert.deepEqual(facts.safeConnectionIds, []);
++  assert.equal(facts.quotaStatus, "EXHAUSTED");
++  assert.equal(facts.quotaRemaining, 0);
++  assert.equal(facts.reason, "QUOTA_EXHAUSTED");
++});
++
++test("sentinel: SAFE telemetry with headroom is reported", () => {
++  const facts = evaluateFreeSentinel(
++    { ...HARD_STOP, connectionId: REAL_CONN },
++    {
++      entry: GROQ_ENTRY,
++      resolveFreeAccessState: () => reading({ remainingFreeAllowance: 40 }),
++      ...OPTIONS,
++    }
++  );
++  assert.deepEqual(facts.safeConnectionIds, [REAL_CONN]);
++  assert.equal(facts.quotaStatus, "SAFE");
++  assert.equal(facts.quotaRemaining, 40);
++  assert.equal(facts.reason, "HARD_STOP_FREE_TIER_VERIFIED");
++});
++
++test("sentinel: SAFE telemetry below the headroom margin is not dispatchable", () => {
++  const facts = evaluateFreeSentinel(
++    { ...HARD_STOP, connectionId: REAL_CONN },
++    {
++      entry: GROQ_ENTRY,
++      resolveFreeAccessState: () => reading({ remainingFreeAllowance: 0.5 }),
++      ...OPTIONS,
++    }
++  );
++  assert.deepEqual(facts.safeConnectionIds, []);
++  assert.equal(facts.quotaStatus, "ABSENT");
++  assert.equal(facts.quotaRemaining, null);
++  assert.equal(facts.reason, "NO_SAFE_CONNECTION");
++});
++
++test("sentinel: stale or UNKNOWN telemetry is advisory only for a hard-stop route", () => {
++  const stale = evaluateFreeSentinel(
++    { ...HARD_STOP, connectionId: REAL_CONN },
++    {
++      entry: GROQ_ENTRY,
++      resolveFreeAccessState: () => reading({ checkedAt: "2026-08-19T00:00:00.000Z" }),
++      ...OPTIONS,
++    }
++  );
++  assert.deepEqual(stale.safeConnectionIds, [REAL_CONN]);
++  assert.equal(stale.quotaStatus, "UNKNOWN");
++
++  const unknown = evaluateFreeSentinel(
++    { ...HARD_STOP, connectionId: REAL_CONN },
++    {
++      entry: GROQ_ENTRY,
++      resolveFreeAccessState: () => reading({ status: "UNKNOWN", remainingFreeAllowance: null }),
++      ...OPTIONS,
++    }
++  );
++  assert.deepEqual(unknown.safeConnectionIds, [REAL_CONN]);
++  assert.equal(unknown.quotaStatus, "UNKNOWN");
++});
++
++test("sentinel: only positive EXHAUSTED evidence narrows a multi-account candidate", () => {
++  const facts = evaluateFreeSentinel(
++    { ...HARD_STOP, connectionId: null, allowedConnectionIds: ["A", "B"] },
++    {
++      entry: GROQ_ENTRY,
++      resolveFreeAccessState: (_provider, connectionId) =>
++        connectionId === "A"
++          ? reading({ status: "EXHAUSTED", remainingFreeAllowance: 0 })
++          : undefined,
++      ...OPTIONS,
++    }
++  );
++  assert.deepEqual(facts.safeConnectionIds, ["B"]);
++  assert.equal(facts.quotaStatus, "UNKNOWN");
++  assert.equal(facts.autoFreeAllowed, true);
++});
++
++test("sentinel: a self-hosted candidate never reads quota telemetry", () => {
++  const facts = evaluateFreeSentinel(
++    { provider: "ollama-local", model: "llama3", connectionId: REAL_CONN },
++    {
++      resolveFreeAccessState: () => {
++        throw new Error("quota must not be read for a self-hosted provider");
++      },
++      ...OPTIONS,
++    }
++  );
++  assert.equal(facts.costClass, "SELF_HOSTED");
++  assert.deepEqual(facts.safeConnectionIds, [REAL_CONN]);
++  assert.equal(facts.quotaStatus, "ABSENT");
++});
++
++test("sentinel: a keyless candidate is admitted with its no-auth connection", () => {
++  const facts = evaluateFreeSentinel(
++    { ...KEYLESS, connectionId: SYNTHETIC_NOAUTH_CONNECTION_ID },
++    { catalog: FREE_MODEL_BUDGETS, ...OPTIONS }
++  );
++  assert.equal(facts.costClass, "FREE_VERIFIED");
++  assert.deepEqual(facts.safeConnectionIds, [SYNTHETIC_NOAUTH_CONNECTION_ID]);
++});
++
++test("sentinel: eligibility follows the catalog it is given, not a hardcoded provider list", () => {
++  const withCatalog = evaluateFreeSentinel(
++    { ...HARD_STOP, connectionId: REAL_CONN },
++    { catalog: FREE_MODEL_BUDGETS, resolveFreeAccessState: () => undefined, ...OPTIONS }
++  );
++  assert.equal(withCatalog.costClass, "FREE_VERIFIED");
++  assert.deepEqual(withCatalog.safeConnectionIds, [REAL_CONN]);
++
++  const withoutCatalog = evaluateFreeSentinel(
++    { ...HARD_STOP, connectionId: REAL_CONN },
++    { catalog: [], resolveFreeAccessState: () => undefined, ...OPTIONS }
++  );
++  assert.equal(withoutCatalog.costClass, "UNKNOWN_COST");
++  assert.equal(withoutCatalog.autoFreeAllowed, false);
++  assert.deepEqual(withoutCatalog.safeConnectionIds, []);
++});
++
++test("sentinel: no paid fallback — telemetry never admits a paid or unknown-cost candidate", () => {
++  const perfectTelemetry = () => reading({ remainingFreeAllowance: 100 });
++
++  const unknownCost = evaluateFreeSentinel(
++    { provider: "openai", model: "gpt-4o", connectionId: REAL_CONN },
++    { catalog: FREE_MODEL_BUDGETS, resolveFreeAccessState: perfectTelemetry, ...OPTIONS }
++  );
++  assert.equal(unknownCost.autoFreeAllowed, false);
++  assert.deepEqual(unknownCost.safeConnectionIds, []);
++  assert.equal(unknownCost.reason, "UNKNOWN_COST_EXCLUDED");
++
++  const paid = evaluateFreeSentinel(
++    { provider: "openai", model: "gpt-4o", connectionId: REAL_CONN, costPer1MTokens: 15 },
++    { catalog: FREE_MODEL_BUDGETS, resolveFreeAccessState: perfectTelemetry, ...OPTIONS }
++  );
++  assert.equal(paid.autoFreeAllowed, false);
++  assert.deepEqual(paid.safeConnectionIds, []);
++  assert.equal(paid.reason, "PAID_COST_EXCLUDED");
++});
++
++test("findFreeCatalogEntry matches provider+model and rejects everything else", () => {
++  const match = findFreeCatalogEntry(HARD_STOP, FREE_MODEL_BUDGETS);
++  assert.ok(match);
++  assert.equal(match.provider, "groq");
++  assert.equal(match.modelId, "llama-3.3-70b-versatile");
++
++  assert.equal(
++    findFreeCatalogEntry({ provider: "groq", model: "not-cataloged" }, FREE_MODEL_BUDGETS),
++    undefined
++  );
++  assert.equal(findFreeCatalogEntry(HARD_STOP, []), undefined);
++});
+diff --git a/tests/unit/autoCombo/strict-zero-cost-connection-safety.test.ts b/tests/unit/autoCombo/strict-zero-cost-connection-safety.test.ts
+index 312f83eb5..e97c19ca5 100644
+--- a/tests/unit/autoCombo/strict-zero-cost-connection-safety.test.ts
++++ b/tests/unit/autoCombo/strict-zero-cost-connection-safety.test.ts
+@@ -169,8 +169,12 @@ test("sanity: non-keyless freeType via the no-auth sentinel connection fails clo
+ 
+ // ─── BLOCKER 2 — multi-account connection mismatch ─────────────────────
+ 
+-// 1. account A SAFE, B UNKNOWN → dispatch can use ONLY A.
+-test("1: A SAFE, B UNKNOWN -> safe connection set is exactly [A]", () => {
++// 1. R1 reconstruction: for a hard-stop-verified entry, missing telemetry means
++// "not measured", never "billable" — B stays dispatchable next to A. The route
++// cannot spill into paid spend (the provider documents a hard stop, not
++// billing), so telemetry only removes a connection on POSITIVE evidence
++// (tests 2 and 5).
++test("1: A SAFE, B without telemetry -> both stay selectable", () => {
+   const candidate: StrictZeroCostCandidate = {
+     provider: "qp",
+     model: "qp-model",
+@@ -178,9 +182,10 @@ test("1: A SAFE, B UNKNOWN -> safe connection set is exactly [A]", () => {
+     allowedConnectionIds: ["A", "B"],
+   };
+   const resolve = (_provider: string, connectionId: string) =>
+-    connectionId === "A" ? safeState() : undefined; // B: no state at all == UNKNOWN
++    connectionId === "A" ? safeState() : undefined; // B: no state at all
+   assert.deepEqual(evaluateCandidateConnections(candidate, quotaEntry(true), resolve, OPTIONS), [
+     "A",
++    "B",
+   ]);
+ });
+ 
+@@ -201,23 +206,30 @@ test("2: A EXHAUSTED, B SAFE -> safe connection set is exactly [B]", () => {
+   ]);
+ });
+ 
+-// 3. A SAFE, B billable/unverifiable (UNKNOWN) → B not selectable.
+-test("3: A SAFE, B UNKNOWN (billable/unverifiable) -> B never enters the safe set", () => {
++// 3. An entry WITHOUT the hard-stop proof stays excluded even when every
++// connection has perfect telemetry: live quota data can never upgrade an
++// unproven free claim into an AUTO FREE candidate.
++test("3: entry without hard-stop proof -> fully excluded regardless of telemetry", () => {
++  const unproven = { ...quotaEntry(true), hardStopGuaranteed: undefined };
+   const candidate: StrictZeroCostCandidate = {
+     provider: "qp",
+     model: "qp-model",
+     connectionId: null,
+     allowedConnectionIds: ["A", "B"],
+   };
+-  const resolve = (_provider: string, connectionId: string) =>
+-    connectionId === "A" ? safeState() : undefined;
+-  const safe = evaluateCandidateConnections(candidate, quotaEntry(true), resolve, OPTIONS);
+-  assert.equal(safe.includes("B"), false);
+-  assert.deepEqual(safe, ["A"]);
++  assert.deepEqual(
++    evaluateCandidateConnections(candidate, unproven, () => safeState(), OPTIONS),
++    []
++  );
++  assert.deepEqual(
++    evaluateCandidateConnections(candidate, unproven, () => undefined, OPTIONS),
++    []
++  );
+ });
+ 
+-// 4. tutte UNKNOWN → candidato escluso.
+-test("4: all connections UNKNOWN -> candidate fully excluded (empty safe set)", () => {
++// 4. All connections without telemetry → the candidate stays selectable for a
++// hard-stop-verified entry (same rationale as test 1).
++test("4: all connections without telemetry -> candidate stays selectable", () => {
+   const candidate: StrictZeroCostCandidate = {
+     provider: "qp",
+     model: "qp-model",
+@@ -226,25 +238,26 @@ test("4: all connections UNKNOWN -> candidate fully excluded (empty safe set)",
+   };
+   assert.deepEqual(
+     evaluateCandidateConnections(candidate, quotaEntry(true), () => undefined, OPTIONS),
+-    []
++    ["A", "B", "C"]
+   );
+ });
+ 
+-// 5. account selezionato al dispatch è uno di quelli verificati SAFE — proven
+-// at the pool-filter level: the returned candidate's `allowedConnectionIds`
+-// is rewritten to exactly the safe subset, which is the same field
+-// `autoStrategy.ts` (open-sse/services/combo/autoStrategy.ts:315-331)
+-// already intersects against before connection selection — so whatever it
+-// picks is provably a member of this set, by construction.
+-test("5: filterStrictZeroCostCandidates rewrites allowedConnectionIds to exactly the verified-SAFE subset", () => {
++// 5. Negative evidence still narrows. The returned candidate's
++// `allowedConnectionIds` is rewritten to exactly the connections without
++// positive EXHAUSTED evidence, and `autoStrategy.ts`
++// (open-sse/services/combo/autoStrategy.ts:315-331) intersects against that
++// same field before connection selection — so whatever it picks is provably
++// not a connection this filter measured as exhausted.
++test("5: filterStrictZeroCostCandidates narrows to connections without EXHAUSTED evidence", () => {
+   const candidate: StrictZeroCostCandidate = {
+     provider: "qp",
+     model: "qp-model",
+     connectionId: null,
+     allowedConnectionIds: ["A", "B", "C"],
+   };
++  const exhausted = safeState({ status: "EXHAUSTED", remainingFreeAllowance: 0 });
+   const resolve = (_provider: string, connectionId: string) =>
+-    connectionId === "B" ? safeState() : undefined; // only B is SAFE
++    connectionId === "B" ? safeState() : connectionId === "A" ? undefined : exhausted;
+   const result = filterStrictZeroCostCandidates([candidate], {
+     enabled: true,
+     resolveFreeAccessState: resolve,
+@@ -254,19 +267,10 @@ test("5: filterStrictZeroCostCandidates rewrites allowedConnectionIds to exactly
+   assert.equal(result.length, 1);
+   assert.deepEqual(
+     result[0].allowedConnectionIds,
+-    ["B"],
+-    "dispatch (via autoStrategy.ts's own allowedConnectionIds intersection) can only ever select B — the one connection this filter actually verified"
+-  );
+-  assert.equal(
+-    result[0].allowedConnectionIds?.includes("A"),
+-    false,
+-    "A (UNKNOWN) must never remain selectable"
+-  );
+-  assert.equal(
+-    result[0].allowedConnectionIds?.includes("C"),
+-    false,
+-    "C (UNKNOWN) must never remain selectable"
++    ["A", "B"],
++    "C is provably exhausted, so dispatch must not be able to select it"
+   );
++  assert.equal(result[0].allowedConnectionIds?.includes("C"), false);
+ });
+ 
+ test("multi-account candidate with an unchanged safe set is returned as the SAME reference (identity contract)", () => {
+@@ -287,7 +291,7 @@ test("multi-account candidate with an unchanged safe set is returned as the SAME
+   assert.equal(result[0], candidate, "the candidate object itself must be preserved, not cloned");
+ });
+ 
+-test("single-connection candidate that fails is dropped, never returned with an empty allowedConnectionIds", () => {
++test("single-connection candidate with EXHAUSTED evidence is dropped, never returned with an empty allowedConnectionIds", () => {
+   const candidate: StrictZeroCostCandidate = {
+     provider: "qp",
+     model: "qp-model",
+@@ -295,9 +299,55 @@ test("single-connection candidate that fails is dropped, never returned with an
+   };
+   const result = filterStrictZeroCostCandidates([candidate], {
+     enabled: true,
+-    resolveFreeAccessState: () => undefined,
++    resolveFreeAccessState: () => safeState({ status: "EXHAUSTED", remainingFreeAllowance: 0 }),
+     catalog: [quotaEntry(true)],
+     ...OPTIONS,
+   });
+   assert.deepEqual(result, []);
+ });
++
++test("single-connection candidate without telemetry stays admitted", () => {
++  const candidate: StrictZeroCostCandidate = {
++    provider: "qp",
++    model: "qp-model",
++    connectionId: REAL_CONN,
++  };
++  const pool = [candidate];
++  const result = filterStrictZeroCostCandidates(pool, {
++    enabled: true,
++    resolveFreeAccessState: () => undefined,
++    catalog: [quotaEntry(true)],
++    ...OPTIONS,
++  });
++  assert.equal(result, pool);
++  assert.deepEqual(result[0].connectionId, REAL_CONN);
++});
++
++// SELF_HOSTED is the one class that needs no catalog entry at all: a local
++// runtime cannot bill, so the strict filter must not silently drop it (the
++// pre-reconstruction filter did, because every admission required an entry).
++test("self-hosted provider with no catalog entry is admitted and never reads quota", () => {
++  const candidate: StrictZeroCostCandidate = {
++    provider: "ollama-local",
++    model: "llama3",
++    connectionId: REAL_CONN,
++  };
++  const throwingResolver = () => {
++    throw new Error("quota must not be read for a self-hosted provider");
++  };
++  assert.deepEqual(evaluateCandidateConnections(candidate, undefined, throwingResolver, OPTIONS), [
++    REAL_CONN,
++  ]);
++});
++
++test("provider with no catalog entry is not admitted by telemetry alone", () => {
++  const candidate: StrictZeroCostCandidate = {
++    provider: "totally-unheard-of-provider-xyz",
++    model: "mystery-model",
++    connectionId: REAL_CONN,
++  };
++  assert.deepEqual(
++    evaluateCandidateConnections(candidate, undefined, () => safeState(), OPTIONS),
++    []
++  );
++});
+diff --git a/tests/unit/autoCombo/strict-zero-cost-filter.test.ts b/tests/unit/autoCombo/strict-zero-cost-filter.test.ts
+index dc293a6dd..c352b9387 100644
+--- a/tests/unit/autoCombo/strict-zero-cost-filter.test.ts
++++ b/tests/unit/autoCombo/strict-zero-cost-filter.test.ts
+@@ -142,39 +142,62 @@ test("EXHAUSTED status excludes even with a fresh checkedAt", () => {
+   );
+ });
+ 
+-// 7. usage adapter absent (no state resolvable) → EXCLUDE
+-test("quota-based candidate with no resolvable state is excluded, not assumed safe", () => {
++// 7. no live telemetry (adapter cold / never fetched) → ADMITTED for a
++// hardStopGuaranteed route: the catalog entry documents that exceeding the free
++// allowance is a hard stop, not billing, so the route cannot spill into paid
++// spend. Live telemetry is an optimization, not a gate (R1 reconstruction).
++test("hard-stop-verified candidate with no resolvable telemetry stays admitted", () => {
+   const entry = FREE_MODEL_BUDGETS.find(
+     (m) => m.provider === "groq" && m.modelId === "llama-3.3-70b-versatile"
+   );
+   assert.deepEqual(
+     evaluateCandidateConnections(QUOTA_SAFE, entry, () => undefined, BASE_OPTIONS),
+-    []
++    [REAL_CONN]
+   );
+ });
+ 
+-// 8. usage API error → EXCLUDE (modeled as UNKNOWN status; freeAccessQuota.ts
+-// deletes the cache entry on a failed refresh, which resolves to `undefined`
+-// here — same assertion as #7, the important contract is "never falls back to SAFE").
+-test("UNKNOWN status excludes", () => {
++// 8. usage API error → telemetry unusable (freeAccessQuota.ts deletes the cache
++// entry on a failed refresh, which also resolves to `undefined`). For a
++// hardStopGuaranteed route this means "telemetry unavailable", not "exhausted".
++test("UNKNOWN status stays admitted for a hard-stop-verified route", () => {
+   const entry = FREE_MODEL_BUDGETS.find(
+     (m) => m.provider === "groq" && m.modelId === "llama-3.3-70b-versatile"
+   );
+   const state = freshState({ status: "UNKNOWN", remainingFreeAllowance: null });
+   assert.deepEqual(
+     evaluateCandidateConnections(QUOTA_SAFE, entry, () => state, BASE_OPTIONS),
+-    []
++    [REAL_CONN]
+   );
+ });
+ 
+-// 9. usage state stale → EXCLUDE
+-test("stale checkedAt excludes even when status is SAFE", () => {
++// 9. usage state stale → telemetry unusable, same as #7/#8: a hard-stop-verified
++// route stays admitted rather than failing closed on a stale sample.
++test("stale checkedAt stays admitted for a hard-stop-verified route", () => {
+   const entry = FREE_MODEL_BUDGETS.find(
+     (m) => m.provider === "groq" && m.modelId === "llama-3.3-70b-versatile"
+   );
+   const stale = freshState({ checkedAt: "2026-08-19T00:00:00.000Z" }); // >24h before NOW
+   assert.deepEqual(
+     evaluateCandidateConnections(QUOTA_SAFE, entry, () => stale, BASE_OPTIONS),
++    [REAL_CONN]
++  );
++});
++
++// Compensating guard (R1): the same missing telemetry must NOT admit a route
++// with no hard-stop proof — unproven metadata still fails closed.
++test("no telemetry still excludes a route without hard-stop proof", () => {
++  const entry = {
++    provider: "synthetic-unproven",
++    modelId: "synthetic-model",
++    displayName: "Synthetic unproven tier",
++    monthlyTokens: 1_000_000,
++    creditTokens: 0,
++    freeType: "recurring-daily" as const,
++    poolKey: null,
++    tos: "ok" as const,
++  };
++  assert.deepEqual(
++    evaluateCandidateConnections(QUOTA_SAFE, entry, () => undefined, BASE_OPTIONS),
+     []
+   );
+ });
+-- 
+2.53.0
+

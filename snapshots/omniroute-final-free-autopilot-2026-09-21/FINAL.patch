@@ -1,0 +1,4052 @@
+From 864ddc1d57871827ab2be3a9235bab5f8c12bc48 Mon Sep 17 00:00:00 2001
+From: StockNewsBR <264292956+StockNewsBR@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 17:47:38 -0300
+Subject: [PATCH 01/11] feat(omniroute): reconstruct strict dynamic FREE_ONLY
+ routing
+
+---
+ open-sse/handlers/autoComboCandidates.ts      | 104 ++++-
+ .../services/autoCombo/freeAccessQuota.ts     |  27 ++
+ .../autoCombo/freeProviderSentinel.ts         | 358 +++++++++++++++++
+ .../autoCombo/strictZeroCostFilter.ts         | 111 +++---
+ .../free-provider-sentinel-r1.test.ts         | 366 ++++++++++++++++++
+ ...strict-zero-cost-connection-safety.test.ts | 120 ++++--
+ .../autoCombo/strict-zero-cost-filter.test.ts |  43 +-
+ 7 files changed, 1006 insertions(+), 123 deletions(-)
+ create mode 100644 open-sse/services/autoCombo/freeProviderSentinel.ts
+ create mode 100644 tests/unit/autoCombo/free-provider-sentinel-r1.test.ts
+
+diff --git a/open-sse/handlers/autoComboCandidates.ts b/open-sse/handlers/autoComboCandidates.ts
+index c13303230..14ccc4aed 100644
+--- a/open-sse/handlers/autoComboCandidates.ts
++++ b/open-sse/handlers/autoComboCandidates.ts
+@@ -14,12 +14,27 @@
+  *     provider_connections row (no-auth synthetic connections have no row —
+  *     treated as always reachable on this axis).
+  *   - model lockout: `isModelLocked(provider, connectionId, model)`.
++ *   - free-cost class: `evaluateFreeSentinel(...)` projects the cost class
++ *     (`FREE_VERIFIED` / `SELF_HOSTED` / ...), whether AUTO FREE routing may
++ *     pick the candidate, the reason code and the cached quota status — via the
++ *     cache-only quota read, so listing candidates never probes a provider.
+  */
+ import { buildErrorBody } from "@omniroute/open-sse/utils/error.ts";
+ import { getCircuitBreaker } from "@/shared/utils/circuitBreaker";
+ import { isModelLocked } from "@omniroute/open-sse/services/accountFallback.ts";
+ import { getProviderConnectionById } from "@/lib/db/providers";
+ import { getExcludedConnectionIds } from "@/lib/db/autoCandidateOverrides";
++import { getSettings } from "@/lib/db/settings";
++import { toNumber } from "@/shared/utils/numeric";
++import { FREE_MODEL_BUDGETS } from "@omniroute/open-sse/config/freeModelCatalog.ts";
++import {
++  evaluateFreeSentinel,
++  type FreeCostClass,
++  type FreeQuotaStatus,
++  type FreeSentinelContext,
++  type FreeSentinelReason,
++} from "@omniroute/open-sse/services/autoCombo/freeProviderSentinel.ts";
++import { readFreeAccessStateCached } from "@omniroute/open-sse/services/autoCombo/freeAccessQuota.ts";
+ 
+ export interface AutoComboCandidateView {
+   provider: string;
+@@ -31,6 +46,12 @@ export interface AutoComboCandidateView {
+   breakerState: string;
+   connectionCooldown: boolean;
+   modelLocked: boolean;
++  /** Free-cost class from `freeProviderSentinel.ts` (advisory, read-only). */
++  freeCostClass: FreeCostClass;
++  autoFreeEligible: boolean;
++  autoFreeReason: FreeSentinelReason;
++  /** Cached quota status: SAFE | EXHAUSTED | UNKNOWN | ABSENT (no telemetry). */
++  quotaStatus: FreeQuotaStatus;
+ }
+ 
+ export interface AutoComboCandidatesResult {
+@@ -44,12 +65,57 @@ function hasFutureRateLimit(value: unknown): boolean {
+   return Number.isFinite(time) && time > Date.now();
+ }
+ 
+-async function decorateCandidate(candidate: {
+-  provider: string;
+-  connectionId: string;
+-  model: string;
+-  modelStr: string;
+-}): Promise<AutoComboCandidateView> {
++interface FreeCostProjection {
++  freeCostClass: FreeCostClass;
++  autoFreeEligible: boolean;
++  autoFreeReason: FreeSentinelReason;
++  quotaStatus: FreeQuotaStatus;
++}
++
++/**
++ * Projects the free-cost classification for one account-oriented candidate.
++ * Read-only: `options.resolveFreeAccessState` must be the cache-only reader, so
++ * this never triggers a provider request. Fails open to "not eligible" so an
++ * unexpected sentinel error cannot break the listing.
++ */
++function projectFreeEligibility(
++  candidate: { provider: string; model: string; connectionId: string },
++  options: FreeSentinelContext
++): FreeCostProjection {
++  try {
++    const facts = evaluateFreeSentinel(
++      {
++        provider: candidate.provider,
++        model: candidate.model,
++        connectionId: candidate.connectionId,
++      },
++      options
++    );
++    return {
++      freeCostClass: facts.costClass,
++      autoFreeEligible: facts.autoFreeAllowed,
++      autoFreeReason: facts.reason,
++      quotaStatus: facts.quotaStatus,
++    };
++  } catch {
++    return {
++      freeCostClass: "UNKNOWN_COST",
++      autoFreeEligible: false,
++      autoFreeReason: "UNKNOWN_COST_EXCLUDED",
++      quotaStatus: "ABSENT",
++    };
++  }
++}
++
++async function decorateCandidate(
++  candidate: {
++    provider: string;
++    connectionId: string;
++    model: string;
++    modelStr: string;
++  },
++  freeOptions: FreeSentinelContext
++): Promise<AutoComboCandidateView> {
+   const breaker = getCircuitBreaker(candidate.provider);
+   const breakerStatus = breaker.getStatus();
+   const breakerReachable = breaker.canExecute();
+@@ -70,6 +136,7 @@ async function decorateCandidate(candidate: {
+   }
+ 
+   const modelLocked = isModelLocked(candidate.provider, candidate.connectionId, candidate.model);
++  const freeProjection = projectFreeEligibility(candidate, freeOptions);
+ 
+   return {
+     provider: candidate.provider,
+@@ -81,6 +148,7 @@ async function decorateCandidate(candidate: {
+     breakerState: String(breakerStatus.state),
+     connectionCooldown,
+     modelLocked,
++    ...freeProjection,
+   };
+ }
+ 
+@@ -114,6 +182,15 @@ export async function getAutoComboCandidates(
+     ? await getExcludedConnectionIds(apiKeyId, modelStr).catch(() => new Set<string>())
+     : new Set<string>();
+ 
++  // Same 1pp headroom / settings TTL as virtualFactory's strict filter (keep in sync).
++  const settings = await getSettings().catch(() => null);
++  const freeOptions: FreeSentinelContext = {
++    catalog: FREE_MODEL_BUDGETS,
++    resolveFreeAccessState: readFreeAccessStateCached,
++    minRemainingAllowance: 1,
++    maxStateAgeMs: toNumber(settings?.autoRefreshProviderQuotaInterval, 180) * 1000,
++  };
++
+   const models: Array<{
+     providerId: string;
+     connectionId: string | null;
+@@ -132,12 +209,15 @@ export async function getAutoComboCandidates(
+ 
+   const candidates = await Promise.all(
+     accountCandidates.map(async (candidate) => {
+-      const decorated = await decorateCandidate({
+-        provider: candidate.providerId,
+-        connectionId: candidate.connectionId,
+-        model: candidate.model,
+-        modelStr: candidate.model,
+-      });
++      const decorated = await decorateCandidate(
++        {
++          provider: candidate.providerId,
++          connectionId: candidate.connectionId,
++          model: candidate.model,
++          modelStr: candidate.model,
++        },
++        freeOptions
++      );
+       return { ...decorated, excluded: excludedConnectionIds.has(candidate.connectionId) };
+     })
+   );
+diff --git a/open-sse/services/autoCombo/freeAccessQuota.ts b/open-sse/services/autoCombo/freeAccessQuota.ts
+index 515ec57a8..e8d37e151 100644
+--- a/open-sse/services/autoCombo/freeAccessQuota.ts
++++ b/open-sse/services/autoCombo/freeAccessQuota.ts
+@@ -13,6 +13,11 @@
+  * fail-closed) and kicks off a background refresh for the *next* read —
+  * nothing here can make `strictZeroCostFilter.ts`'s pool build block on a
+  * network call.
++ *
++ * `readFreeAccessStateCached()` is the cache-only sibling used by read-only
++ * inspection paths (`autoComboCandidates.ts`): same gates, same freshness
++ * rule, but it NEVER triggers a refresh, so merely listing candidates cannot
++ * cause a provider request. A miss/stale entry reads as `undefined`.
+  */
+ import {
+   getUsageForProvider,
+@@ -198,6 +203,28 @@ export function resolveFreeAccessState(
+   return fresh ? entry.state : undefined;
+ }
+ 
++/**
++ * Cache-only sibling of `resolveFreeAccessState()` for read-only inspection
++ * paths. Applies the exact same gates (usage-adapter presence, connection id)
++ * and the same freshness rule, but it never calls `refresh()`: a read-only
++ * endpoint must not trigger a provider request as a side effect of being
++ * called. Anything cold or stale simply reads as `undefined` (→ ABSENT/UNKNOWN
++ * for the caller), which the sentinel treats as "no telemetry available"
++ * rather than "exhausted".
++ */
++export function readFreeAccessStateCached(
++  provider: string,
++  connectionId: string | undefined
++): FreeAccessState | undefined {
++  sweepIfDue();
++  if (!USAGE_FETCHER_PROVIDER_SET.has(provider as UsageFetcherProvider)) return undefined;
++  if (!connectionId) return undefined;
++
++  const entry = cache.get(cacheKey(provider, connectionId));
++  if (!entry) return undefined;
++  return Date.now() - entry.fetchedAtMs <= ttlMs() ? entry.state : undefined;
++}
++
+ /** Called by `accountFallback.ts` the moment a 402/403/quota-exhausted
+  * response is classified for a connection — drops the cached entry
+  * immediately instead of waiting out the TTL, so the very next candidate-pool
+diff --git a/open-sse/services/autoCombo/freeProviderSentinel.ts b/open-sse/services/autoCombo/freeProviderSentinel.ts
+new file mode 100644
+index 000000000..ddde1565c
+--- /dev/null
++++ b/open-sse/services/autoCombo/freeProviderSentinel.ts
+@@ -0,0 +1,358 @@
++/**
++ * Free-provider sentinel: dynamic, evidence-based cost classification for AUTO FREE routing.
++ *
++ * Mission context (STRICT POLICY DESIGN REVIEW):
++ * - AUTO FREE must be dynamic. There is no static provider shortlist: every discovered
++ *   provider/model is classified from current evidence and may join the pool when it satisfies
++ *   the policy, health, capability and circuit requirements.
++ * - Live quota telemetry improves selection/headroom when it is available, but its ABSENCE must
++ *   not automatically exclude a route that is provably unable to spill into paid billing
++ *   (self-hosted hardware, keyless hard-free endpoint, or a curated hard-stop free tier that
++ *   returns 429/limit exhaustion instead of billing). That is why quota state is advisory for
++ *   proof classes and authoritative only when it carries positive evidence of exhaustion.
++ *
++ * Policy (automatic FREE admission):
++ *   ALLOW  FREE_VERIFIED  curated catalog entry with proven no-billing semantics
++ *                         (keyless hard-free endpoint, or hard-stop free tier).
++ *   ALLOW  SELF_HOSTED    provider runs on operator-controlled hardware; cannot bill.
++ *   DENY   FREE_UNKNOWN   free-looking but no proof that exceeding the allowance is a hard stop.
++ *   DENY   UNKNOWN_COST   no catalog entry and no zero-cost evidence.
++ *   DENY   NULL_COST      cost metadata is null; never assumed free.
++ *   DENY   PAID           known positive cost.
++ *   DENY   CREDIT_BACKED  trial/one-time/recurring credits that can spill into billing.
++ *   DENY   DISCONTINUED   model retired by the provider.
++ *
++ * This module is pure (no DB, no network). It is used by:
++ *   - strictZeroCostFilter.ts — admission into auto/* pools when settings.freeAccessPolicy is "strict";
++ *   - autoComboCandidates.ts  — read-only inspector projection using cached state only.
++ * Explicit/pinned provider+model requests never consult this module; their semantics are unchanged.
++ */
++
++import type { FreeModelBudget } from "@omniroute/open-sse/config/freeModelCatalog.ts";
++import { isLocalProvider, isSelfHostedChatProvider } from "@/shared/constants/providers";
++import { SYNTHETIC_NOAUTH_CONNECTION_ID } from "./resilienceCandidateFilter";
++
++export type FreeCostClass =
++  | "FREE_VERIFIED"
++  | "SELF_HOSTED"
++  | "FREE_UNKNOWN"
++  | "UNKNOWN_COST"
++  | "NULL_COST"
++  | "PAID"
++  | "CREDIT_BACKED"
++  | "DISCONTINUED";
++
++/** The only cost classes AUTO FREE may select. Everything else is denied automatically. */
++export const AUTO_FREE_ALLOWED_COST_CLASSES: ReadonlySet<FreeCostClass> = new Set<FreeCostClass>([
++  "FREE_VERIFIED",
++  "SELF_HOSTED",
++]);
++
++/** Stable machine-readable explanation codes (safe to expose in read-only diagnostics). */
++export type FreeSentinelReason =
++  | "SELF_HOSTED_NO_BILLING"
++  | "KEYLESS_HARD_FREE_ENDPOINT"
++  | "HARD_STOP_FREE_TIER_VERIFIED"
++  | "NOAUTH_METADATA_CONFLICT_EXCLUDED"
++  | "KEYLESS_REQUIRES_NOAUTH_CONNECTION"
++  | "CREDIT_BACKED_EXCLUDED"
++  | "FREE_UNKNOWN_NO_HARD_STOP_PROOF"
++  | "NULL_COST_EXCLUDED"
++  | "UNKNOWN_COST_EXCLUDED"
++  | "PAID_COST_EXCLUDED"
++  | "DISCONTINUED_EXCLUDED"
++  | "QUOTA_EXHAUSTED"
++  | "NO_SAFE_CONNECTION";
++
++export interface FreeCostCandidate {
++  provider: string;
++  model: string;
++  connectionId?: string | null;
++  allowedConnectionIds?: string[];
++  costPer1MTokens?: number | null;
++}
++
++/** Structural subset of FreeAccessState (kept local to avoid a circular import). */
++export interface FreeQuotaReading {
++  status: "SAFE" | "EXHAUSTED" | "UNKNOWN";
++  remainingFreeAllowance: number | null;
++  resetAt?: string | null;
++  checkedAt: string;
++}
++
++export type FreeQuotaStatus = "SAFE" | "EXHAUSTED" | "UNKNOWN" | "ABSENT";
++
++export interface FreeCostVerdict {
++  costClass: FreeCostClass;
++  autoFreeAllowed: boolean;
++  /** True when the class is proven unable to spill into paid billing. */
++  hardStopProven: boolean;
++  /** True when a live quota/headroom reading can refine selection (but not gate it). */
++  telemetryAdvisory: boolean;
++  reason: FreeSentinelReason;
++}
++
++export interface FreeSentinelFacts extends FreeCostVerdict {
++  quotaStatus: FreeQuotaStatus;
++  quotaRemaining: number | null;
++  /** Connections this candidate may be dispatched on; empty means the candidate is not eligible. */
++  safeConnectionIds: string[];
++}
++
++export interface FreeSentinelContext {
++  /** Explicit catalog entry (the strict filter resolves it and passes it through). */
++  entry?: FreeModelBudget | null;
++  /** Catalog to resolve the entry from when `entry` is not provided. */
++  catalog?: readonly FreeModelBudget[];
++  /** Synchronous, cache-only free-access reader. Never triggers a provider request. */
++  resolveFreeAccessState?: (provider: string, connectionId: string) => FreeQuotaReading | undefined;
++  minRemainingAllowance?: number;
++  maxStateAgeMs?: number;
++  now?: () => number;
++}
++
++interface VerdictFlags {
++  hardStopProven: boolean;
++  telemetryAdvisory: boolean;
++  reason: FreeSentinelReason;
++}
++
++function allow(costClass: FreeCostClass, flags: VerdictFlags): FreeCostVerdict {
++  return {
++    costClass,
++    autoFreeAllowed: true,
++    hardStopProven: flags.hardStopProven,
++    telemetryAdvisory: flags.telemetryAdvisory,
++    reason: flags.reason,
++  };
++}
++
++function deny(costClass: FreeCostClass, reason: FreeSentinelReason): FreeCostVerdict {
++  return {
++    costClass,
++    autoFreeAllowed: false,
++    hardStopProven: false,
++    telemetryAdvisory: false,
++    reason,
++  };
++}
++
++const HARD_STOP_FREE_TYPES = new Set<FreeModelBudget["freeType"]>([
++  "recurring-daily",
++  "recurring-monthly",
++  "recurring-uncapped",
++]);
++
++/** Credits, trials and one-time balances can spill into billing — never auto-selected. */
++const CREDIT_BACKED_FREE_TYPES = new Set<FreeModelBudget["freeType"]>([
++  "one-time-initial",
++  "recurring-credit",
++]);
++
++/**
++ * Self-hosted signal: the provider executes on hardware the operator controls, so no request can
++ * ever generate provider billing. This reads the native self-hosted/local provider constants; it is
++ * a capability class, not a free-provider allowlist. Generic `*-compatible-*` endpoints are
++ * deliberately NOT included: a user-defined endpoint may front a paid remote service, so those
++ * models stay UNKNOWN_COST until a catalog entry proves otherwise.
++ */
++export function isSelfHostedFreeProvider(providerId: string): boolean {
++  return isSelfHostedChatProvider(providerId) || isLocalProvider(providerId);
++}
++
++export function findFreeCatalogEntry(
++  candidate: Pick<FreeCostCandidate, "provider" | "model">,
++  catalog: readonly FreeModelBudget[] | undefined
++): FreeModelBudget | undefined {
++  if (!catalog) return undefined;
++  return catalog.find(
++    (item) => item.provider === candidate.provider && item.modelId === candidate.model
++  );
++}
++
++/**
++ * Pure cost classification from catalog/credential evidence. No provider is classified as free by
++ * name, and no quota reading is consulted here (see evaluateFreeSentinel for the quota dimension).
++ */
++export function classifyFreeCost(
++  candidate: FreeCostCandidate,
++  entry?: FreeModelBudget
++): FreeCostVerdict {
++  if (isSelfHostedFreeProvider(candidate.provider)) {
++    return allow("SELF_HOSTED", {
++      hardStopProven: true,
++      telemetryAdvisory: false,
++      reason: "SELF_HOSTED_NO_BILLING",
++    });
++  }
++
++  if (entry) {
++    const freeType = entry.freeType;
++
++    if (candidate.connectionId === SYNTHETIC_NOAUTH_CONNECTION_ID && freeType !== "keyless") {
++      // A credential-less candidate pointing at a credential-backed catalog entry is contradictory
++      // metadata. Fail closed instead of trusting either side.
++      return deny("FREE_UNKNOWN", "NOAUTH_METADATA_CONFLICT_EXCLUDED");
++    }
++
++    if (freeType === "discontinued") {
++      return deny("DISCONTINUED", "DISCONTINUED_EXCLUDED");
++    }
++
++    if (freeType === "keyless") {
++      // The endpoint itself needs no credential, so it cannot bill. The shortcut is only valid on
++      // the genuine no-auth path: a real DB connection holding a credential must not inherit
++      // keyless semantics (connection-safety invariant #1).
++      if (candidate.connectionId === SYNTHETIC_NOAUTH_CONNECTION_ID) {
++        return allow("FREE_VERIFIED", {
++          hardStopProven: true,
++          telemetryAdvisory: false,
++          reason: "KEYLESS_HARD_FREE_ENDPOINT",
++        });
++      }
++      return deny("FREE_UNKNOWN", "KEYLESS_REQUIRES_NOAUTH_CONNECTION");
++    }
++
++    if (CREDIT_BACKED_FREE_TYPES.has(freeType)) {
++      return deny("CREDIT_BACKED", "CREDIT_BACKED_EXCLUDED");
++    }
++
++    if (HARD_STOP_FREE_TYPES.has(freeType)) {
++      if (entry.hardStopGuaranteed === true) {
++        return allow("FREE_VERIFIED", {
++          hardStopProven: true,
++          telemetryAdvisory: true,
++          reason: "HARD_STOP_FREE_TIER_VERIFIED",
++        });
++      }
++      return deny("FREE_UNKNOWN", "FREE_UNKNOWN_NO_HARD_STOP_PROOF");
++    }
++
++    return deny("FREE_UNKNOWN", "FREE_UNKNOWN_NO_HARD_STOP_PROOF");
++  }
++
++  const cost = candidate.costPer1MTokens;
++  if (cost === null) return deny("NULL_COST", "NULL_COST_EXCLUDED");
++  if (typeof cost === "number" && Number.isFinite(cost) && cost > 0) {
++    return deny("PAID", "PAID_COST_EXCLUDED");
++  }
++  // An uncatalogued zero price is not evidence of a hard-free endpoint.
++  return deny("UNKNOWN_COST", "UNKNOWN_COST_EXCLUDED");
++}
++
++function collectConnectionIds(candidate: FreeCostCandidate): string[] {
++  if (typeof candidate.connectionId === "string" && candidate.connectionId.length > 0) {
++    return [candidate.connectionId];
++  }
++  const allowed = candidate.allowedConnectionIds;
++  if (Array.isArray(allowed) && allowed.length > 0) return [...allowed];
++  return [];
++}
++
++function isUsableSafeReading(
++  reading: FreeQuotaReading,
++  now: () => number,
++  maxAgeMs: number
++): boolean {
++  if (reading.status !== "SAFE") return false;
++  if (reading.remainingFreeAllowance === null) return false;
++  if (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0) return false;
++  const checkedAtMs = Date.parse(reading.checkedAt);
++  if (!Number.isFinite(checkedAtMs)) return false;
++  return now() - checkedAtMs <= maxAgeMs;
++}
++
++/**
++ * Full eligibility projection: cost class + per-connection safety.
++ *
++ * Quota semantics for proof classes (FREE_VERIFIED via hard stop):
++ *   - a fresh SAFE reading with headroom above the margin keeps the connection and reports headroom;
++ *   - a reading that positively reports EXHAUSTED, or a fresh SAFE reading without headroom, drops
++ *     the connection (negative evidence must never be dispatched);
++ *   - an ABSENT, stale or UNKNOWN reading does not exclude the connection, because the hard stop
++ *     itself prevents billing (worst case the provider returns 429 and the existing resilience
++ *     layer cools the connection down).
++ * SELF_HOSTED and keyless candidates never resolve quota state at all.
++ */
++export function evaluateFreeSentinel(
++  candidate: FreeCostCandidate,
++  context: FreeSentinelContext = {}
++): FreeSentinelFacts {
++  const entry =
++    context.entry === undefined
++      ? findFreeCatalogEntry(candidate, context.catalog)
++      : (context.entry ?? undefined);
++  const verdict = classifyFreeCost(candidate, entry);
++
++  const facts: FreeSentinelFacts = {
++    ...verdict,
++    quotaStatus: "ABSENT",
++    quotaRemaining: null,
++    safeConnectionIds: [],
++  };
++
++  if (!verdict.autoFreeAllowed) return facts;
++
++  const connectionIds = collectConnectionIds(candidate);
++  if (connectionIds.length === 0) return facts;
++
++  if (verdict.costClass === "SELF_HOSTED" || verdict.reason === "KEYLESS_HARD_FREE_ENDPOINT") {
++    return { ...facts, safeConnectionIds: [...connectionIds] };
++  }
++
++  const resolve = context.resolveFreeAccessState;
++  const minRemaining =
++    typeof context.minRemainingAllowance === "number" ? context.minRemainingAllowance : 0;
++  const maxAgeMs = typeof context.maxStateAgeMs === "number" ? context.maxStateAgeMs : 0;
++  const now = context.now ?? (() => Date.now());
++
++  const safeConnectionIds: string[] = [];
++  let bestStatus: FreeQuotaStatus = "ABSENT";
++  let bestRemaining: number | null = null;
++  let exhaustedRemaining: number | null = null;
++
++  for (const connectionId of connectionIds) {
++    const reading = resolve ? resolve(candidate.provider, connectionId) : undefined;
++
++    if (!reading) {
++      // Telemetry absent: advisory only for a provably hard-free route.
++      if (bestStatus !== "SAFE") bestStatus = "UNKNOWN";
++      safeConnectionIds.push(connectionId);
++      continue;
++    }
++
++    if (reading.status === "EXHAUSTED") {
++      exhaustedRemaining = reading.remainingFreeAllowance;
++      continue;
++    }
++
++    if (!isUsableSafeReading(reading, now, maxAgeMs)) {
++      if (bestStatus !== "SAFE") bestStatus = "UNKNOWN";
++      safeConnectionIds.push(connectionId);
++      continue;
++    }
++
++    const remaining = reading.remainingFreeAllowance as number;
++    if (minRemaining < 0 || remaining > minRemaining) {
++      bestStatus = "SAFE";
++      bestRemaining = remaining;
++      safeConnectionIds.push(connectionId);
++    }
++  }
++
++  if (safeConnectionIds.length === 0) {
++    return {
++      ...facts,
++      quotaStatus: exhaustedRemaining === null ? "ABSENT" : "EXHAUSTED",
++      quotaRemaining: exhaustedRemaining,
++      reason: exhaustedRemaining === null ? "NO_SAFE_CONNECTION" : "QUOTA_EXHAUSTED",
++    };
++  }
++
++  return {
++    ...facts,
++    quotaStatus: bestStatus,
++    quotaRemaining: bestRemaining,
++    safeConnectionIds,
++  };
++}
+diff --git a/open-sse/services/autoCombo/strictZeroCostFilter.ts b/open-sse/services/autoCombo/strictZeroCostFilter.ts
+index c9bc601bc..80d13fc6b 100644
+--- a/open-sse/services/autoCombo/strictZeroCostFilter.ts
++++ b/open-sse/services/autoCombo/strictZeroCostFilter.ts
+@@ -23,6 +23,20 @@
+  * handled automatically; one that doesn't is excluded automatically — see
+  * `docs/routing/STRICT_ZERO_COST.md`.
+  *
++ * ## Free cost classes (reconstruction, see `docs/routing/STRICT_ZERO_COST.md`)
++ *
++ * Admission is no longer "is it in FREE_MODEL_BUDGETS and freshly verified".
++ * `freeProviderSentinel.ts` classifies every candidate into exactly one of
++ * FREE_VERIFIED, SELF_HOSTED, FREE_UNKNOWN, UNKNOWN_COST, NULL_COST, PAID,
++ * CREDIT_BACKED or DISCONTINUED from catalog metadata plus the candidate's own
++ * connection shape; only FREE_VERIFIED and SELF_HOSTED are admissible. Live
++ * quota telemetry remains the headroom signal wherever it exists, but it is an
++ * optimization, NOT a gate, for routes with independent evidence they cannot
++ * spill into paid billing (self-hosted, keyless hard-free endpoint, or a
++ * `recurring-*` entry whose provider terms document a hard stop rather than
++ * pay-as-you-go billing). A positive EXHAUSTED reading still excludes, and
++ * every class outside the allowed set is rejected before any quota read runs.
++ *
+  * ## Connection safety (fixed after code review, see `docs/routing/STRICT_ZERO_COST.md`)
+  *
+  * A candidate from `virtualFactory.ts`'s connection-based pool represents ONE
+@@ -53,10 +67,7 @@ import {
+   type FreeModelBudget,
+ } from "@omniroute/open-sse/config/freeModelCatalog.ts";
+ import { SYNTHETIC_NOAUTH_CONNECTION_ID } from "./resilienceCandidateFilter";
+-
+-/** Types whose allowance needs no runtime verification: no credential exists
+- * for the candidate at all, so no request against it can ever be billed. */
+-const KEYLESS_FREE_TYPES = new Set<FreeModelBudget["freeType"]>(["keyless"]);
++import { evaluateFreeSentinel, findFreeCatalogEntry } from "./freeProviderSentinel";
+ 
+ export type FreeAccessStatus = "SAFE" | "EXHAUSTED" | "UNKNOWN";
+ 
+@@ -128,40 +139,36 @@ export function findBudgetEntry(
+   candidate: Pick<StrictZeroCostCandidate, "provider" | "model">,
+   catalog: readonly FreeModelBudget[] = FREE_MODEL_BUDGETS
+ ): FreeModelBudget | undefined {
+-  return catalog.find((m) => m.provider === candidate.provider && m.modelId === candidate.model);
+-}
+-
+-function isConnectionStateSafe(
+-  provider: string,
+-  connectionId: string,
+-  resolveFreeAccessState: StrictZeroCostOptions["resolveFreeAccessState"],
+-  options: Pick<StrictZeroCostOptions, "minRemainingAllowance" | "maxStateAgeMs" | "now">
+-): boolean {
+-  const state = resolveFreeAccessState(provider, connectionId);
+-  if (!state) return false; // no usage adapter for this provider, or lookup never ran/is stale
+-  if (state.status !== "SAFE") return false;
+-
+-  const now = (options.now ?? Date.now)();
+-  const checkedAtMs = Date.parse(state.checkedAt);
+-  if (!Number.isFinite(checkedAtMs) || now - checkedAtMs > options.maxStateAgeMs) return false;
+-
+-  if (state.remainingFreeAllowance === null) return false;
+-  // A negative threshold would let a negative/garbage reading pass; a caller
+-  // that genuinely wants "any allowance greater than zero" should pass 0.
+-  if (options.minRemainingAllowance < 0) return false;
+-  return state.remainingFreeAllowance > options.minRemainingAllowance;
++  return findFreeCatalogEntry(candidate, catalog);
+ }
+ 
+ /**
+  * Decide which of a candidate's connections satisfy STRICT_ZERO_COST. Pure —
+- * `resolveFreeAccessState` is the only injected side-effecting dependency,
+- * and it's a synchronous cache read (see `StrictZeroCostOptions` above).
++ * `resolveFreeAccessState` is the only injected side-effecting dependency, and
++ * it's a synchronous cache read (see `StrictZeroCostOptions` above).
+  *
+- * Returns the list of connection ids proven SAFE right now:
++ * Admission is delegated to `freeProviderSentinel.ts`, which classifies the
++ * candidate into exactly one free-cost class and returns the connection ids
++ * that may be dispatched:
++ *   - `FREE_VERIFIED` — a genuine no-auth keyless endpoint, or a `recurring-*`
++ *     catalog entry with `hardStopGuaranteed: true`. A live quota reading is
++ *     honoured whenever it is fresh and usable: EXHAUSTED excludes that
++ *     connection, and a SAFE reading below the headroom threshold excludes it
++ *     too. An ABSENT / stale / UNKNOWN reading is advisory, not a gate — the
++ *     provider's own terms make free-tier exhaustion a hard stop, so the route
++ *     cannot spill into paid billing, and refusing it while telemetry is
++ *     missing would fail closed for no safety benefit.
++ *   - `SELF_HOSTED` — self-hosted/local provider ids: always dispatchable, no
++ *     cloud quota row exists or is required.
++ *   - every other class (FREE_UNKNOWN, UNKNOWN_COST, NULL_COST, PAID,
++ *     CREDIT_BACKED, DISCONTINUED) — excluded, and excluded BEFORE any quota
++ *     lookup runs, so an untrusted entry never costs a usage read.
++ *
++ * Returns the list of connection ids proven dispatchable right now:
+  *   - `[SYNTHETIC_NOAUTH_CONNECTION_ID]` for a genuine no-auth candidate whose
+  *     catalog entry is `keyless` — no live check needed or possible.
+  *   - a (possibly empty) subset of the candidate's real connection id(s) for
+- *     every other case, each individually verified.
++ *     every other case, each individually evaluated.
+  * An empty array means the caller must exclude the candidate entirely.
+  */
+ export function evaluateCandidateConnections(
+@@ -170,42 +177,14 @@ export function evaluateCandidateConnections(
+   resolveFreeAccessState: StrictZeroCostOptions["resolveFreeAccessState"],
+   options: Pick<StrictZeroCostOptions, "minRemainingAllowance" | "maxStateAgeMs" | "now">
+ ): string[] {
+-  if (!budgetEntry) return []; // not in the catalog at all → paid, or genuinely unknown
+-
+-  const isGenuineNoAuthCandidate = candidate.connectionId === SYNTHETIC_NOAUTH_CONNECTION_ID;
+-  if (KEYLESS_FREE_TYPES.has(budgetEntry.freeType)) {
+-    // The keyless shortcut is trustworthy ONLY when this specific candidate
+-    // instance actually has no credential behind it. A `keyless`-catalogued
+-    // model reached through a real DB connection (connectionId is a real id,
+-    // or the candidate carries allowedConnectionIds at all) must NOT take
+-    // this shortcut — it falls through to the quota-based check below like
+-    // any other freeType, and is excluded there unless hardStopGuaranteed is
+-    // also set for it (which the curated catalog does not do for keyless
+-    // entries today, so it will correctly exclude).
+-    if (isGenuineNoAuthCandidate) return [SYNTHETIC_NOAUTH_CONNECTION_ID];
+-  }
+-  if (budgetEntry.freeType === "discontinued") return [];
+-  if (isGenuineNoAuthCandidate) return []; // no-auth path but a non-keyless catalog entry: contradictory metadata, fail closed
+-
+-  // Every remaining freeType (recurring-*, one-time-initial, a keyless entry
+-  // reached via a real connection, and any future type this module doesn't
+-  // special-case) requires a documented hard stop before any live check even
+-  // runs — no point burning a quota lookup on a connection we could never
+-  // trust regardless of its answer.
+-  if (budgetEntry.hardStopGuaranteed !== true) return [];
+-
+-  const candidateConnectionIds = candidate.connectionId
+-    ? [candidate.connectionId]
+-    : (candidate.allowedConnectionIds ?? []);
+-
+-  const safe: string[] = [];
+-  for (const connectionId of candidateConnectionIds) {
+-    if (connectionId === SYNTHETIC_NOAUTH_CONNECTION_ID) continue; // never reachable here, defensive
+-    if (isConnectionStateSafe(candidate.provider, connectionId, resolveFreeAccessState, options)) {
+-      safe.push(connectionId);
+-    }
+-  }
+-  return safe;
++  const facts = evaluateFreeSentinel(candidate, {
++    entry: budgetEntry,
++    resolveFreeAccessState,
++    minRemainingAllowance: options.minRemainingAllowance,
++    maxStateAgeMs: options.maxStateAgeMs,
++    now: options.now,
++  });
++  return facts.safeConnectionIds;
+ }
+ 
+ /**
+diff --git a/tests/unit/autoCombo/free-provider-sentinel-r1.test.ts b/tests/unit/autoCombo/free-provider-sentinel-r1.test.ts
+new file mode 100644
+index 000000000..5ae08fb78
+--- /dev/null
++++ b/tests/unit/autoCombo/free-provider-sentinel-r1.test.ts
+@@ -0,0 +1,366 @@
++/**
++ * R1 reconstruction — policy matrix for the AUTO FREE cost sentinel.
++ *
++ * `tests/unit/autoCombo/` is a vitest-only scope (see vitest.mcp.config.ts).
++ *
++ * The sentinel is the single source of truth for AUTO FREE admission: only
++ * FREE_VERIFIED (a keyless hard-free endpoint, or a recurring free tier whose
++ * provider terms document a hard stop) and SELF_HOSTED may be auto-selected.
++ * Paid, credit-backed, unknown-cost, null-cost, free-unknown and discontinued
++ * candidates are always excluded, and there is no paid fallback.
++ */
++import { test } from "vitest";
++import assert from "node:assert/strict";
++
++import {
++  AUTO_FREE_ALLOWED_COST_CLASSES,
++  classifyFreeCost,
++  evaluateFreeSentinel,
++  findFreeCatalogEntry,
++  isSelfHostedFreeProvider,
++  type FreeCostClass,
++  type FreeQuotaReading,
++} from "../../../open-sse/services/autoCombo/freeProviderSentinel.ts";
++import {
++  FREE_MODEL_BUDGETS,
++  type FreeModelBudget,
++} from "../../../open-sse/config/freeModelCatalog.ts";
++import { SYNTHETIC_NOAUTH_CONNECTION_ID } from "../../../open-sse/services/autoCombo/resilienceCandidateFilter.ts";
++
++const NOW = "2026-08-20T00:00:00.000Z";
++const REAL_CONN = "sentinel-conn-1";
++const OPTIONS = { minRemainingAllowance: 1, maxStateAgeMs: 180_000, now: () => Date.parse(NOW) };
++
++const HARD_STOP = { provider: "groq", model: "llama-3.3-70b-versatile" } as const;
++const KEYLESS = { provider: "felo-web", model: "felo-chat" } as const;
++
++function entryFor(provider: string, modelId: string): FreeModelBudget {
++  const entry = FREE_MODEL_BUDGETS.find((m) => m.provider === provider && m.modelId === modelId);
++  assert.ok(entry, `catalog entry ${provider}/${modelId} must exist`);
++  return entry;
++}
++
++function syntheticEntry(overrides: Partial<FreeModelBudget>): FreeModelBudget {
++  return { ...entryFor("groq", "llama-3.3-70b-versatile"), ...overrides };
++}
++
++function reading(
++  overrides: {
++    status?: FreeQuotaReading["status"];
++    remainingFreeAllowance?: number | null;
++    checkedAt?: string;
++  } = {}
++): FreeQuotaReading {
++  return {
++    status: overrides.status ?? "SAFE",
++    remainingFreeAllowance:
++      overrides.remainingFreeAllowance === undefined ? 40 : overrides.remainingFreeAllowance,
++    resetAt: null,
++    checkedAt: overrides.checkedAt ?? NOW,
++  };
++}
++
++const GROQ_ENTRY = entryFor("groq", "llama-3.3-70b-versatile");
++const FELO_ENTRY = entryFor("felo-web", "felo-chat");
++
++test("fixtures: the catalog entries used by this suite keep their documented shape", () => {
++  assert.equal(GROQ_ENTRY.hardStopGuaranteed, true);
++  assert.equal(GROQ_ENTRY.freeType, "recurring-daily");
++  assert.equal(FELO_ENTRY.freeType, "keyless");
++});
++
++test("classify: recurring free tier with a documented hard stop is FREE_VERIFIED", () => {
++  const verdict = classifyFreeCost(HARD_STOP, GROQ_ENTRY);
++  assert.equal(verdict.costClass, "FREE_VERIFIED");
++  assert.equal(verdict.autoFreeAllowed, true);
++  assert.equal(verdict.hardStopProven, true);
++  assert.equal(verdict.telemetryAdvisory, true);
++  assert.equal(verdict.reason, "HARD_STOP_FREE_TIER_VERIFIED");
++});
++
++test("classify: keyless endpoint is FREE_VERIFIED only through the no-auth connection", () => {
++  const noauth = classifyFreeCost(
++    { ...KEYLESS, connectionId: SYNTHETIC_NOAUTH_CONNECTION_ID },
++    FELO_ENTRY
++  );
++  assert.equal(noauth.costClass, "FREE_VERIFIED");
++  assert.equal(noauth.autoFreeAllowed, true);
++  assert.equal(noauth.telemetryAdvisory, false);
++  assert.equal(noauth.reason, "KEYLESS_HARD_FREE_ENDPOINT");
++
++  const credentialed = classifyFreeCost({ ...KEYLESS, connectionId: REAL_CONN }, FELO_ENTRY);
++  assert.equal(credentialed.costClass, "FREE_UNKNOWN");
++  assert.equal(credentialed.autoFreeAllowed, false);
++  assert.equal(credentialed.reason, "KEYLESS_REQUIRES_NOAUTH_CONNECTION");
++});
++
++test("classify: signup and recurring credit grants are CREDIT_BACKED", () => {
++  const trial = classifyFreeCost(
++    { provider: "synthetic-trial", model: "trial-model" },
++    syntheticEntry({ freeType: "one-time-initial" })
++  );
++  assert.equal(trial.costClass, "CREDIT_BACKED");
++  assert.equal(trial.autoFreeAllowed, false);
++  assert.equal(trial.reason, "CREDIT_BACKED_EXCLUDED");
++
++  const credit = classifyFreeCost(
++    { provider: "synthetic-credit", model: "credit-model" },
++    syntheticEntry({ freeType: "recurring-credit" })
++  );
++  assert.equal(credit.costClass, "CREDIT_BACKED");
++  assert.equal(credit.reason, "CREDIT_BACKED_EXCLUDED");
++});
++
++test("classify: recurring free tier without a hard-stop proof is FREE_UNKNOWN", () => {
++  for (const hardStopGuaranteed of [undefined, false]) {
++    const verdict = classifyFreeCost(
++      { provider: "synthetic-unproven", model: "unproven-model" },
++      syntheticEntry({ freeType: "recurring-monthly", hardStopGuaranteed })
++    );
++    assert.equal(verdict.costClass, "FREE_UNKNOWN");
++    assert.equal(verdict.autoFreeAllowed, false);
++    assert.equal(verdict.reason, "FREE_UNKNOWN_NO_HARD_STOP_PROOF");
++  }
++});
++
++test("classify: discontinued free tiers are DISCONTINUED", () => {
++  const verdict = classifyFreeCost(
++    { provider: "synthetic-dead", model: "dead-model" },
++    syntheticEntry({ freeType: "discontinued" })
++  );
++  assert.equal(verdict.costClass, "DISCONTINUED");
++  assert.equal(verdict.autoFreeAllowed, false);
++  assert.equal(verdict.reason, "DISCONTINUED_EXCLUDED");
++});
++
++test("classify: unknown, null and paid costs are excluded", () => {
++  const unknown = classifyFreeCost({ provider: "unlisted-provider", model: "unlisted-model" });
++  assert.equal(unknown.costClass, "UNKNOWN_COST");
++  assert.equal(unknown.autoFreeAllowed, false);
++  assert.equal(unknown.reason, "UNKNOWN_COST_EXCLUDED");
++
++  const nullCost = classifyFreeCost({
++    provider: "unlisted-provider",
++    model: "unlisted-model",
++    costPer1MTokens: null,
++  });
++  assert.equal(nullCost.costClass, "NULL_COST");
++  assert.equal(nullCost.reason, "NULL_COST_EXCLUDED");
++
++  const paid = classifyFreeCost({
++    provider: "unlisted-provider",
++    model: "unlisted-model",
++    costPer1MTokens: 15,
++  });
++  assert.equal(paid.costClass, "PAID");
++  assert.equal(paid.reason, "PAID_COST_EXCLUDED");
++});
++
++test("classify: no-auth connection carrying non-keyless metadata fails closed", () => {
++  const verdict = classifyFreeCost(
++    { ...HARD_STOP, connectionId: SYNTHETIC_NOAUTH_CONNECTION_ID },
++    GROQ_ENTRY
++  );
++  assert.equal(verdict.costClass, "FREE_UNKNOWN");
++  assert.equal(verdict.autoFreeAllowed, false);
++  assert.equal(verdict.reason, "NOAUTH_METADATA_CONFLICT_EXCLUDED");
++});
++
++test("classify: self-hosted and local providers are SELF_HOSTED without quota telemetry", () => {
++  for (const provider of ["ollama-local", "lm-studio", "llama-cpp", "vllm"]) {
++    assert.equal(isSelfHostedFreeProvider(provider), true);
++    const verdict = classifyFreeCost({ provider, model: "any-local-model" });
++    assert.equal(verdict.costClass, "SELF_HOSTED");
++    assert.equal(verdict.autoFreeAllowed, true);
++    assert.equal(verdict.telemetryAdvisory, false);
++    assert.equal(verdict.reason, "SELF_HOSTED_NO_BILLING");
++  }
++  assert.equal(isSelfHostedFreeProvider("totally-unheard-of-provider-xyz"), false);
++});
++
++test("AUTO FREE admission set is exactly FREE_VERIFIED and SELF_HOSTED", () => {
++  assert.deepEqual([...AUTO_FREE_ALLOWED_COST_CLASSES].sort(), ["FREE_VERIFIED", "SELF_HOSTED"]);
++  const denied: FreeCostClass[] = [
++    "FREE_UNKNOWN",
++    "UNKNOWN_COST",
++    "NULL_COST",
++    "PAID",
++    "CREDIT_BACKED",
++    "DISCONTINUED",
++  ];
++  for (const costClass of denied) {
++    assert.equal(AUTO_FREE_ALLOWED_COST_CLASSES.has(costClass), false);
++  }
++});
++
++test("sentinel: hard-stop route without telemetry stays eligible", () => {
++  const facts = evaluateFreeSentinel(
++    { ...HARD_STOP, connectionId: REAL_CONN },
++    { entry: GROQ_ENTRY, resolveFreeAccessState: () => undefined, ...OPTIONS }
++  );
++  assert.equal(facts.autoFreeAllowed, true);
++  assert.deepEqual(facts.safeConnectionIds, [REAL_CONN]);
++  assert.equal(facts.quotaStatus, "UNKNOWN");
++  assert.equal(facts.quotaRemaining, null);
++  assert.equal(facts.reason, "HARD_STOP_FREE_TIER_VERIFIED");
++});
++
++test("sentinel: EXHAUSTED telemetry empties the safe set", () => {
++  const facts = evaluateFreeSentinel(
++    { ...HARD_STOP, connectionId: REAL_CONN },
++    {
++      entry: GROQ_ENTRY,
++      resolveFreeAccessState: () => reading({ status: "EXHAUSTED", remainingFreeAllowance: 0 }),
++      ...OPTIONS,
++    }
++  );
++  assert.deepEqual(facts.safeConnectionIds, []);
++  assert.equal(facts.quotaStatus, "EXHAUSTED");
++  assert.equal(facts.quotaRemaining, 0);
++  assert.equal(facts.reason, "QUOTA_EXHAUSTED");
++});
++
++test("sentinel: SAFE telemetry with headroom is reported", () => {
++  const facts = evaluateFreeSentinel(
++    { ...HARD_STOP, connectionId: REAL_CONN },
++    {
++      entry: GROQ_ENTRY,
++      resolveFreeAccessState: () => reading({ remainingFreeAllowance: 40 }),
++      ...OPTIONS,
++    }
++  );
++  assert.deepEqual(facts.safeConnectionIds, [REAL_CONN]);
++  assert.equal(facts.quotaStatus, "SAFE");
++  assert.equal(facts.quotaRemaining, 40);
++  assert.equal(facts.reason, "HARD_STOP_FREE_TIER_VERIFIED");
++});
++
++test("sentinel: SAFE telemetry below the headroom margin is not dispatchable", () => {
++  const facts = evaluateFreeSentinel(
++    { ...HARD_STOP, connectionId: REAL_CONN },
++    {
++      entry: GROQ_ENTRY,
++      resolveFreeAccessState: () => reading({ remainingFreeAllowance: 0.5 }),
++      ...OPTIONS,
++    }
++  );
++  assert.deepEqual(facts.safeConnectionIds, []);
++  assert.equal(facts.quotaStatus, "ABSENT");
++  assert.equal(facts.quotaRemaining, null);
++  assert.equal(facts.reason, "NO_SAFE_CONNECTION");
++});
++
++test("sentinel: stale or UNKNOWN telemetry is advisory only for a hard-stop route", () => {
++  const stale = evaluateFreeSentinel(
++    { ...HARD_STOP, connectionId: REAL_CONN },
++    {
++      entry: GROQ_ENTRY,
++      resolveFreeAccessState: () => reading({ checkedAt: "2026-08-19T00:00:00.000Z" }),
++      ...OPTIONS,
++    }
++  );
++  assert.deepEqual(stale.safeConnectionIds, [REAL_CONN]);
++  assert.equal(stale.quotaStatus, "UNKNOWN");
++
++  const unknown = evaluateFreeSentinel(
++    { ...HARD_STOP, connectionId: REAL_CONN },
++    {
++      entry: GROQ_ENTRY,
++      resolveFreeAccessState: () => reading({ status: "UNKNOWN", remainingFreeAllowance: null }),
++      ...OPTIONS,
++    }
++  );
++  assert.deepEqual(unknown.safeConnectionIds, [REAL_CONN]);
++  assert.equal(unknown.quotaStatus, "UNKNOWN");
++});
++
++test("sentinel: only positive EXHAUSTED evidence narrows a multi-account candidate", () => {
++  const facts = evaluateFreeSentinel(
++    { ...HARD_STOP, connectionId: null, allowedConnectionIds: ["A", "B"] },
++    {
++      entry: GROQ_ENTRY,
++      resolveFreeAccessState: (_provider, connectionId) =>
++        connectionId === "A"
++          ? reading({ status: "EXHAUSTED", remainingFreeAllowance: 0 })
++          : undefined,
++      ...OPTIONS,
++    }
++  );
++  assert.deepEqual(facts.safeConnectionIds, ["B"]);
++  assert.equal(facts.quotaStatus, "UNKNOWN");
++  assert.equal(facts.autoFreeAllowed, true);
++});
++
++test("sentinel: a self-hosted candidate never reads quota telemetry", () => {
++  const facts = evaluateFreeSentinel(
++    { provider: "ollama-local", model: "llama3", connectionId: REAL_CONN },
++    {
++      resolveFreeAccessState: () => {
++        throw new Error("quota must not be read for a self-hosted provider");
++      },
++      ...OPTIONS,
++    }
++  );
++  assert.equal(facts.costClass, "SELF_HOSTED");
++  assert.deepEqual(facts.safeConnectionIds, [REAL_CONN]);
++  assert.equal(facts.quotaStatus, "ABSENT");
++});
++
++test("sentinel: a keyless candidate is admitted with its no-auth connection", () => {
++  const facts = evaluateFreeSentinel(
++    { ...KEYLESS, connectionId: SYNTHETIC_NOAUTH_CONNECTION_ID },
++    { catalog: FREE_MODEL_BUDGETS, ...OPTIONS }
++  );
++  assert.equal(facts.costClass, "FREE_VERIFIED");
++  assert.deepEqual(facts.safeConnectionIds, [SYNTHETIC_NOAUTH_CONNECTION_ID]);
++});
++
++test("sentinel: eligibility follows the catalog it is given, not a hardcoded provider list", () => {
++  const withCatalog = evaluateFreeSentinel(
++    { ...HARD_STOP, connectionId: REAL_CONN },
++    { catalog: FREE_MODEL_BUDGETS, resolveFreeAccessState: () => undefined, ...OPTIONS }
++  );
++  assert.equal(withCatalog.costClass, "FREE_VERIFIED");
++  assert.deepEqual(withCatalog.safeConnectionIds, [REAL_CONN]);
++
++  const withoutCatalog = evaluateFreeSentinel(
++    { ...HARD_STOP, connectionId: REAL_CONN },
++    { catalog: [], resolveFreeAccessState: () => undefined, ...OPTIONS }
++  );
++  assert.equal(withoutCatalog.costClass, "UNKNOWN_COST");
++  assert.equal(withoutCatalog.autoFreeAllowed, false);
++  assert.deepEqual(withoutCatalog.safeConnectionIds, []);
++});
++
++test("sentinel: no paid fallback — telemetry never admits a paid or unknown-cost candidate", () => {
++  const perfectTelemetry = () => reading({ remainingFreeAllowance: 100 });
++
++  const unknownCost = evaluateFreeSentinel(
++    { provider: "openai", model: "gpt-4o", connectionId: REAL_CONN },
++    { catalog: FREE_MODEL_BUDGETS, resolveFreeAccessState: perfectTelemetry, ...OPTIONS }
++  );
++  assert.equal(unknownCost.autoFreeAllowed, false);
++  assert.deepEqual(unknownCost.safeConnectionIds, []);
++  assert.equal(unknownCost.reason, "UNKNOWN_COST_EXCLUDED");
++
++  const paid = evaluateFreeSentinel(
++    { provider: "openai", model: "gpt-4o", connectionId: REAL_CONN, costPer1MTokens: 15 },
++    { catalog: FREE_MODEL_BUDGETS, resolveFreeAccessState: perfectTelemetry, ...OPTIONS }
++  );
++  assert.equal(paid.autoFreeAllowed, false);
++  assert.deepEqual(paid.safeConnectionIds, []);
++  assert.equal(paid.reason, "PAID_COST_EXCLUDED");
++});
++
++test("findFreeCatalogEntry matches provider+model and rejects everything else", () => {
++  const match = findFreeCatalogEntry(HARD_STOP, FREE_MODEL_BUDGETS);
++  assert.ok(match);
++  assert.equal(match.provider, "groq");
++  assert.equal(match.modelId, "llama-3.3-70b-versatile");
++
++  assert.equal(
++    findFreeCatalogEntry({ provider: "groq", model: "not-cataloged" }, FREE_MODEL_BUDGETS),
++    undefined
++  );
++  assert.equal(findFreeCatalogEntry(HARD_STOP, []), undefined);
++});
+diff --git a/tests/unit/autoCombo/strict-zero-cost-connection-safety.test.ts b/tests/unit/autoCombo/strict-zero-cost-connection-safety.test.ts
+index 312f83eb5..e97c19ca5 100644
+--- a/tests/unit/autoCombo/strict-zero-cost-connection-safety.test.ts
++++ b/tests/unit/autoCombo/strict-zero-cost-connection-safety.test.ts
+@@ -169,8 +169,12 @@ test("sanity: non-keyless freeType via the no-auth sentinel connection fails clo
+ 
+ // ─── BLOCKER 2 — multi-account connection mismatch ─────────────────────
+ 
+-// 1. account A SAFE, B UNKNOWN → dispatch can use ONLY A.
+-test("1: A SAFE, B UNKNOWN -> safe connection set is exactly [A]", () => {
++// 1. R1 reconstruction: for a hard-stop-verified entry, missing telemetry means
++// "not measured", never "billable" — B stays dispatchable next to A. The route
++// cannot spill into paid spend (the provider documents a hard stop, not
++// billing), so telemetry only removes a connection on POSITIVE evidence
++// (tests 2 and 5).
++test("1: A SAFE, B without telemetry -> both stay selectable", () => {
+   const candidate: StrictZeroCostCandidate = {
+     provider: "qp",
+     model: "qp-model",
+@@ -178,9 +182,10 @@ test("1: A SAFE, B UNKNOWN -> safe connection set is exactly [A]", () => {
+     allowedConnectionIds: ["A", "B"],
+   };
+   const resolve = (_provider: string, connectionId: string) =>
+-    connectionId === "A" ? safeState() : undefined; // B: no state at all == UNKNOWN
++    connectionId === "A" ? safeState() : undefined; // B: no state at all
+   assert.deepEqual(evaluateCandidateConnections(candidate, quotaEntry(true), resolve, OPTIONS), [
+     "A",
++    "B",
+   ]);
+ });
+ 
+@@ -201,23 +206,30 @@ test("2: A EXHAUSTED, B SAFE -> safe connection set is exactly [B]", () => {
+   ]);
+ });
+ 
+-// 3. A SAFE, B billable/unverifiable (UNKNOWN) → B not selectable.
+-test("3: A SAFE, B UNKNOWN (billable/unverifiable) -> B never enters the safe set", () => {
++// 3. An entry WITHOUT the hard-stop proof stays excluded even when every
++// connection has perfect telemetry: live quota data can never upgrade an
++// unproven free claim into an AUTO FREE candidate.
++test("3: entry without hard-stop proof -> fully excluded regardless of telemetry", () => {
++  const unproven = { ...quotaEntry(true), hardStopGuaranteed: undefined };
+   const candidate: StrictZeroCostCandidate = {
+     provider: "qp",
+     model: "qp-model",
+     connectionId: null,
+     allowedConnectionIds: ["A", "B"],
+   };
+-  const resolve = (_provider: string, connectionId: string) =>
+-    connectionId === "A" ? safeState() : undefined;
+-  const safe = evaluateCandidateConnections(candidate, quotaEntry(true), resolve, OPTIONS);
+-  assert.equal(safe.includes("B"), false);
+-  assert.deepEqual(safe, ["A"]);
++  assert.deepEqual(
++    evaluateCandidateConnections(candidate, unproven, () => safeState(), OPTIONS),
++    []
++  );
++  assert.deepEqual(
++    evaluateCandidateConnections(candidate, unproven, () => undefined, OPTIONS),
++    []
++  );
+ });
+ 
+-// 4. tutte UNKNOWN → candidato escluso.
+-test("4: all connections UNKNOWN -> candidate fully excluded (empty safe set)", () => {
++// 4. All connections without telemetry → the candidate stays selectable for a
++// hard-stop-verified entry (same rationale as test 1).
++test("4: all connections without telemetry -> candidate stays selectable", () => {
+   const candidate: StrictZeroCostCandidate = {
+     provider: "qp",
+     model: "qp-model",
+@@ -226,25 +238,26 @@ test("4: all connections UNKNOWN -> candidate fully excluded (empty safe set)",
+   };
+   assert.deepEqual(
+     evaluateCandidateConnections(candidate, quotaEntry(true), () => undefined, OPTIONS),
+-    []
++    ["A", "B", "C"]
+   );
+ });
+ 
+-// 5. account selezionato al dispatch è uno di quelli verificati SAFE — proven
+-// at the pool-filter level: the returned candidate's `allowedConnectionIds`
+-// is rewritten to exactly the safe subset, which is the same field
+-// `autoStrategy.ts` (open-sse/services/combo/autoStrategy.ts:315-331)
+-// already intersects against before connection selection — so whatever it
+-// picks is provably a member of this set, by construction.
+-test("5: filterStrictZeroCostCandidates rewrites allowedConnectionIds to exactly the verified-SAFE subset", () => {
++// 5. Negative evidence still narrows. The returned candidate's
++// `allowedConnectionIds` is rewritten to exactly the connections without
++// positive EXHAUSTED evidence, and `autoStrategy.ts`
++// (open-sse/services/combo/autoStrategy.ts:315-331) intersects against that
++// same field before connection selection — so whatever it picks is provably
++// not a connection this filter measured as exhausted.
++test("5: filterStrictZeroCostCandidates narrows to connections without EXHAUSTED evidence", () => {
+   const candidate: StrictZeroCostCandidate = {
+     provider: "qp",
+     model: "qp-model",
+     connectionId: null,
+     allowedConnectionIds: ["A", "B", "C"],
+   };
++  const exhausted = safeState({ status: "EXHAUSTED", remainingFreeAllowance: 0 });
+   const resolve = (_provider: string, connectionId: string) =>
+-    connectionId === "B" ? safeState() : undefined; // only B is SAFE
++    connectionId === "B" ? safeState() : connectionId === "A" ? undefined : exhausted;
+   const result = filterStrictZeroCostCandidates([candidate], {
+     enabled: true,
+     resolveFreeAccessState: resolve,
+@@ -254,19 +267,10 @@ test("5: filterStrictZeroCostCandidates rewrites allowedConnectionIds to exactly
+   assert.equal(result.length, 1);
+   assert.deepEqual(
+     result[0].allowedConnectionIds,
+-    ["B"],
+-    "dispatch (via autoStrategy.ts's own allowedConnectionIds intersection) can only ever select B — the one connection this filter actually verified"
+-  );
+-  assert.equal(
+-    result[0].allowedConnectionIds?.includes("A"),
+-    false,
+-    "A (UNKNOWN) must never remain selectable"
+-  );
+-  assert.equal(
+-    result[0].allowedConnectionIds?.includes("C"),
+-    false,
+-    "C (UNKNOWN) must never remain selectable"
++    ["A", "B"],
++    "C is provably exhausted, so dispatch must not be able to select it"
+   );
++  assert.equal(result[0].allowedConnectionIds?.includes("C"), false);
+ });
+ 
+ test("multi-account candidate with an unchanged safe set is returned as the SAME reference (identity contract)", () => {
+@@ -287,7 +291,7 @@ test("multi-account candidate with an unchanged safe set is returned as the SAME
+   assert.equal(result[0], candidate, "the candidate object itself must be preserved, not cloned");
+ });
+ 
+-test("single-connection candidate that fails is dropped, never returned with an empty allowedConnectionIds", () => {
++test("single-connection candidate with EXHAUSTED evidence is dropped, never returned with an empty allowedConnectionIds", () => {
+   const candidate: StrictZeroCostCandidate = {
+     provider: "qp",
+     model: "qp-model",
+@@ -295,9 +299,55 @@ test("single-connection candidate that fails is dropped, never returned with an
+   };
+   const result = filterStrictZeroCostCandidates([candidate], {
+     enabled: true,
+-    resolveFreeAccessState: () => undefined,
++    resolveFreeAccessState: () => safeState({ status: "EXHAUSTED", remainingFreeAllowance: 0 }),
+     catalog: [quotaEntry(true)],
+     ...OPTIONS,
+   });
+   assert.deepEqual(result, []);
+ });
++
++test("single-connection candidate without telemetry stays admitted", () => {
++  const candidate: StrictZeroCostCandidate = {
++    provider: "qp",
++    model: "qp-model",
++    connectionId: REAL_CONN,
++  };
++  const pool = [candidate];
++  const result = filterStrictZeroCostCandidates(pool, {
++    enabled: true,
++    resolveFreeAccessState: () => undefined,
++    catalog: [quotaEntry(true)],
++    ...OPTIONS,
++  });
++  assert.equal(result, pool);
++  assert.deepEqual(result[0].connectionId, REAL_CONN);
++});
++
++// SELF_HOSTED is the one class that needs no catalog entry at all: a local
++// runtime cannot bill, so the strict filter must not silently drop it (the
++// pre-reconstruction filter did, because every admission required an entry).
++test("self-hosted provider with no catalog entry is admitted and never reads quota", () => {
++  const candidate: StrictZeroCostCandidate = {
++    provider: "ollama-local",
++    model: "llama3",
++    connectionId: REAL_CONN,
++  };
++  const throwingResolver = () => {
++    throw new Error("quota must not be read for a self-hosted provider");
++  };
++  assert.deepEqual(evaluateCandidateConnections(candidate, undefined, throwingResolver, OPTIONS), [
++    REAL_CONN,
++  ]);
++});
++
++test("provider with no catalog entry is not admitted by telemetry alone", () => {
++  const candidate: StrictZeroCostCandidate = {
++    provider: "totally-unheard-of-provider-xyz",
++    model: "mystery-model",
++    connectionId: REAL_CONN,
++  };
++  assert.deepEqual(
++    evaluateCandidateConnections(candidate, undefined, () => safeState(), OPTIONS),
++    []
++  );
++});
+diff --git a/tests/unit/autoCombo/strict-zero-cost-filter.test.ts b/tests/unit/autoCombo/strict-zero-cost-filter.test.ts
+index dc293a6dd..c352b9387 100644
+--- a/tests/unit/autoCombo/strict-zero-cost-filter.test.ts
++++ b/tests/unit/autoCombo/strict-zero-cost-filter.test.ts
+@@ -142,39 +142,62 @@ test("EXHAUSTED status excludes even with a fresh checkedAt", () => {
+   );
+ });
+ 
+-// 7. usage adapter absent (no state resolvable) → EXCLUDE
+-test("quota-based candidate with no resolvable state is excluded, not assumed safe", () => {
++// 7. no live telemetry (adapter cold / never fetched) → ADMITTED for a
++// hardStopGuaranteed route: the catalog entry documents that exceeding the free
++// allowance is a hard stop, not billing, so the route cannot spill into paid
++// spend. Live telemetry is an optimization, not a gate (R1 reconstruction).
++test("hard-stop-verified candidate with no resolvable telemetry stays admitted", () => {
+   const entry = FREE_MODEL_BUDGETS.find(
+     (m) => m.provider === "groq" && m.modelId === "llama-3.3-70b-versatile"
+   );
+   assert.deepEqual(
+     evaluateCandidateConnections(QUOTA_SAFE, entry, () => undefined, BASE_OPTIONS),
+-    []
++    [REAL_CONN]
+   );
+ });
+ 
+-// 8. usage API error → EXCLUDE (modeled as UNKNOWN status; freeAccessQuota.ts
+-// deletes the cache entry on a failed refresh, which resolves to `undefined`
+-// here — same assertion as #7, the important contract is "never falls back to SAFE").
+-test("UNKNOWN status excludes", () => {
++// 8. usage API error → telemetry unusable (freeAccessQuota.ts deletes the cache
++// entry on a failed refresh, which also resolves to `undefined`). For a
++// hardStopGuaranteed route this means "telemetry unavailable", not "exhausted".
++test("UNKNOWN status stays admitted for a hard-stop-verified route", () => {
+   const entry = FREE_MODEL_BUDGETS.find(
+     (m) => m.provider === "groq" && m.modelId === "llama-3.3-70b-versatile"
+   );
+   const state = freshState({ status: "UNKNOWN", remainingFreeAllowance: null });
+   assert.deepEqual(
+     evaluateCandidateConnections(QUOTA_SAFE, entry, () => state, BASE_OPTIONS),
+-    []
++    [REAL_CONN]
+   );
+ });
+ 
+-// 9. usage state stale → EXCLUDE
+-test("stale checkedAt excludes even when status is SAFE", () => {
++// 9. usage state stale → telemetry unusable, same as #7/#8: a hard-stop-verified
++// route stays admitted rather than failing closed on a stale sample.
++test("stale checkedAt stays admitted for a hard-stop-verified route", () => {
+   const entry = FREE_MODEL_BUDGETS.find(
+     (m) => m.provider === "groq" && m.modelId === "llama-3.3-70b-versatile"
+   );
+   const stale = freshState({ checkedAt: "2026-08-19T00:00:00.000Z" }); // >24h before NOW
+   assert.deepEqual(
+     evaluateCandidateConnections(QUOTA_SAFE, entry, () => stale, BASE_OPTIONS),
++    [REAL_CONN]
++  );
++});
++
++// Compensating guard (R1): the same missing telemetry must NOT admit a route
++// with no hard-stop proof — unproven metadata still fails closed.
++test("no telemetry still excludes a route without hard-stop proof", () => {
++  const entry = {
++    provider: "synthetic-unproven",
++    modelId: "synthetic-model",
++    displayName: "Synthetic unproven tier",
++    monthlyTokens: 1_000_000,
++    creditTokens: 0,
++    freeType: "recurring-daily" as const,
++    poolKey: null,
++    tos: "ok" as const,
++  };
++  assert.deepEqual(
++    evaluateCandidateConnections(QUOTA_SAFE, entry, () => undefined, BASE_OPTIONS),
+     []
+   );
+ });
+-- 
+2.53.0
+
+
+From 3f4d1219b542cfcaf5c5991f7053eb8117632aa4 Mon Sep 17 00:00:00 2001
+From: StockNewsBR <264292956+StockNewsBR@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 17:54:14 -0300
+Subject: [PATCH 02/11] docs(omniroute): record final R1 reconstruction
+ evidence
+
+---
+ ...OUTE_FINAL_R1_RECONSTRUCTION_2026-09-21.md | 202 ++++++++++++++++++
+ 1 file changed, 202 insertions(+)
+ create mode 100644 docs/OMNIROUTE_FINAL_R1_RECONSTRUCTION_2026-09-21.md
+
+diff --git a/docs/OMNIROUTE_FINAL_R1_RECONSTRUCTION_2026-09-21.md b/docs/OMNIROUTE_FINAL_R1_RECONSTRUCTION_2026-09-21.md
+new file mode 100644
+index 000000000..5b93f6dcc
+--- /dev/null
++++ b/docs/OMNIROUTE_FINAL_R1_RECONSTRUCTION_2026-09-21.md
+@@ -0,0 +1,202 @@
++# OmniRoute — Final Free Autopilot: R1 Reconstruction (strict dynamic FREE_ONLY)
++
++Mission: `OMNIROUTE_FREE_AUTOPILOT_FINAL_RECONSTRUCTION_R1_11_R4_LIVE_CLOSURE_2026_09_21`
++Phase: 2 — R1 reconstruction (isolated candidate; **not promoted, not deployed**)
++Date: 2026-09-21
++Workspace: `/home/dcima/omniroute-final-free-autopilot-20260921`
++Branch: `final/free-autopilot-2026-09-21`
++
++| Field                  | Value                                                                     |
++| ---------------------- | ------------------------------------------------------------------------- |
++| `UPSTREAM_BASE_SHA`    | `dea6bb8b6b64d3a3d9f639a044625c3452442c56`                                |
++| `BASE_TREE`            | `cc1a406d4cb75ace2ca726880ec0975af5a812e6`                                |
++| `R1_CANDIDATE_SHA`     | `864ddc1d57871827ab2be3a9235bab5f8c12bc48`                                |
++| `R1_CANDIDATE_TREE`    | `7a7d000577237a9f8203bcf1dd0c802be36e28f8`                                |
++| Commit                 | `864ddc1d5 feat(omniroute): reconstruct strict dynamic FREE_ONLY routing` |
++| Working tree at commit | clean (`git status --short` empty)                                        |
++
++This report is written after the R1 candidate commit. It is evidence, not a build input: nothing
++here changes the candidate tree, and its own presence is not part of `R1_CANDIDATE_TREE`.
++
++---
++
++## 1. Result
++
++```
++R1_RECONSTRUCTED=PASS (isolated candidate; production policy unchanged)
++FREE_ONLY_ADMISSION=FREE_VERIFIED+SELF_HOSTED_ONLY
++NO_STATIC_FREE_PROVIDER_ALLOWLIST=YES
++NO_PAID_FALLBACK=YES
++EXPLICIT_AND_PINNED_PATH=UNCHANGED
++PAID_SPEND_TRIGGERED_BY_R1=NO
++```
++
++AUTO FREE admission is now a pure, evidence-driven classification of every discovered
++provider/model, evaluated inside the existing strict zero-cost filter. There is no curated
++"4 providers" list, no NVIDIA+Zen-only list and no OpenRouter+NVIDIA-only list: any provider that
++can _prove_ it cannot bill is eligible; every provider that cannot prove it is excluded.
++
++## 2. Files changed
++
++| File                                                              | Change                                                                                 |
++| ----------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
++| `open-sse/services/autoCombo/freeProviderSentinel.ts`             | **new** (+358) — cost-class vocabulary, classifier, eligibility projector              |
++| `open-sse/services/autoCombo/strictZeroCostFilter.ts`             | 111 changed — admission delegated to the sentinel; exports/signatures unchanged        |
++| `open-sse/services/autoCombo/freeAccessQuota.ts`                  | +27 — `readFreeAccessStateCached()` (cache-only, never triggers a fetch)               |
++| `open-sse/handlers/autoComboCandidates.ts`                        | +104 — read-only projection of cost class / eligibility / reason / cached quota status |
++| `tests/unit/autoCombo/free-provider-sentinel-r1.test.ts`          | **new** (+366) — policy matrix                                                         |
++| `tests/unit/autoCombo/strict-zero-cost-connection-safety.test.ts` | +120 — rewritten to the new contract                                                   |
++| `tests/unit/autoCombo/strict-zero-cost-filter.test.ts`            | +43 — 3 assertions rewritten + 1 compensating test                                     |
++
++Total: 7 files, 1006 insertions, 123 deletions.
++
++Deliberately **not** touched: `open-sse/services/autoCombo/virtualFactory.ts` (its
++`filterStrictZeroCostCandidates` call was already the single extension point), `open-sse/config/*`
++(catalog data unchanged), `src/lib/quota/*`, the provider registry, the circuit breaker, and every
++OpenCode/Hermes/Harness surface.
++
++## 3. Cost classes and admission rule
++
++`classifyFreeCost(candidate, entry?)` derives one class from evidence only — never from a
++provider's name or reputation:
++
++| Class           | Evidence                                                                                                                                                                                                                                                      | AUTO FREE                           |
++| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
++| `SELF_HOSTED`   | provider is a native self-hosted/local id (`isSelfHostedChatProvider` / `isLocalProvider`)                                                                                                                                                                    | **ALLOW** (no cloud quota possible) |
++| `FREE_VERIFIED` | `freeType: "keyless"` reached through the genuine no-auth connection, **or** a `recurring-daily/monthly/uncapped` entry with `hardStopGuaranteed: true` (curated, source-cited provider terms: exceeding the allowance is refused/rate-limited, never billed) | **ALLOW**                           |
++| `FREE_UNKNOWN`  | recurring free tier without a hard-stop proof; keyless metadata reached through a real credentialed connection; no-auth connection with non-keyless metadata                                                                                                  | DENY                                |
++| `CREDIT_BACKED` | `one-time-initial` (signup/trial/AWS-style credits), `recurring-credit` (monthly credit grants)                                                                                                                                                               | DENY                                |
++| `NULL_COST`     | candidate with an explicitly null cost                                                                                                                                                                                                                        | DENY                                |
++| `UNKNOWN_COST`  | no catalog entry and no positive cost evidence (an uncatalogued zero price is _not_ evidence)                                                                                                                                                                 | DENY                                |
++| `PAID`          | known positive cost, no free entitlement                                                                                                                                                                                                                      | DENY                                |
++| `DISCONTINUED`  | entry withdrawn                                                                                                                                                                                                                                               | DENY                                |
++
++`AUTO_FREE_ALLOWED_COST_CLASSES` is exactly `{FREE_VERIFIED, SELF_HOSTED}` — asserted by test, so a
++future class can never be admitted silently.
++
++## 4. Quota telemetry: optimization, not gate (mission "strict policy design review")
++
++The previous strict policy required, for every non-keyless free candidate, a **fresh `SAFE` usage
++reading for the exact connection**. The R5 audit found `provider_quota_state` rows = 0, i.e. the
++policy would fail closed for routes that simply cannot be charged — the failure mode the mission
++forbids.
++
++Reconstructed semantics:
++
++| Telemetry for the connection                 | Result                                                                                                                           |
++| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
++| absent / stale / `UNKNOWN`                   | **kept** for a provably hard-free route (evidence: self-hosted, keyless no-auth endpoint, or catalog `hardStopGuaranteed: true`) |
++| fresh `SAFE`, remaining above the 1pp margin | kept, and the headroom is reported (`quotaStatus=SAFE`, `quotaRemaining`)                                                        |
++| fresh `SAFE`, remaining at/below the margin  | dropped (prefer a connection with headroom)                                                                                      |
++| `EXHAUSTED` (positive evidence)              | dropped — and `allowedConnectionIds` is narrowed so dispatch can never select it                                                 |
++
++Residual risk and containment: a credentialed account on a provider whose free tier is documented as
++no-card could in principle be a paid-plan account. The containment already in the runtime is the
++mitigation: any 402/403/quota failure calls `invalidateFreeAccessState()`
++(`src/sse/services/auth.ts::markAccountUnavailable`), so the next pool build excludes that
++connection, and 429s are absorbed by the existing connection cooldown and provider circuit breaker.
++No new fallback path, no paid route, no new enforcement point.
++
++## 5. R1.5 — catalog identity (exact, no substitution)
++
++The published identity is preserved byte-for-byte; the reconstruction never repairs one model by
++routing to another.
++
++| Published identity                                                                    | freeType             | hardStopGuaranteed | Sentinel class  | AUTO FREE                              |
++| ------------------------------------------------------------------------------------- | -------------------- | ------------------ | --------------- | -------------------------------------- |
++| `glm/glm-4.7-flash` (displayName "GLM-4.7-Flash", poolKey `zhipu-flash-free`, tos ok) | `recurring-uncapped` | absent             | `FREE_UNKNOWN`  | NO (`FREE_UNKNOWN_NO_HARD_STOP_PROOF`) |
++| `glm-cn/glm-4.7-flash` (same shape)                                                   | `recurring-uncapped` | absent             | `FREE_UNKNOWN`  | NO (`FREE_UNKNOWN_NO_HARD_STOP_PROOF`) |
++| `cloudflare-ai/@cf/zai-org/glm-4.7-flash`                                             | `recurring-daily`    | absent             | `FREE_UNKNOWN`  | NO                                     |
++| `cerebras/zai-glm-4.7` (a **different** model identity)                               | `recurring-daily`    | `true`             | `FREE_VERIFIED` | YES, on its own merits                 |
++| `bluesminds/glm-4.7`, `siliconflow/zai-org/GLM-4.7`                                   | recurring-*          | absent             | `FREE_UNKNOWN`  | NO                                     |
++| `deepinfra/zai-org/GLM-5.1`                                                           | `one-time-initial`   | —                  | `CREDIT_BACKED` | NO                                     |
++
++`AUTO_FREE_ELIGIBLE=NO` for `glm-4.7-flash` is a classification result, not a restriction: explicit
++and pinned requests (`zai/glm-4.7-flash` included) bypass the adaptive pool entirely and keep
++exactly their previous semantics.
++
++## 6. Test evidence
++
++```
++npx vitest run --config vitest.mcp.config.ts \
++  tests/unit/autoCombo/free-provider-sentinel-r1.test.ts \
++  tests/unit/autoCombo/strict-zero-cost-filter.test.ts \
++  tests/unit/autoCombo/strict-zero-cost-connection-safety.test.ts \
++  tests/unit/autoCombo/strict-zero-cost-autodiscovery.test.ts
++```
++
++| Run                                                                  | Result                                                                                   |
++| -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
++| before the contract rewrite (sentinel wired, old expectations)       | 8 failed / 23 passed — exactly the 8 predicted by-design flips, zero unexpected failures |
++| after the rewrite (pre-commit)                                       | 4 files / 56 tests passed                                                                |
++| after commit, on the committed revision (post prettier/eslint --fix) | 4 files / 56 tests passed                                                                |
++
++Suite sizes: `free-provider-sentinel-r1` 21, `strict-zero-cost-filter` 16,
++`strict-zero-cost-connection-safety` 14, `strict-zero-cost-autodiscovery` 5.
++
++By-design expectation flips (each documented in place with its rationale):
++`strict-zero-cost-filter` tests 7/8/9 (hard-stop route with absent / `UNKNOWN` / stale telemetry now
++admitted) + new compensating test proving an unproven entry with absent telemetry is still
++excluded; `strict-zero-cost-connection-safety` tests 1/3/4/5 and the single-connection case
++(missing telemetry no longer drops a hard-stop-verified connection; the unproven-entry case now
++carries the fail-closed guarantee, and `EXHAUSTED` still narrows/drops) + new tests for
++`SELF_HOSTED` (admitted with no catalog entry, resolver asserted never called) and for an arbitrary
++unlisted provider (still excluded, even with perfect telemetry).
++
++The new suite asserts the full matrix: class table, `AUTO_FREE_ALLOWED_COST_CLASSES`, keyless
++no-auth-only rule, no-auth metadata conflict fail-closed, credit-backed/paid/null-cost/unknown-cost
++denial, self-hosted admission without any quota read, headroom reporting, `EXHAUSTED` exclusion,
++multi-account narrowing only on negative evidence, catalog-driven discovery (same candidate,
++different catalog → different verdict), and no paid fallback.
++
++## 7. Gates
++
++| Gate               | Command                                                                                   | Result                                                                                                                                                                                                                         |
++| ------------------ | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
++| Tests              | `npx vitest run --config vitest.mcp.config.ts` (4 autoCombo suites)                       | **PASS** (4 files / 56 tests, exit 0)                                                                                                                                                                                          |
++| Typecheck (core)   | `npm run typecheck:core`                                                                  | **PASS** (exit 0)                                                                                                                                                                                                              |
++| Lint               | scoped `npx eslint` over the 7 files + pre-commit `lint-staged` (prettier + eslint --fix) | **PASS** (exit 0)                                                                                                                                                                                                              |
++| Open-sse typecheck | `npm run check:open-sse-typecheck`                                                        | `FAIL_PREEXISTING_NOT_R1` — one `src/app/api/v1/models/catalog.ts TS2367` error, reproduced identically with all R1 changes stashed (`git stash push -u` → same failure → `git stash pop`), i.e. present at upstream `dea6bb8` |
++| Build              | `npm run build`                                                                           | not run — deliberately out of R1 scope (no artifact in this phase)                                                                                                                                                             |
++
++Pre-commit hooks also ran and passed: docs-sync (version 3.8.50 consistency, 42 locales),
++`check:any-budget:t11` (no new explicit `any`), tracked-artifacts, secret scan.
++
++## 8. Environment notes
++
++- The clone was first installed with `pnpm install`, which is **not** this workspace's canonical
++  installer: it created an untracked `pnpm-lock.yaml`, rewrote the tracked `pnpm-workspace.yaml`
++  with placeholder `allowBuilds` entries, and produced three extra `TS2307` vendor typecheck
++  errors. All of that was reverted (`git checkout -- pnpm-workspace.yaml`, `rm -f pnpm-lock.yaml`)
++  and the environment was rebuilt with `npm ci` from the tracked `package-lock.json`
++  (exit 0, 2452 packages); the vendor `TS2307`s disappeared, confirming they were an
++  install-tree artifact and not a code change.
++- Pre-existing, not R1: 18 `npm audit` advisories (1 low, 9 moderate, 7 high, 1 critical);
++  a Vite `__dirname` `configLoader` warning from `vitest.mcp.config.ts:34`; the `catalog.ts`
++  `TS2367` baseline residue described above; `gitignored` `.env` regenerated by postinstall.
++
++## 9. Security and safety
++
++```
++SECRETS_EXPOSED=NO
++PAID_INFERENCE_TRIGGERED=NO
++PAID_SPEND_TRIGGERED_BY_R1=NO
++OPENCODE_TOUCHED=NO
++LIVE_20128_TOUCHED=NO
++PROVIDERS_DELETED=0
++CONNECTIONS_DELETED=0
++CREDENTIALS_DELETED=0
++```
++
++No secret was read, printed or committed; the staged diff was secret-scanned before commit
++(`sk-…` / `PRIVATE KEY` / assigned `api_key` patterns: clean). Tests are pure and offline — no
++provider request is made, no quota fetch is triggered, and the read-only candidate endpoint now
++uses the cache-only quota reader.
++
++## 10. Explicitly out of scope here
++
++R2 search, R3 vision/image, R4 quota/circuit/workload-isolation work, the release artifact build,
++promotion, deployment, live :20128 regression, the R1.11 canary and every client-side change are
++**not** part of this phase and were not started. The candidate is an isolated commit on
++`final/free-autopilot-2026-09-21`; production remains on the packaged `v3.8.50` runtime with the
++free policy untouched.
+-- 
+2.53.0
+
+
+From 2e10170e8a481ef40af4bdda9f0fb390eab96bc7 Mon Sep 17 00:00:00 2001
+From: StockNewsBR <264292956+StockNewsBR@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 18:24:50 -0300
+Subject: [PATCH 03/11] fix(omniroute): classify FREE_ONLY inspector candidates
+ by bare model id
+
+---
+ open-sse/handlers/autoComboCandidates.ts      | 14 +++++++++++++-
+ open-sse/services/autoCombo/virtualFactory.ts |  1 +
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/open-sse/handlers/autoComboCandidates.ts b/open-sse/handlers/autoComboCandidates.ts
+index 14ccc4aed..7e461f9f3 100644
+--- a/open-sse/handlers/autoComboCandidates.ts
++++ b/open-sse/handlers/autoComboCandidates.ts
+@@ -40,6 +40,7 @@ export interface AutoComboCandidateView {
+   provider: string;
+   connectionId: string;
+   model: string;
++  modelId: string;
+   modelStr: string;
+   excluded: boolean;
+   reachable: boolean;
+@@ -112,6 +113,7 @@ async function decorateCandidate(
+     provider: string;
+     connectionId: string;
+     model: string;
++    modelId: string;
+     modelStr: string;
+   },
+   freeOptions: FreeSentinelContext
+@@ -136,12 +138,20 @@ async function decorateCandidate(
+   }
+ 
+   const modelLocked = isModelLocked(candidate.provider, candidate.connectionId, candidate.model);
+-  const freeProjection = projectFreeEligibility(candidate, freeOptions);
++  const freeProjection = projectFreeEligibility(
++    {
++      provider: candidate.provider,
++      model: candidate.modelId,
++      connectionId: candidate.connectionId,
++    },
++    freeOptions
++  );
+ 
+   return {
+     provider: candidate.provider,
+     connectionId: candidate.connectionId,
+     model: candidate.model,
++    modelId: candidate.modelId,
+     modelStr: candidate.modelStr,
+     excluded: false,
+     reachable: breakerReachable && !connectionCooldown && !modelLocked,
+@@ -196,6 +206,7 @@ export async function getAutoComboCandidates(
+     connectionId: string | null;
+     allowedConnectionIds?: string[];
+     model: string;
++    modelId?: string;
+   }> = Array.isArray(virtualCombo?.models) ? virtualCombo.models : [];
+   // Routing keeps one logical provider/model candidate, but the management API
+   // remains account-oriented so operators can inspect and toggle each fallback.
+@@ -214,6 +225,7 @@ export async function getAutoComboCandidates(
+           provider: candidate.providerId,
+           connectionId: candidate.connectionId,
+           model: candidate.model,
++          modelId: candidate.modelId ?? candidate.model,
+           modelStr: candidate.model,
+         },
+         freeOptions
+diff --git a/open-sse/services/autoCombo/virtualFactory.ts b/open-sse/services/autoCombo/virtualFactory.ts
+index ccadba995..7c2d36e38 100644
+--- a/open-sse/services/autoCombo/virtualFactory.ts
++++ b/open-sse/services/autoCombo/virtualFactory.ts
+@@ -902,6 +902,7 @@ export async function createVirtualAutoComboFromPrepared(
+     id: `virtual-auto-${variant || "default"}-${index + 1}-${candidate.provider}`,
+     kind: "model" as const,
+     model: candidate.modelStr,
++    modelId: candidate.model,
+     providerId: candidate.provider,
+     connectionId: candidate.connectionId,
+     ...(candidate.allowedConnectionIds
+-- 
+2.53.0
+
+
+From 26066ca07fab180f7f39d58abc56efe03205e28e Mon Sep 17 00:00:00 2001
+From: StockNewsBR <264292956+StockNewsBR@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 18:25:46 -0300
+Subject: [PATCH 04/11] docs(omniroute): record final R1.11 isolated canary
+
+---
+ ...OMNIROUTE_FINAL_R1_11_CANARY_2026-09-21.md | 128 ++++++++++++++++++
+ 1 file changed, 128 insertions(+)
+ create mode 100644 docs/OMNIROUTE_FINAL_R1_11_CANARY_2026-09-21.md
+
+diff --git a/docs/OMNIROUTE_FINAL_R1_11_CANARY_2026-09-21.md b/docs/OMNIROUTE_FINAL_R1_11_CANARY_2026-09-21.md
+new file mode 100644
+index 000000000..4a1201607
+--- /dev/null
++++ b/docs/OMNIROUTE_FINAL_R1_11_CANARY_2026-09-21.md
+@@ -0,0 +1,128 @@
++# OmniRoute — Final Free Autopilot: R1.11 Isolated Canary (redo)
++
++Mission: `OMNIROUTE_FREE_AUTOPILOT_FINAL_RECONSTRUCTION_R1_11_R4_LIVE_CLOSURE_2026_09_21`
++Phase: 3B — R1.11 canary redo (isolated; NOT deployed; live :20128 untouched)
++Date: 2026-09-21
++Workspace: `/home/dcima/omniroute-final-free-autopilot-20260921`
++Branch: `final/free-autopilot-2026-09-21`
++
++```
++UPSTREAM_BASE_SHA=dea6bb8b6b64d3a3d9f639a044625c3452442c56
++R1_CANDIDATE_SHA=864ddc1d57871827ab2be3a9235bab5f8c12bc48
++R1_REPORT_COMMIT=3f4d1219b542cfcaf5c5991f7053eb8117632aa4
++R1_INSPECTOR_FIX_SHA=2e10170e8a481ef40af4bdda9f0fb390eab96bc7
++CANARY_PORT=22128
++CANARY_DATA_DIR=/tmp/omniroute-final-r1-11-canary
++CANARY_MODE=node scripts/dev/run-next.mjs start (source-tree production path, NEXT_DIST_DIR=.build/next)
++```
++
++The canary ran the candidate built with the canonical `npm run build` (exit 0, twice) and reused an
++isolated DATA_DIR/DB. Live `127.0.0.1:20128` remained LISTENING and untouched for the whole phase;
++no OpenCode/IAMM/StockNewsBR/Hermes/Harness file or credential was modified; no paid inference was
++issued anywhere (no credit-backed spend, PAID_SPEND=0).
++
++## 1. Gate matrix
++
++| Gate                          | Value                        | Evidence level                                                                                                                                                                                                                                                      |
++| ----------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
++| R1_11_CANARY                  | PASS                         | isolated canary, see below                                                                                                                                                                                                                                          |
++| CANARY_ONLY                   | YES                          | separate port + DATA_DIR; live listeners verified present throughout                                                                                                                                                                                                |
++| LIVE_20128_CHANGED            | NO                           | live service never restarted, no deploy, no settings/DB/key writes                                                                                                                                                                                                  |
++| FREE_VERIFIED_ALLOW           | PASS                         | live: 5 groq hard-stop models admitted with zero quota telemetry + 2 opencode / 5 felo-web keyless admitted                                                                                                                                                         |
++| SELF_HOSTED_ALLOW             | PASS                         | live: `ollama-local` candidate `SELF_HOSTED                                                                                                                                                                                                                         | eligible=true | SELF_HOSTED_NO_BILLING`; auto chat served by the local mock     |
++| FREE_UNKNOWN_DENY             | PASS                         | live: `glm-4.7-flash` → `FREE_UNKNOWN                                                                                                                                                                                                                               | false         | FREE_UNKNOWN_NO_HARD_STOP_PROOF`, excluded from the strict pool |
++| UNKNOWN_COST_DENY             | PASS                         | live: all uncatalogued models denied and removed in strict mode (openai 19, glm 16, groq 2, opencode 6 rows)                                                                                                                                                        |
++| NULL_COST_DENY                | PASS                         | unit: sentinel policy matrix (explicit null cost → `NULL_COST_EXCLUDED`)                                                                                                                                                                                            |
++| PAID_AUTO_DENY                | PASS                         | no paid-class candidate is admitted; `gpt-4o` → `UNKNOWN_COST_EXCLUDED`; strict pool contains only FREE_VERIFIED/SELF_HOSTED                                                                                                                                        |
++| CREDIT_BACKED_AUTO_DENY       | PASS                         | live: 3 agentrouter rows → `CREDIT_BACKED                                                                                                                                                                                                                           | false         | CREDIT_BACKED_EXCLUDED`, removed in strict mode                 |
++| PAID_AUTO_FALLBACK            | NO                           | strict-mode `auto` pool held 12 then 13 candidates, all FREE_VERIFIED/SELF_HOSTED                                                                                                                                                                                   |
++| MANUAL_PINNED_BYPASS          | PASS                         | live: pinned `ollama-local/mock-local-1` → HTTP 200 (explicit path unchanged)                                                                                                                                                                                       |
++| HEALTH_FILTER                 | PASS                         | live: an unhealthy/cooldown connection is dropped from the pool; the 429-locked model disappears and returns after recovery                                                                                                                                         |
++| QUOTA_FILTER                  | PASS                         | live: ABSENT/UNKNOWN telemetry no longer excludes a provably hard-free route; unit: EXHAUSTED/headroom/no-telemetry matrix green                                                                                                                                    |
++| CIRCUIT_BREAKER               | PASS_COMPONENT + live wiring | 52/52 native breaker tests green (half-open recovery, failure kinds, 429, ECONNREFUSED); live DB row `domain_circuit_breakers` for `ollama-local` (threshold 12, reset 30 s, halfOpen 1) is consulted by the read-only inspector. Live limitation documented in §3. |
++| COOLDOWN                      | PASS                         | live: forced 429 → `error_code 429.0`, `last_error_type rate_limited` ("Model mock-local-1 rate_limited"), candidate removed, subsequent calls failed fast (`503`, `503`)                                                                                           |
++| AUTO_RECOVERY                 | PASS                         | live: after the mock recovered, a call returned 200 and the candidate returned with intact eligibility                                                                                                                                                              |
++| STREAMING                     | PASS                         | live: SSE deltas (`canary-` + `mock-ok`), `finish_reason: stop`, `data: [DONE]`                                                                                                                                                                                     |
++| TOOL_CALLS                    | PASS                         | live: `finish_reason: tool_calls`, `tool_calls[0].function.name = canary_noop`, arguments `{"value":42}`                                                                                                                                                            |
++| OPENAI_COMPAT                 | PASS                         | live: OpenAI chat-completions request/response schema honored (non-stream + stream + tools)                                                                                                                                                                         |
++| CANDIDATE_ENDPOINT_CACHE_ONLY | PASS                         | live: repeated candidate reads produced no provider requests (mock request log clean)                                                                                                                                                                               |
++
++Gate detail for the policy matrix (canary :22128):
++
++- strict mode, `GET /api/v1/auto-combo/auto/candidates` → 12→13 rows, every row
++  `FREE_VERIFIED | eligible=true | reachable=true | breakerState=CLOSED`, reasons
++  `HARD_STOP_FREE_TIER_VERIFIED` (5 groq) or `KEYLESS_HARD_FREE_ENDPOINT` (2 opencode + 5 felo-web),
++  plus `ollama-local | SELF_HOSTED | SELF_HOSTED_NO_BILLING` once its model was synced.
++- `freeAccessPolicy=off` → 59 rows with per-class labels: agentrouter `CREDIT_BACKED`;
++  glm `FREE_UNKNOWN` (glm-4.7-flash) + `UNKNOWN_COST`; groq `FREE_VERIFIED` + `UNKNOWN_COST`;
++  openai `UNKNOWN_COST`; opencode `FREE_VERIFIED` + `UNKNOWN_COST`; felo-web `FREE_VERIFIED`.
++- strict mode again → only the FREE_VERIFIED/SELF_HOSTED rows survive; every denied class is removed.
++
++## 2. Findings (all real, none inferred)
++
++- **F1 — R1 inspector defect (found by this canary, fixed in `2e10170e8`).** The read-only
++  inspector classified candidates with the provider-prefixed routing id (`groq/llama-3.3-70b-versatile`)
++  instead of the bare catalog id (`llama-3.3-70b-versatile`), so every row rendered
++  `UNKNOWN_COST_EXCLUDED`. The dispatch-side strict filter was always correct — the strict pool kept
++  exactly the catalog-proven routes even before the fix. Fix: `virtualFactory` now exposes
++  `modelId: candidate.model` on built config entries and `autoComboCandidates` classifies with it.
++  Regression suites green after the fix.
++- **F2 — exact-identity matching is upstream behavior.** `git show dea6bb8b6:…/strictZeroCostFilter.ts`
++  shows `findBudgetEntry` comparing `provider` + `modelId` exactly, with no prefix normalization, so
++  the reconstruction preserves upstream semantics; classification must use the bare id (see F1).
++- **F3 — static no-auth keyless ids carry route prefixes** (`oc/…`, `felo/…`) while the catalog uses
++  bare ids; the dispatch pool resolves them correctly (2 opencode + 5 felo-web survive strict mode).
++- **F4 — self-hosted connections need a placeholder apiKey in this build.** The pool credential filter
++  requires a credential (apiKey/OAuth/web-session) or a `*-compatible-*` provider id, so a
++  credential-less `ollama-local` connection was dropped before policy admission. Patching the
++  documented placeholder (`sk-no-key-required`) surfaced the candidate as `SELF_HOSTED`. Not a policy
++  defect; worth an operator note.
++- **F5 — provider breaker could not be forced OPEN from the canary.** 16 consecutive forced 500s
++  updated `last_failure_time` but left `failure_count=0`, `lastFailureKind=null`,
++  `openCycleCount=0`; the component contract itself is verified by the native test suite (52/52).
++
++## 3. Resilience detail
++
++- 429 path (live): `echo 429 > mock-fail-mode` → call 1 `429` → calls 2-3 `503` (fail-fast, no retry
++  storm) → candidate removed from the pool → DB records `429.0 / rate_limited`.
++- Recovery (live): failure mode cleared → `200` → candidate returns with `SELF_HOSTED | eligible=true`.
++- Breaker (component): `tests/unit/provider-breaker-halfopen-recovery.test.ts`,
++  `circuit-breaker-failure-kind.test.ts`, `resilience-settings-upstream429-breaker.test.ts`,
++  `circuit-breaker-abort-provider-trip-7907.test.ts`, `8376-econnrefused-breaker.test.ts`,
++  `breaker-network-error-guard.test.ts` → 52 tests, 52 pass, exit 0.
++- Quota semantics (unit): `free-provider-sentinel-r1.test.ts` covers absent/stale/UNKNOWN telemetry,
++  fresh SAFE with/without headroom, EXHAUSTED narrowing and multi-account allowlist rewrites.
++
++## 4. Test evidence for this phase
++
++- autoCombo suites (`vitest.mcp.config.ts`): 4 files / 56 tests PASS (pre-fix and post-fix).
++- circuit-breaker component suites (`node --test`): 6 files / 52 tests PASS.
++- `npm run typecheck:core`: PASS. `npm run check:open-sse-typecheck`: only the pre-existing
++  `src/app/api/v1/models/catalog.ts TS2367` baseline error (proven pre-existing at `dea6bb8b6` via the
++  stash experiment) — no new candidate type error.
++- scoped ESLint + lint-staged (prettier/eslint --fix) PASS on every committed change.
++
++## 5. Data-safety statement
++
++```
++SECRETS_EXPOSED=NO
++PAID_INFERENCE_TRIGGERED=NO
++PROVIDERS_DELETED=0
++CONNECTIONS_DELETED=0
++CREDENTIALS_DELETED=0
++OPENCODE_CHANGED=NO
++LIVE_20128_CHANGED=NO
++```
++
++All synthetic providers/connections/keys live exclusively inside the isolated canary DATA_DIR
++(`/tmp/omniroute-final-r1-11-canary`) and the canary-only harness (`/tmp/omniroute-canary-harness`).
++No canary artifact was promoted anywhere; live production remains packaged v3.8.50 (`BUILD_SHA=dea6bb8`)
++with its settings untouched.
++
++## 6. Verdict
++
++`R1_11_CANARY=PASS` and `R1_11_REDONE=YES` for the policy surface: dynamic FREE_ONLY admission,
++the full cost-class matrix, SELF_HOSTED admission, pinned bypass, streaming/tool/OpenAI compatibility
++and the live cooldown/fail-fast/recovery path are all proven on an isolated canary running the clean
++candidate, with the two limitations documented above (F4 operator note; F5 live breaker opening not
++forceable — component contract verified by 52/52 native tests).
+-- 
+2.53.0
+
+
+From af44c10b595cbe36d3e1168a9918d7f857ce5862 Mon Sep 17 00:00:00 2001
+From: StockNewsBR <264292956+StockNewsBR@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 18:33:57 -0300
+Subject: [PATCH 05/11] feat(omniroute): reconstruct dynamic FREE_ONLY search
+ routing
+
+---
+ open-sse/services/searchFreeRouting.ts | 293 +++++++++++++++++++
+ src/app/api/v1/search/route.ts         | 133 ++++++++-
+ tests/unit/search-free-routing.test.ts | 371 +++++++++++++++++++++++++
+ 3 files changed, 796 insertions(+), 1 deletion(-)
+ create mode 100644 open-sse/services/searchFreeRouting.ts
+ create mode 100644 tests/unit/search-free-routing.test.ts
+
+diff --git a/open-sse/services/searchFreeRouting.ts b/open-sse/services/searchFreeRouting.ts
+new file mode 100644
+index 000000000..4e2421202
+--- /dev/null
++++ b/open-sse/services/searchFreeRouting.ts
+@@ -0,0 +1,293 @@
++/**
++ * FREE_ONLY search routing for `POST /v1/search`.
++ *
++ * Search counterpart to the model-side FREE_ONLY admission in
++ * `autoCombo/freeProviderSentinel.ts`: it does NOT open a parallel search
++ * gateway — the native route keeps owning credentials, cache and execution —
++ * it only (a) classifies the search providers already declared in
++ * `SEARCH_PROVIDERS` from their registry metadata (cost + quota + auth),
++ * (b) orders the eligible free providers into a bounded chain, and (c) provides
++ * the deterministic quality gate and URL dedup applied to each leg.
++ *
++ * Free eligibility is metadata-only and shortlist-free: any provider that is
++ * provably no-cost (FREE_VERIFIED) or self-hosted (SELF_HOSTED) is eligible;
++ * paid / credit-backed / unknown-cost / free-unknown providers never are.
++ */
++import {
++  isUnconfiguredLoopbackSearchProvider,
++  supportsSearchType,
++  type SearchProviderConfig,
++} from "../config/searchRegistry.ts";
++import type { FreeCostClass } from "./autoCombo/freeProviderSentinel.ts";
++import type { SearchResult } from "../handlers/search.ts";
++
++/** Provider selector that opts a `/v1/search` request into FREE_ONLY routing. */
++export const FREE_ONLY_SEARCH_SELECTOR = "auto/search:free";
++
++/** Terminal error when no eligible free provider remains — never a paid fallback. */
++export const NO_FREE_SEARCH_PROVIDER_AVAILABLE = "NO_FREE_SEARCH_PROVIDER_AVAILABLE";
++
++/** Circuit-breaker name namespace so search legs never collide with model legs. */
++export const FREE_SEARCH_BREAKER_PREFIX = "search:";
++
++export type SearchFreeStatus = FreeCostClass;
++
++export const FREE_ELIGIBLE_SEARCH_STATUSES: readonly SearchFreeStatus[] = [
++  "FREE_VERIFIED",
++  "SELF_HOSTED",
++];
++
++const SELF_HOSTED_HOST_PREFIXES = [
++  "localhost",
++  "127.",
++  "10.",
++  "192.168.",
++  "0.0.0.0",
++  "::1",
++  "[::1]",
++] as const;
++
++const SELF_HOSTED_HOST_SUFFIXES = [".local", ".internal", ".localhost"] as const;
++
++function isPrivateIpv4(host: string): boolean {
++  if (!host.startsWith("172.")) return false;
++  const second = Number(host.split(".")[1]);
++  return Number.isFinite(second) && second >= 16 && second <= 31;
++}
++
++export function isSelfHostedBaseUrl(baseUrl: string | undefined | null): boolean {
++  if (!baseUrl || typeof baseUrl !== "string") return false;
++  let host = "";
++  try {
++    host = new URL(baseUrl).hostname.toLowerCase();
++  } catch {
++    host =
++      baseUrl
++        .trim()
++        .toLowerCase()
++        .replace(/^[a-z]+:\/\//, "")
++        .split("/")[0]
++        ?.split(":")[0] ?? "";
++  }
++  if (!host) return false;
++  if (isPrivateIpv4(host)) return true;
++  return (
++    SELF_HOSTED_HOST_PREFIXES.some((prefix) => host === prefix || host.startsWith(prefix)) ||
++    SELF_HOSTED_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix))
++  );
++}
++
++export function classifySearchProviderFreeStatus(
++  provider: Pick<SearchProviderConfig, "baseUrl" | "authType" | "costPerQuery" | "freeMonthlyQuota">
++): SearchFreeStatus {
++  const cost = provider.costPerQuery;
++  if (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0) return "UNKNOWN_COST";
++  if (cost === 0) {
++    if (isSelfHostedBaseUrl(provider.baseUrl)) return "SELF_HOSTED";
++    if (provider.authType === "none") return "FREE_VERIFIED";
++    return (provider.freeMonthlyQuota ?? 0) > 0 ? "FREE_VERIFIED" : "FREE_UNKNOWN";
++  }
++  return (provider.freeMonthlyQuota ?? 0) > 0 ? "CREDIT_BACKED" : "PAID";
++}
++
++export function isFreeEligibleStatus(status: SearchFreeStatus): boolean {
++  return FREE_ELIGIBLE_SEARCH_STATUSES.includes(status);
++}
++
++export interface FreeSearchChainEntry {
++  config: SearchProviderConfig;
++  freeStatus: SearchFreeStatus;
++}
++
++export function buildFreeSearchChain(
++  providers: readonly SearchProviderConfig[],
++  options: { searchType: string; isBlocked?: (providerId: string) => boolean }
++): FreeSearchChainEntry[] {
++  const isBlocked = options.isBlocked ?? (() => false);
++  const ordered: Array<FreeSearchChainEntry & { order: number }> = [];
++  providers.forEach((config, order) => {
++    if (config.disabled) return;
++    if (!supportsSearchType(config, options.searchType)) return;
++    if (isBlocked(config.id)) return;
++    if (isUnconfiguredLoopbackSearchProvider(config)) return;
++    const freeStatus = classifySearchProviderFreeStatus(config);
++    if (!isFreeEligibleStatus(freeStatus)) return;
++    ordered.push({ config, freeStatus, order });
++  });
++  ordered.sort(
++    (a, b) =>
++      Number(Boolean(a.config.fallbackOnly)) - Number(Boolean(b.config.fallbackOnly)) ||
++      (a.config.costPerQuery ?? Number.POSITIVE_INFINITY) -
++        (b.config.costPerQuery ?? Number.POSITIVE_INFINITY) ||
++      a.order - b.order
++  );
++  return ordered.map(({ config, freeStatus }) => ({ config, freeStatus }));
++}
++
++export interface SearchQualityAssessment {
++  valid: boolean;
++  resultCount: number;
++  validUrlCount: number;
++  freshnessCount: number;
++  reason?: "empty" | "no-valid-urls";
++}
++
++export function isValidResultUrl(url: unknown): boolean {
++  if (typeof url !== "string" || url.trim() === "") return false;
++  try {
++    const parsed = new URL(url);
++    return parsed.protocol === "http:" || parsed.protocol === "https:";
++  } catch {
++    return false;
++  }
++}
++
++export function assessSearchResultQuality(
++  data: { results?: unknown } | null | undefined
++): SearchQualityAssessment {
++  const results = Array.isArray(data?.results) ? (data?.results as SearchResult[]) : [];
++  if (results.length === 0) {
++    return { valid: false, resultCount: 0, validUrlCount: 0, freshnessCount: 0, reason: "empty" };
++  }
++  let validUrlCount = 0;
++  let freshnessCount = 0;
++  for (const result of results) {
++    if (isValidResultUrl((result as { url?: unknown })?.url)) validUrlCount += 1;
++    const published = (result as { published_at?: unknown })?.published_at;
++    if (typeof published === "string" && published.trim() !== "") freshnessCount += 1;
++  }
++  if (validUrlCount === 0) {
++    return {
++      valid: false,
++      resultCount: results.length,
++      validUrlCount,
++      freshnessCount,
++      reason: "no-valid-urls",
++    };
++  }
++  return { valid: true, resultCount: results.length, validUrlCount, freshnessCount };
++}
++
++export function normalizeResultUrl(url: string): string {
++  const trimmed = url.trim();
++  if (!trimmed) return "";
++  try {
++    const parsed = new URL(trimmed);
++    const protocol = parsed.protocol.toLowerCase();
++    const host = parsed.hostname.toLowerCase();
++    const port = parsed.port ? `:${parsed.port}` : "";
++    const pathname = parsed.pathname.replace(/\/+$/, "");
++    return `${protocol}//${host}${port}${pathname}${parsed.search}`;
++  } catch {
++    return trimmed.toLowerCase();
++  }
++}
++
++export function dedupeSearchResults<T extends { url?: string }>(results: readonly T[]): T[] {
++  const seen = new Set<string>();
++  const deduped: T[] = [];
++  for (const result of results) {
++    const key = normalizeResultUrl(String(result?.url ?? ""));
++    if (!key) continue;
++    if (seen.has(key)) continue;
++    seen.add(key);
++    deduped.push(result);
++  }
++  return deduped;
++}
++
++export type FreeSearchLegOutcome =
++  | { kind: "ok"; data: { results?: SearchResult[]; [key: string]: unknown } }
++  | { kind: "empty" }
++  | { kind: "failed"; error: string; status?: number }
++  | { kind: "skipped"; reason: "no-credentials" | "rate-limited" | "circuit-open" };
++
++export interface FreeSearchLegAttempt {
++  providerId: string;
++  outcome: "ok" | "empty" | "failed" | "skipped" | "quality-failed";
++  skipReason?: string;
++  error?: string;
++}
++
++export interface FreeSearchChainOutcome {
++  ok: boolean;
++  providerId?: string;
++  data?: { results?: SearchResult[]; [key: string]: unknown };
++  attempts: FreeSearchLegAttempt[];
++  allRateLimited: boolean;
++  exhausted: boolean;
++}
++
++export interface FreeSearchChainDeps {
++  executeLeg: (entry: FreeSearchChainEntry) => Promise<FreeSearchLegOutcome>;
++  assessQuality?: (data: { results?: unknown }) => SearchQualityAssessment;
++  dedupe?: <T extends { url?: string }>(results: readonly T[]) => T[];
++}
++
++/**
++ * Runs one bounded pass over the ordered free chain: every provider is tried at
++ * most once, a leg only wins when it returns data that passes the deterministic
++ * quality gate, and the runner never escalates outside the chain it was given
++ * (the route builds that chain exclusively from FREE_VERIFIED / SELF_HOSTED
++ * providers, so a paid provider can never be reached from here).
++ */
++export async function runFreeSearchChain(
++  chain: readonly FreeSearchChainEntry[],
++  deps: FreeSearchChainDeps
++): Promise<FreeSearchChainOutcome> {
++  const assessQuality = deps.assessQuality ?? assessSearchResultQuality;
++  const dedupe = deps.dedupe ?? dedupeSearchResults;
++  const attempts: FreeSearchLegAttempt[] = [];
++  let rateLimitedOnly = chain.length > 0;
++
++  for (const entry of chain) {
++    const outcome = await deps.executeLeg(entry);
++
++    if (outcome.kind === "ok") {
++      const quality = assessQuality(outcome.data);
++      if (quality.valid) {
++        const results = dedupe((outcome.data?.results ?? []) as Array<{ url?: string }>);
++        attempts.push({ providerId: entry.config.id, outcome: "ok" });
++        return {
++          ok: true,
++          providerId: entry.config.id,
++          data: { ...outcome.data, results: results as SearchResult[] },
++          attempts,
++          allRateLimited: false,
++          exhausted: false,
++        };
++      }
++      attempts.push({
++        providerId: entry.config.id,
++        outcome: "quality-failed",
++        error: quality.reason,
++      });
++      rateLimitedOnly = false;
++      continue;
++    }
++
++    if (outcome.kind === "skipped") {
++      attempts.push({
++        providerId: entry.config.id,
++        outcome: "skipped",
++        skipReason: outcome.reason,
++      });
++      if (outcome.reason !== "rate-limited") rateLimitedOnly = false;
++      continue;
++    }
++
++    attempts.push({
++      providerId: entry.config.id,
++      outcome: outcome.kind,
++      error: outcome.kind === "failed" ? outcome.error : undefined,
++    });
++    rateLimitedOnly = false;
++  }
++
++  return {
++    ok: false,
++    attempts,
++    allRateLimited: rateLimitedOnly && attempts.length > 0,
++    exhausted: true,
++  };
++}
+diff --git a/src/app/api/v1/search/route.ts b/src/app/api/v1/search/route.ts
+index ceb78643e..99cc6c80e 100644
+--- a/src/app/api/v1/search/route.ts
++++ b/src/app/api/v1/search/route.ts
+@@ -1,4 +1,12 @@
+-import { handleSearch } from "@omniroute/open-sse/handlers/search.ts";
++import { handleSearch, type SearchResult } from "@omniroute/open-sse/handlers/search.ts";
++import {
++  FREE_ONLY_SEARCH_SELECTOR,
++  FREE_SEARCH_BREAKER_PREFIX,
++  NO_FREE_SEARCH_PROVIDER_AVAILABLE,
++  buildFreeSearchChain,
++  runFreeSearchChain,
++} from "@omniroute/open-sse/services/searchFreeRouting.ts";
++import { getCircuitBreaker } from "@/shared/utils/circuitBreaker";
+ import {
+   getProviderCredentialsWithQuotaPreflight,
+   extractApiKey,
+@@ -142,6 +150,129 @@ async function postHandler(request: Request, context: unknown) {
+   const settings = await getSettings().catch(() => ({}) as any);
+   const blockedProviders = settings?.blockedProviders || [];
+ 
++  // FREE_ONLY search routing — `auto/search:free` can only ever reach providers
++  // classified FREE_VERIFIED or SELF_HOSTED; the bounded chain below never
++  // escalates to a paid/credit-backed/unknown-cost provider.
++  if (body.provider === FREE_ONLY_SEARCH_SELECTOR) {
++    const freeChain = buildFreeSearchChain(Object.values(SEARCH_PROVIDERS), {
++      searchType: body.search_type,
++      isBlocked: (providerId) => isProviderBlockedByIdOrAlias(providerId, blockedProviders),
++    });
++    const firstFree = freeChain[0];
++    if (!firstFree) {
++      return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, NO_FREE_SEARCH_PROVIDER_AVAILABLE);
++    }
++
++    const requestedMax = body.max_results ?? firstFree.config.defaultMaxResults;
++    const freeCacheKey = computeCacheKey(
++      body.query,
++      FREE_ONLY_SEARCH_SELECTOR,
++      body.search_type,
++      Math.min(requestedMax, firstFree.config.maxMaxResults),
++      body.country,
++      body.language,
++      {
++        filters: body.filters,
++        offset: body.offset,
++        time_range: body.time_range,
++        content: body.content,
++        provider_options: body.provider_options,
++      }
++    );
++    const freeTtl = firstFree.config.cacheTTLMs ?? SEARCH_CACHE_DEFAULT_TTL_MS;
++
++    let freeCached = true;
++    try {
++      const freeData = await getOrCoalesce(freeCacheKey, freeTtl, async () => {
++        freeCached = false;
++        const outcome = await runFreeSearchChain(freeChain, {
++          executeLeg: async (entry) => {
++            const legCredentials = await resolveSearchExecutionCredentials(entry.config);
++            if (!legCredentials) {
++              return { kind: "skipped", reason: "no-credentials" };
++            }
++            if (isAllRateLimitedCredentials(legCredentials)) {
++              return { kind: "skipped", reason: "rate-limited" };
++            }
++            const breaker = getCircuitBreaker(`${FREE_SEARCH_BREAKER_PREFIX}${entry.config.id}`, {
++              failureThreshold: 3,
++              resetTimeout: 30_000,
++            });
++            if (!breaker.canExecute()) {
++              return { kind: "skipped", reason: "circuit-open" };
++            }
++
++            const legResult = await handleSearch({
++              query: body.query,
++              provider: entry.config.id,
++              maxResults: Math.min(requestedMax, entry.config.maxMaxResults),
++              searchType: body.search_type,
++              country: body.country,
++              language: body.language,
++              timeRange: body.time_range,
++              offset: body.offset,
++              domainFilter: buildDomainFilter(body.filters),
++              contentOptions: body.content,
++              strictFilters: body.strict_filters,
++              providerOptions: body.provider_options,
++              credentials: legCredentials,
++              log,
++              connectionId: legCredentials.connectionId || undefined,
++              apiKeyId: policy.apiKeyInfo?.id || undefined,
++            });
++            if (!legResult.success) {
++              return {
++                kind: "failed",
++                error: legResult.error || "Search failed",
++                status: legResult.status,
++              };
++            }
++            const legResults = (legResult.data as { results?: unknown[] } | undefined)?.results;
++            if (!Array.isArray(legResults) || legResults.length === 0) {
++              return { kind: "empty" };
++            }
++            return { kind: "ok", data: legResult.data as { results?: SearchResult[] } };
++          },
++        });
++
++        if (!outcome.ok) {
++          throw new SearchError(
++            NO_FREE_SEARCH_PROVIDER_AVAILABLE,
++            outcome.allRateLimited ? HTTP_STATUS.TOO_MANY_REQUESTS : HTTP_STATUS.SERVICE_UNAVAILABLE
++          );
++        }
++        return outcome.data;
++      });
++
++      const response = {
++        id: `search-${crypto.randomUUID()}`,
++        ...freeData,
++        cached: freeCached,
++        usage: freeCached ? { queries_used: 0, search_cost_usd: 0 } : freeData.usage,
++      };
++
++      return new Response(JSON.stringify(response), {
++        status: 200,
++        headers: { "Content-Type": "application/json", ...CORS_HEADERS },
++      });
++    } catch (err: unknown) {
++      if (err instanceof SearchError) {
++        const errorPayload = toJsonErrorPayload(err.message, "Search provider error");
++        return new Response(JSON.stringify(errorPayload), {
++          status: err.statusCode,
++          headers: { "Content-Type": "application/json", ...CORS_HEADERS },
++        });
++      }
++      const message = err instanceof Error ? err.message : String(err);
++      log.error("SEARCH", `Unexpected free-search error: ${message}`);
++      const errorPayload = toJsonErrorPayload(message, "Internal search error");
++      return new Response(JSON.stringify(errorPayload), {
++        status: 500,
++        headers: { "Content-Type": "application/json", ...CORS_HEADERS },
++      });
++    }
++  }
++
+   // Resolve provider and credentials
+   if (body.provider) {
+     if (isProviderBlockedByIdOrAlias(body.provider, blockedProviders)) {
+diff --git a/tests/unit/search-free-routing.test.ts b/tests/unit/search-free-routing.test.ts
+new file mode 100644
+index 000000000..1607e2005
+--- /dev/null
++++ b/tests/unit/search-free-routing.test.ts
+@@ -0,0 +1,371 @@
++/**
++ * R2 reconstruction — FREE_ONLY search routing: metadata-only cost classification,
++ * dynamic discovery, deterministic quality gate and the bounded free→free chain.
++ *
++ * Node:test scope: top-level tests/unit/*.test.ts runs under the built-in runner
++ * (tests/unit/autoCombo/** is the vitest-only scope).
++ */
++import { test } from "node:test";
++import assert from "node:assert/strict";
++
++import type { SearchProviderConfig } from "../../open-sse/config/searchRegistry.ts";
++import {
++  FREE_ELIGIBLE_SEARCH_STATUSES,
++  NO_FREE_SEARCH_PROVIDER_AVAILABLE,
++  assessSearchResultQuality,
++  buildFreeSearchChain,
++  classifySearchProviderFreeStatus,
++  dedupeSearchResults,
++  isFreeEligibleStatus,
++  isSelfHostedBaseUrl,
++  normalizeResultUrl,
++  runFreeSearchChain,
++  type FreeSearchChainEntry,
++  type SearchFreeStatus,
++} from "../../open-sse/services/searchFreeRouting.ts";
++
++function provider(overrides: Partial<SearchProviderConfig> & { id: string }): SearchProviderConfig {
++  const { id, ...rest } = overrides;
++  return {
++    id,
++    name: id,
++    baseUrl: `https://${id}.example.com/search`,
++    method: "POST",
++    authType: "apikey",
++    authHeader: "authorization",
++    costPerQuery: 0,
++    freeMonthlyQuota: 1000,
++    searchTypes: ["web"],
++    defaultMaxResults: 5,
++    maxMaxResults: 100,
++    timeoutMs: 10_000,
++    cacheTTLMs: 60_000,
++    ...rest,
++  };
++}
++
++function entry(config: SearchProviderConfig): FreeSearchChainEntry {
++  return { config, freeStatus: classifySearchProviderFreeStatus(config) };
++}
++
++test("classification: cost and auth evidence decide the free status", () => {
++  const base = { baseUrl: "https://x.test/search", freeMonthlyQuota: 0 } as const;
++  assert.equal(
++    classifySearchProviderFreeStatus({ ...base, authType: "none", costPerQuery: 0 }),
++    "FREE_VERIFIED"
++  );
++  assert.equal(
++    classifySearchProviderFreeStatus({
++      ...base,
++      authType: "apikey",
++      costPerQuery: 0,
++      freeMonthlyQuota: 1000,
++    }),
++    "FREE_VERIFIED"
++  );
++  assert.equal(
++    classifySearchProviderFreeStatus({ ...base, authType: "apikey", costPerQuery: 0 }),
++    "FREE_UNKNOWN"
++  );
++  assert.equal(
++    classifySearchProviderFreeStatus({
++      ...base,
++      authType: "apikey",
++      costPerQuery: 0.001,
++      freeMonthlyQuota: 2500,
++    }),
++    "CREDIT_BACKED"
++  );
++  assert.equal(
++    classifySearchProviderFreeStatus({
++      ...base,
++      authType: "apikey",
++      costPerQuery: 0.005,
++      freeMonthlyQuota: 0,
++    }),
++    "PAID"
++  );
++  assert.equal(
++    classifySearchProviderFreeStatus({
++      ...base,
++      authType: "apikey",
++      costPerQuery: 0,
++      baseUrl: "http://localhost:8888/search",
++    }),
++    "SELF_HOSTED"
++  );
++  assert.equal(
++    classifySearchProviderFreeStatus({ ...base, authType: "none", costPerQuery: Number.NaN }),
++    "UNKNOWN_COST"
++  );
++  assert.equal(
++    classifySearchProviderFreeStatus({ ...base, authType: "none", costPerQuery: -1 }),
++    "UNKNOWN_COST"
++  );
++});
++
++test("self-hosted detection covers loopback, private ranges and internal suffixes", () => {
++  const selfHosted = [
++    "http://localhost:8888/search",
++    "http://127.0.0.1:8080/v1",
++    "http://0.0.0.0:8080/search",
++    "http://[::1]:1234/search",
++    "http://10.1.2.3/search",
++    "http://192.168.0.9/search",
++    "http://172.20.5.5/search",
++    "http://searx.internal/search",
++    "http://box.local/search",
++  ];
++  for (const url of selfHosted) {
++    assert.equal(isSelfHostedBaseUrl(url), true, `${url} must be self-hosted`);
++  }
++  assert.equal(isSelfHostedBaseUrl("https://api.example.com/search"), false);
++  assert.equal(isSelfHostedBaseUrl(undefined), false);
++});
++
++test("eligibility is exactly FREE_VERIFIED plus SELF_HOSTED", () => {
++  assert.deepEqual([...FREE_ELIGIBLE_SEARCH_STATUSES], ["FREE_VERIFIED", "SELF_HOSTED"]);
++  const denied: SearchFreeStatus[] = [
++    "FREE_UNKNOWN",
++    "UNKNOWN_COST",
++    "NULL_COST",
++    "PAID",
++    "CREDIT_BACKED",
++    "DISCONTINUED",
++  ];
++  for (const status of denied) {
++    assert.equal(isFreeEligibleStatus(status), false, `${status} must not be auto-eligible`);
++  }
++});
++
++test("chain: discovery filters non-free, blocked, unsupported, disabled and unconfigured-loopback providers", () => {
++  const providers = [
++    provider({ id: "paid-search", costPerQuery: 0.01, freeMonthlyQuota: 0 }),
++    provider({ id: "credit-search", costPerQuery: 0.005, freeMonthlyQuota: 1000 }),
++    provider({ id: "unknown-search", costPerQuery: 0, freeMonthlyQuota: 0 }),
++    provider({ id: "disabled-free", authType: "none", freeMonthlyQuota: 0, disabled: true }),
++    provider({
++      id: "news-only-free",
++      authType: "none",
++      freeMonthlyQuota: 0,
++      searchTypes: ["news"],
++    }),
++    provider({ id: "blocked-free", authType: "none", freeMonthlyQuota: 0 }),
++    provider({
++      id: "searxng-search",
++      baseUrl: "http://localhost:8888/search",
++      authType: "apikey",
++      freeMonthlyQuota: 0,
++    }),
++    provider({ id: "plain-free", authType: "none", freeMonthlyQuota: 0 }),
++  ];
++  const chain = buildFreeSearchChain(providers, {
++    searchType: "web",
++    isBlocked: (id) => id === "blocked-free",
++  });
++  assert.deepEqual(
++    chain.map((item) => item.config.id),
++    ["plain-free"]
++  );
++  for (const item of chain) {
++    assert.equal(isFreeEligibleStatus(item.freeStatus), true);
++  }
++});
++
++test("chain: ordering keeps non-fallbackOnly providers first, then registry order", () => {
++  const chain = buildFreeSearchChain(
++    [
++      provider({ id: "fallback-free", authType: "none", freeMonthlyQuota: 0, fallbackOnly: true }),
++      provider({ id: "alpha-free", authType: "none", freeMonthlyQuota: 0 }),
++      provider({ id: "beta-free", authType: "none", freeMonthlyQuota: 0 }),
++    ],
++    { searchType: "web" }
++  );
++  assert.deepEqual(
++    chain.map((item) => item.config.id),
++    ["alpha-free", "beta-free", "fallback-free"]
++  );
++});
++
++test("quality gate: empty, url-less and healthy result sets", () => {
++  assert.deepEqual(assessSearchResultQuality(undefined), {
++    valid: false,
++    resultCount: 0,
++    validUrlCount: 0,
++    freshnessCount: 0,
++    reason: "empty",
++  });
++  const noUrls = assessSearchResultQuality({ results: [{ title: "no url here" }] });
++  assert.equal(noUrls.valid, false);
++  assert.equal(noUrls.reason, "no-valid-urls");
++  const healthy = assessSearchResultQuality({
++    results: [
++      { url: "https://a.test/one", published_at: "2026-09-01" },
++      { url: "http://b.test/two" },
++    ],
++  });
++  assert.equal(healthy.valid, true);
++  assert.equal(healthy.resultCount, 2);
++  assert.equal(healthy.validUrlCount, 2);
++  assert.equal(healthy.freshnessCount, 1);
++});
++
++test("url normalization strips hashes and trailing slashes and dedupe keeps the first hit", () => {
++  assert.equal(
++    normalizeResultUrl("https://Example.com:8443/Path/#frag"),
++    "https://example.com:8443/Path"
++  );
++  const deduped = dedupeSearchResults([
++    { url: "https://a.test/x/" },
++    { url: "https://A.test/x" },
++    { url: "https://a.test/x#fragment" },
++    { url: "https://b.test/y" },
++  ]);
++  assert.deepEqual(
++    deduped.map((item) => item.url),
++    ["https://a.test/x/", "https://b.test/y"]
++  );
++});
++
++test("failover: the bounded chain stops at the first quality-passing free leg", async () => {
++  const attempts: string[] = [];
++  const outcome = await runFreeSearchChain(
++    [
++      entry(provider({ id: "leg-a", authType: "none", freeMonthlyQuota: 0 })),
++      entry(provider({ id: "leg-b", authType: "none", freeMonthlyQuota: 0 })),
++      entry(provider({ id: "leg-c", authType: "none", freeMonthlyQuota: 0 })),
++    ],
++    {
++      executeLeg: async (item) => {
++        attempts.push(item.config.id);
++        if (item.config.id === "leg-a") {
++          return { kind: "failed", error: "upstream 503", status: 503 };
++        }
++        return { kind: "ok", data: {} };
++      },
++      dedupe: (results) => results,
++      assessQuality: () => ({ valid: true, resultCount: 1, validUrlCount: 1, freshnessCount: 0 }),
++    }
++  );
++  assert.equal(outcome.ok, true);
++  assert.equal(outcome.providerId, "leg-b");
++  assert.deepEqual(attempts, ["leg-a", "leg-b"]);
++  assert.deepEqual(
++    outcome.attempts.map((item) => item.outcome),
++    ["failed", "ok"]
++  );
++});
++
++test("failover: a leg failing the quality gate hands off to the next free provider", async () => {
++  let qualityCalls = 0;
++  const outcome = await runFreeSearchChain(
++    [
++      entry(provider({ id: "leg-empty", authType: "none", freeMonthlyQuota: 0 })),
++      entry(provider({ id: "leg-good", authType: "none", freeMonthlyQuota: 0 })),
++    ],
++    {
++      executeLeg: async () => ({ kind: "ok", data: {} }),
++      dedupe: (results) => results,
++      assessQuality: () => {
++        qualityCalls += 1;
++        return qualityCalls === 1
++          ? {
++              valid: false,
++              resultCount: 0,
++              validUrlCount: 0,
++              freshnessCount: 0,
++              reason: "no-valid-urls",
++            }
++          : { valid: true, resultCount: 1, validUrlCount: 1, freshnessCount: 0 };
++      },
++    }
++  );
++  assert.equal(outcome.ok, true);
++  assert.equal(outcome.providerId, "leg-good");
++  assert.deepEqual(
++    outcome.attempts.map((item) => item.outcome),
++    ["quality-failed", "ok"]
++  );
++});
++test("skips: exhausted free legs report their reasons without executing", async () => {
++  const executed: string[] = [];
++  const outcome = await runFreeSearchChain(
++    [
++      entry(provider({ id: "leg-noauth", authType: "none", freeMonthlyQuota: 0 })),
++      entry(provider({ id: "leg-cool", authType: "none", freeMonthlyQuota: 0 })),
++      entry(provider({ id: "leg-open", authType: "none", freeMonthlyQuota: 0 })),
++    ],
++    {
++      executeLeg: async (item) => {
++        executed.push(item.config.id);
++        const reason =
++          item.config.id === "leg-noauth"
++            ? ("no-credentials" as const)
++            : item.config.id === "leg-cool"
++              ? ("rate-limited" as const)
++              : ("circuit-open" as const);
++        return { kind: "skipped", reason };
++      },
++      assessQuality: () => ({ valid: true, resultCount: 1, validUrlCount: 1, freshnessCount: 0 }),
++    }
++  );
++  assert.equal(outcome.ok, false);
++  assert.equal(outcome.exhausted, true);
++  assert.equal(outcome.allRateLimited, false);
++  assert.deepEqual(
++    outcome.attempts.map((item) => item.skipReason),
++    ["no-credentials", "rate-limited", "circuit-open"]
++  );
++  assert.equal(executed.length, 3);
++});
++
++test("exhaustion: all rate-limited legs surface allRateLimited and never leave the chain", async () => {
++  const outcome = await runFreeSearchChain(
++    [
++      entry(provider({ id: "leg-r1", authType: "none", freeMonthlyQuota: 0 })),
++      entry(provider({ id: "leg-r2", authType: "none", freeMonthlyQuota: 0 })),
++    ],
++    {
++      executeLeg: async () => ({ kind: "skipped", reason: "rate-limited" }),
++    }
++  );
++  assert.equal(outcome.ok, false);
++  assert.equal(outcome.exhausted, true);
++  assert.equal(outcome.allRateLimited, true);
++  assert.equal(outcome.attempts.length, 2);
++});
++
++test("exhaustion: every failing leg is attempted exactly once and the terminal error is stable", async () => {
++  const outcome = await runFreeSearchChain(
++    [
++      entry(provider({ id: "leg-x", authType: "none", freeMonthlyQuota: 0 })),
++      entry(provider({ id: "leg-y", authType: "none", freeMonthlyQuota: 0 })),
++    ],
++    {
++      executeLeg: async () => ({ kind: "failed", error: "boom", status: 500 }),
++    }
++  );
++  assert.equal(outcome.ok, false);
++  assert.equal(outcome.exhausted, true);
++  assert.equal(outcome.allRateLimited, false);
++  assert.equal(outcome.attempts.length, 2);
++  assert.equal(NO_FREE_SEARCH_PROVIDER_AVAILABLE, "NO_FREE_SEARCH_PROVIDER_AVAILABLE");
++});
++
++test("dedupe: the winning leg's results are normalised and deduplicated", async () => {
++  const outcome = await runFreeSearchChain(
++    [entry(provider({ id: "leg-dedupe", authType: "none", freeMonthlyQuota: 0 }))],
++    {
++      executeLeg: async () => ({
++        kind: "ok",
++        data: {
++          results: [{ url: "https://dup.test/x" }, { url: "https://dup.test/x#again" }],
++        },
++      }),
++    }
++  );
++  assert.equal(outcome.ok, true);
++  assert.equal(outcome.providerId, "leg-dedupe");
++  const results = (outcome.data as { results?: unknown[] } | undefined)?.results ?? [];
++  assert.equal(results.length, 1);
++});
+-- 
+2.53.0
+
+
+From f0e40d9697ea8e8b63b0ffd0fc0b06afbdf80576 Mon Sep 17 00:00:00 2001
+From: StockNewsBR <264292956+StockNewsBR@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 18:34:47 -0300
+Subject: [PATCH 06/11] docs(omniroute): record final R2 search reconstruction
+
+---
+ docs/OMNIROUTE_FINAL_R2_SEARCH_2026-09-21.md | 123 +++++++++++++++++++
+ 1 file changed, 123 insertions(+)
+ create mode 100644 docs/OMNIROUTE_FINAL_R2_SEARCH_2026-09-21.md
+
+diff --git a/docs/OMNIROUTE_FINAL_R2_SEARCH_2026-09-21.md b/docs/OMNIROUTE_FINAL_R2_SEARCH_2026-09-21.md
+new file mode 100644
+index 000000000..28240bf6e
+--- /dev/null
++++ b/docs/OMNIROUTE_FINAL_R2_SEARCH_2026-09-21.md
+@@ -0,0 +1,123 @@
++# OmniRoute — Final Free Autopilot: R2 Search Reconstruction (dynamic FREE_ONLY)
++
++Mission: OMNIROUTE_FREE_AUTOPILOT_FINAL_RECONSTRUCTION_R1_11_R4_LIVE_CLOSURE_2026_09_21
++Phase: 4 — R2 search reconstruction (isolated candidate; nothing deployed)
++Date: 2026-09-21
++Workspace: /home/dcima/omniroute-final-free-autopilot-20260921
++Branch: final/free-autopilot-2026-09-21
++
++UPSTREAM_BASE_SHA=dea6bb8b6b64d3a3d9f639a044625c3452442c56
++R1_CANDIDATE_SHA=864ddc1d57871827ab2be3a9235bab5f8c12bc48
++R1_REPORT_COMMIT=3f4d1219b542cfcaf5c5991f7053eb8117632aa4
++R1_INSPECTOR_FIX_SHA=2e10170e8a481ef40af4bdda9f0fb390eab96bc7
++R1_11_REPORT_COMMIT=26066ca07fab180f7f39d58abc56efe03205e28e
++R2_SHA=af44c10b595cbe36d3e1168a9918d7f857ce5862
++R2_COMMIT=af44c10b5 "feat(omniroute): reconstruct dynamic FREE_ONLY search routing" (3 files, +796/-1)
++
++## 1. Result (required fields)
++
++R2=PASS
++AUTO_SEARCH_FREE=PASS
++STATIC_SEARCH_ALLOWLIST=NO
++SEARCH_DYNAMIC_DISCOVERY=PASS
++SEARCH_FREE_TO_FREE_FAILOVER=PASS
++SEARCH_PAID_FALLBACK=NO
++
++## 2. What was reconstructed
++
++New pure module `open-sse/services/searchFreeRouting.ts` (+293), no parallel gateway:
++
++- `FREE_ONLY_SEARCH_SELECTOR = "auto/search:free"` — the `provider` value that opts a
++  `/v1/search` request into FREE_ONLY routing.
++- `NO_FREE_SEARCH_PROVIDER_AVAILABLE` — terminal error when the free chain is exhausted.
++- `FREE_SEARCH_BREAKER_PREFIX = "search:"` — breaker namespace so search legs never
++  collide with model-provider legs.
++- Eligibility is metadata-only and shortlist-free (`classifySearchProviderFreeStatus`):
++  cost missing/non-finite/negative → UNKNOWN_COST (deny); cost 0 + self-hosted base URL
++  (loopback / RFC1918 / `.local` / `.internal`) → SELF_HOSTED (allow); cost 0 + keyless
++  (`authType: "none"`) → FREE_VERIFIED (allow); cost 0 + keyed but `freeMonthlyQuota > 0`
++  → FREE_VERIFIED (allow); cost 0 + keyed + quota 0 → FREE_UNKNOWN (deny); cost > 0 with
++  a free quota → CREDIT_BACKED (deny); cost > 0 → PAID (deny).
++  `FREE_ELIGIBLE_SEARCH_STATUSES = ["FREE_VERIFIED", "SELF_HOSTED"]` only.
++- `buildFreeSearchChain()` discovers providers from `SEARCH_PROVIDERS` and skips
++  `disabled`, unsupported `search_type` (`supportsSearchType`), blocked ids
++  (`blockedProviders` policy), unconfigured loopback providers
++  (`isUnconfiguredLoopbackSearchProvider`) and every non-eligible cost class; the chain
++  orders non-`fallbackOnly` first, then cheapest, then registry order — all derived from
++  registry metadata, never from a hardcoded provider list.
++- Deterministic quality gate `assessSearchResultQuality()` (results array present,
++  ≥1 result, ≥1 well-formed absolute http(s) URL; freshness measured, not required) and
++  `dedupeSearchResults()` / `normalizeResultUrl()` (hash stripped, host lowercased,
++  trailing slashes trimmed, first occurrence wins).
++- `runFreeSearchChain()` — one bounded pass, at most one attempt per chain entry:
++  a leg that fails, returns no results, or fails the quality gate hands off to the next
++  free leg; skips are recorded with reasons (`no-credentials`, `rate-limited`,
++  `circuit-open`); nothing wins → `{ ok: false, exhausted: true }` with `allRateLimited`
++  set when every attempt was rate-limited. The runner can only ever touch the chain it is
++  given, so a paid provider is structurally unreachable.
++
++Route integration in `src/app/api/v1/search/route.ts` (+133/-1): a branch inside the
++native POST handler, before the native provider/credential resolution. It builds the free
++chain from `Object.values(SEARCH_PROVIDERS)` with the blocked-provider filter, resolves
++per-leg credentials with the native helper (`resolveSearchExecutionCredentials`, including
++`getSearchCredentialFallbacks` and quota preflight), skips rate-limited credentials
++(`isAllRateLimitedCredentials`), consults the native breaker
++(`getCircuitBreaker("search:<id>", { failureThreshold: 3, resetTimeout: 30_000 })`,
++`canExecute()`), executes each leg through the native `handleSearch()` **without**
++`alternateProvider`/`alternateCredentials` (a leg therefore cannot escalate to another,
++potentially paid, provider), caches with `getOrCoalesce` under the synthetic provider
++component `auto/search:free` (so free results never collide with plain `auto` caching) and
++returns the same response envelope as the native path
++(`{ id: "search-<uuid>", ...data, cached, usage }`, usage zeroed on cache hits). Exhaustion
++returns HTTP 503 `NO_FREE_SEARCH_PROVIDER_AVAILABLE` (429 when every leg was rate-limited).
++No paid provider can appear in the chain, and no cost is recorded for free legs.
++
++## 3. R2 vs R5 failover contradiction — resolved
++
++The old R2 report claimed `FREE_TO_FREE_FAILOVER=YES`; the old R5 live report observed
++`SEARCH_FAILOVER=CREDENTIAL_ONLY`. Both are accurate for the paths they described:
++
++- The **native** auto-select/alternate path is credential-driven: the alternate leg is the
++  first other provider (sorted by `costPerQuery`, `fallbackOnly` excluded, rate-limited
++  skipped) that has credentials — which means the native path _can_ hand a retry to a paid
++  provider whenever it is the cheapest credentialed one. That is exactly R5's observation.
++- The **FREE_ONLY branch** (`auto/search:free`) never constructs an alternate: its chain is
++  built exclusively from FREE_VERIFIED/SELF_HOSTED metadata, each leg is called without
++  `alternateProvider`, and the only terminal states are a free success or
++  `NO_FREE_SEARCH_PROVIDER_AVAILABLE`. Within this branch free→free failover is real and
++  paid is unreachable — the PASS recorded in section 1 applies to this branch, which is the
++  mission's required semantics.
++
++## 4. Tests and gates
++
++- `tests/unit/search-free-routing.test.ts` (new, +371, node:test scope): 13/13 PASS —
++  classification matrix, self-hosted truth table, eligibility set, chain filtering
++  (paid/credit/unknown/disabled/unsupported/blocked/unconfigured-loopback excluded),
++  chain ordering, quality gate, URL normalization + dedupe, bounded failover (stop at the
++  first quality-passing leg), quality-gate handoff, skip reasons, all-rate-limited
++  exhaustion, all-failing exhaustion (attempts == chain length, stable terminal constant),
++  real-helper dedupe on the winning leg.
++- Regression: the four autoCombo vitest suites remain green (4 files / 56 tests).
++- `npm run check:open-sse-typecheck`: no new errors; only the pre-existing, independently
++  reproduced baseline entry `src/app/api/v1/models/catalog.ts TS2367`.
++- Lint: scoped eslint + pre-commit lint-staged (prettier/eslint --fix) PASS; docs-sync,
++  explicit-any budget and tracked-artifacts hooks PASS; secret scan clean.
++
++## 5. Honest limitations
++
++- The circuit breaker is **consulted** (`canExecute()`) but not re-implemented: failure
++  recording stays owned by the existing upstream paths (mission rule: no second breaker
++  implementation). The `search:` namespace keeps search legs isolated from model legs.
++- `isUnconfiguredLoopbackSearchProvider` inspects only the registry config, so a
++  `searxng-search` connection whose `providerSpecificData.baseUrl` is overridden at
++  connection level stays excluded from the free chain unless the registry default is
++  overridden (same known limitation the old R2 documented; deliberately not "fixed" by
++  guessing identities).
++- The free branch is validated deterministically at unit level; the live `auto/search:free`
++  exercise is part of the integrated Phase 7/8 canary and is not claimed here.
++
++## 6. Data safety
++
++No paid or credit-backed search provider is reachable from the free branch; no provider
++calls were made while implementing or testing R2; live production OmniRoute (127.0.0.1:20128)
++was not touched; OpenCode/IAMM/StockNewsBR/Hermes/Harness were not modified.
+-- 
+2.53.0
+
+
+From 309ae65f6976947ec74ac5998343d92ddf4e755e Mon Sep 17 00:00:00 2001
+From: StockNewsBR <264292956+StockNewsBR@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 18:45:57 -0300
+Subject: [PATCH 07/11] feat(omniroute): reconstruct FREE_ONLY vision and image
+ routing
+
+---
+ open-sse/config/freeImageRouting.ts           | 159 ++++++++++++
+ open-sse/services/autoCombo/builtinCatalog.ts |   2 +
+ src/app/api/v1/images/generations/route.ts    |  51 +++-
+ tests/unit/free-image-routing.test.ts         | 241 ++++++++++++++++++
+ 4 files changed, 441 insertions(+), 12 deletions(-)
+ create mode 100644 open-sse/config/freeImageRouting.ts
+ create mode 100644 tests/unit/free-image-routing.test.ts
+
+diff --git a/open-sse/config/freeImageRouting.ts b/open-sse/config/freeImageRouting.ts
+new file mode 100644
+index 000000000..ba82a92a1
+--- /dev/null
++++ b/open-sse/config/freeImageRouting.ts
+@@ -0,0 +1,159 @@
++/**
++ * FREE_ONLY image-generation routing.
++ *
++ * Image generation is a capability of its own: this module only ever inspects
++ * `IMAGE_PROVIDERS` registry entries (plus the free-budget catalog), so a chat or
++ * vision model can never be selected as an image generator. A remote provider is
++ * FREE_VERIFIED only when the catalog carries an explicit hard-free budget row
++ * (`hardStopGuaranteed === true`); a local self-hosted endpoint (`authType:
++ * "none"`) with an active connection is SELF_HOSTED. Everything else — including
++ * a remote provider that merely reports price 0 without hard-free evidence — is
++ * denied, which is why `auto/image-gen:free` may legitimately answer
++ * `NO_FREE_IMAGE_PROVIDER_AVAILABLE` instead of falling back to a paid generator.
++ */
++import { IMAGE_PROVIDERS } from "./imageRegistry.ts";
++import { FREE_MODEL_BUDGETS, type FreeModelBudget } from "./freeModelCatalog.ts";
++import { isSelfHostedBaseUrl } from "../services/searchFreeRouting.ts";
++
++type ImageProviderEntry = (typeof IMAGE_PROVIDERS)[string];
++import type { FreeCostClass } from "../services/autoCombo/freeProviderSentinel.ts";
++
++export const FREE_IMAGE_ROUTE_ID = "auto/image-gen";
++export const FREE_IMAGE_ROUTE_ID_FREE = "auto/image-gen:free";
++export const NO_FREE_IMAGE_PROVIDER_AVAILABLE = "NO_FREE_IMAGE_PROVIDER_AVAILABLE";
++
++export const FREE_IMAGE_ELIGIBLE_STATUSES: readonly FreeCostClass[] = [
++  "FREE_VERIFIED",
++  "SELF_HOSTED",
++];
++
++const HARD_FREE_BUDGET_TYPES = new Set([
++  "keyless",
++  "recurring-daily",
++  "recurring-monthly",
++  "recurring-uncapped",
++]);
++
++const CREDIT_BACKED_BUDGET_TYPES = new Set(["one-time-initial", "recurring-credit"]);
++
++export type ImageFreeReason =
++  | "SELF_HOSTED_LOCAL_IMAGE_ENDPOINT"
++  | "HARD_STOP_FREE_TIER_VERIFIED"
++  | "CREDIT_BACKED_IMAGE_EXCLUDED"
++  | "DISCONTINUED_IMAGE_EXCLUDED"
++  | "NO_HARD_FREE_IMAGE_EVIDENCE";
++
++export interface ImageFreeVerdict {
++  status: FreeCostClass;
++  reason: ImageFreeReason;
++}
++
++export function isFreeImageEligibleStatus(status: FreeCostClass): boolean {
++  return FREE_IMAGE_ELIGIBLE_STATUSES.includes(status);
++}
++
++export function classifyImageProviderFreeStatus(params: {
++  providerId: string;
++  authType?: string | null;
++  baseUrl?: string | null;
++  modelId: string;
++  budgets?: readonly FreeModelBudget[];
++  hasActiveConnection: boolean;
++}): ImageFreeVerdict {
++  if (
++    params.authType === "none" &&
++    params.hasActiveConnection &&
++    isSelfHostedBaseUrl(params.baseUrl)
++  ) {
++    return { status: "SELF_HOSTED", reason: "SELF_HOSTED_LOCAL_IMAGE_ENDPOINT" };
++  }
++
++  const budgets = params.budgets ?? FREE_MODEL_BUDGETS;
++  const row = budgets.find(
++    (budget) => budget.provider === params.providerId && budget.modelId === params.modelId
++  );
++
++  if (!row) return { status: "FREE_UNKNOWN", reason: "NO_HARD_FREE_IMAGE_EVIDENCE" };
++  if (CREDIT_BACKED_BUDGET_TYPES.has(row.freeType)) {
++    return { status: "CREDIT_BACKED", reason: "CREDIT_BACKED_IMAGE_EXCLUDED" };
++  }
++  if (row.freeType === "discontinued") {
++    return { status: "DISCONTINUED", reason: "DISCONTINUED_IMAGE_EXCLUDED" };
++  }
++  if (HARD_FREE_BUDGET_TYPES.has(row.freeType)) {
++    return row.hardStopGuaranteed === true
++      ? { status: "FREE_VERIFIED", reason: "HARD_STOP_FREE_TIER_VERIFIED" }
++      : { status: "FREE_UNKNOWN", reason: "NO_HARD_FREE_IMAGE_EVIDENCE" };
++  }
++  return { status: "FREE_UNKNOWN", reason: "NO_HARD_FREE_IMAGE_EVIDENCE" };
++}
++
++export interface FreeImageSelection {
++  ok: true;
++  providerId: string;
++  modelId: string;
++  status: Extract<FreeCostClass, "FREE_VERIFIED" | "SELF_HOSTED">;
++  reason: ImageFreeReason;
++}
++
++export interface FreeImageUnavailable {
++  ok: false;
++  code: typeof NO_FREE_IMAGE_PROVIDER_AVAILABLE;
++  reason: "NO_ELIGIBLE_FREE_IMAGE_PROVIDER" | "ALL_FREE_IMAGE_PROVIDERS_CIRCUIT_OPEN";
++  considered: Array<{ providerId: string; modelId: string; status: FreeCostClass }>;
++}
++
++export function resolveFreeImageProvider(deps: {
++  providers?: Record<string, ImageProviderEntry>;
++  budgets?: readonly FreeModelBudget[];
++  hasActiveConnection: (providerId: string) => boolean;
++  isCircuitOpen?: (providerId: string) => boolean;
++}): FreeImageSelection | FreeImageUnavailable {
++  const providers = deps.providers ?? IMAGE_PROVIDERS;
++  const budgets = deps.budgets ?? FREE_MODEL_BUDGETS;
++  const considered: FreeImageUnavailable["considered"] = [];
++  let sawCircuitOpen = false;
++
++  for (const [providerId, config] of Object.entries(providers)) {
++    if (deps.isCircuitOpen?.(providerId)) {
++      sawCircuitOpen = true;
++      continue;
++    }
++    if (!deps.hasActiveConnection(providerId)) continue;
++
++    const models = Array.isArray(config?.models) ? config.models : [];
++    for (const model of models) {
++      const modelId = typeof model === "string" ? model : model?.id;
++      if (!modelId) continue;
++
++      const verdict = classifyImageProviderFreeStatus({
++        providerId,
++        authType: config?.authType,
++        baseUrl: config?.baseUrl,
++        modelId,
++        budgets,
++        hasActiveConnection: true,
++      });
++      considered.push({ providerId, modelId, status: verdict.status });
++
++      if (isFreeImageEligibleStatus(verdict.status)) {
++        return {
++          ok: true,
++          providerId,
++          modelId,
++          status: verdict.status as FreeImageSelection["status"],
++          reason: verdict.reason,
++        };
++      }
++    }
++  }
++
++  return {
++    ok: false,
++    code: NO_FREE_IMAGE_PROVIDER_AVAILABLE,
++    reason: sawCircuitOpen
++      ? "ALL_FREE_IMAGE_PROVIDERS_CIRCUIT_OPEN"
++      : "NO_ELIGIBLE_FREE_IMAGE_PROVIDER",
++    considered,
++  };
++}
+diff --git a/open-sse/services/autoCombo/builtinCatalog.ts b/open-sse/services/autoCombo/builtinCatalog.ts
+index dc1b7f046..e61f58997 100644
+--- a/open-sse/services/autoCombo/builtinCatalog.ts
++++ b/open-sse/services/autoCombo/builtinCatalog.ts
+@@ -65,6 +65,8 @@ export const AUTO_SUFFIX_VARIANTS: string[] = [
+   "auto/reasoning:pro",
+   "auto/vision",
+   "auto/multimodal",
++  "auto/vision:free",
++  "auto/multimodal:free",
+ ];
+ 
+ type ResolvedAutoVariant =
+diff --git a/src/app/api/v1/images/generations/route.ts b/src/app/api/v1/images/generations/route.ts
+index cc8403115..64029830d 100644
+--- a/src/app/api/v1/images/generations/route.ts
++++ b/src/app/api/v1/images/generations/route.ts
+@@ -20,6 +20,14 @@ import { v1ImageGenerationSchema } from "@/shared/validation/schemas";
+ import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
+ 
+ import { getComboByName } from "@/lib/db/combos";
++import {
++  FREE_IMAGE_ROUTE_ID,
++  FREE_IMAGE_ROUTE_ID_FREE,
++  NO_FREE_IMAGE_PROVIDER_AVAILABLE,
++  resolveFreeImageProvider,
++} from "@omniroute/open-sse/config/freeImageRouting.ts";
++import { getCachedProviderConnections } from "@/lib/db/readCache";
++import { getCircuitBreaker } from "@/shared/utils/circuitBreaker";
+ import { getAllCustomModels } from "@/lib/db/models";
+ import { resolveProxyForConnection } from "@/lib/db/settings";
+ import { resolveImageRouteModel } from "@/lib/images/imageRouteModel";
+@@ -97,6 +105,19 @@ function publicBaseUrlHeaders(headers: Headers): Record<string, string> {
+   return out;
+ }
+ 
++async function resolveFreeImageRouteSelection() {
++  const connections = await getCachedProviderConnections();
++  const activeProviders = new Set(
++    connections
++      .filter((connection) => (connection as { isActive?: boolean }).isActive !== false)
++      .map((connection) => (connection as { provider: string }).provider)
++  );
++  return resolveFreeImageProvider({
++    hasActiveConnection: (providerId) => activeProviders.has(providerId),
++    isCircuitOpen: (providerId) => !getCircuitBreaker(providerId).canExecute(),
++  });
++}
++
+ async function postHandler(request, context) {
+   let rawBody;
+   try {
+@@ -122,21 +143,23 @@ async function postHandler(request, context) {
+   const policy = await enforceApiKeyPolicy(request, body.model);
+   if (policy.rejection) return policy.rejection;
+ 
++  // FREE_ONLY image generation — `auto/image-gen[:free]` can only ever reach a
++  // free-verified or self-hosted image generator, never a paid/credit-backed one.
++  if (body.model === FREE_IMAGE_ROUTE_ID || body.model === FREE_IMAGE_ROUTE_ID_FREE) {
++    const selection = await resolveFreeImageRouteSelection();
++    if (!selection.ok) {
++      return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, NO_FREE_IMAGE_PROVIDER_AVAILABLE);
++    }
++    body.model = `${selection.providerId}/${selection.modelId}`;
++  }
++
+   // #9239: Detect combo name and divert to full image combo execution.
+   // Checks before resolveImageRouteModel so we skip single-target flattening.
+   if (body.model && typeof body.model === "string" && !body.model.includes("/")) {
+     const combo = await getComboByName(body.model as string);
+     if (combo) {
+-      const { executeImageCombo } = await import(
+-        "@omniroute/open-sse/services/imageCombo"
+-      );
+-      return executeImageCombo(
+-        body.model as string,
+-        body,
+-        { request, policy },
+-        startTime,
+-        log
+-      );
++      const { executeImageCombo } = await import("@omniroute/open-sse/services/imageCombo");
++      return executeImageCombo(body.model as string, body, { request, policy }, startTime, log);
+     }
+   }
+ 
+@@ -246,7 +269,8 @@ async function postHandler(request, context) {
+       provider,
+       null,
+       syncedEndpointRoute?.connectionIds ?? null,
+-      requestedModel    );
++      requestedModel
++    );
+     if (!credentials) {
+       return errorResponse(
+         HTTP_STATUS.BAD_REQUEST,
+@@ -346,7 +370,10 @@ async function postHandler(request, context) {
+     });
+   }
+ 
+-  const errorPayload = toJsonErrorPayload((result as any).error, "Image generation provider error") as {
++  const errorPayload = toJsonErrorPayload(
++    (result as any).error,
++    "Image generation provider error"
++  ) as {
+     error?: { message?: string };
+   };
+   const message =
+diff --git a/tests/unit/free-image-routing.test.ts b/tests/unit/free-image-routing.test.ts
+new file mode 100644
+index 000000000..08a9608e1
+--- /dev/null
++++ b/tests/unit/free-image-routing.test.ts
+@@ -0,0 +1,241 @@
++/**
++ * R3 reconstruction — FREE_ONLY image-generation routing.
++ *
++ * Node:test scope: top-level tests/unit/*.test.ts run under the built-in test
++ * runner (tests/unit/autoCombo/** is the vitest-only scope).
++ */
++import { test } from "node:test";
++import assert from "node:assert/strict";
++
++import {
++  FREE_IMAGE_ELIGIBLE_STATUSES,
++  FREE_IMAGE_ROUTE_ID,
++  FREE_IMAGE_ROUTE_ID_FREE,
++  NO_FREE_IMAGE_PROVIDER_AVAILABLE,
++  classifyImageProviderFreeStatus,
++  isFreeImageEligibleStatus,
++  resolveFreeImageProvider,
++} from "../../open-sse/config/freeImageRouting.ts";
++import type { FreeModelBudget } from "../../open-sse/config/freeModelCatalog.ts";
++
++const LOCAL_COMFY = "http://127.0.0.1:8188";
++
++function provider(authType: string, baseUrl: string, models: string[]) {
++  return {
++    id: "synthetic",
++    name: "Synthetic",
++    baseUrl,
++    method: "POST",
++    authType,
++    authHeader: "authorization",
++    models: models.map((id) => ({ id, name: id })),
++  };
++}
++
++function budgetRow(
++  providerId: string,
++  modelId: string,
++  freeType: string,
++  hardStopGuaranteed?: boolean
++): FreeModelBudget {
++  return {
++    provider: providerId,
++    modelId,
++    displayName: modelId,
++    monthlyTokens: 0,
++    creditTokens: 0,
++    freeType,
++    poolKey: null,
++    tos: "ok",
++    hardStopGuaranteed,
++  } as FreeModelBudget;
++}
++
++test("classification: local self-hosted endpoint with an active connection is SELF_HOSTED", () => {
++  const verdict = classifyImageProviderFreeStatus({
++    providerId: "comfyui",
++    authType: "none",
++    baseUrl: LOCAL_COMFY,
++    modelId: "sd-xl",
++    budgets: [],
++    hasActiveConnection: true,
++  });
++  assert.equal(verdict.status, "SELF_HOSTED");
++  assert.equal(verdict.reason, "SELF_HOSTED_LOCAL_IMAGE_ENDPOINT");
++  assert.equal(isFreeImageEligibleStatus(verdict.status), true);
++});
++
++test("classification: a remote keyless provider without hard-free evidence is FREE_UNKNOWN", () => {
++  const verdict = classifyImageProviderFreeStatus({
++    providerId: "aihorde",
++    authType: "none",
++    baseUrl: "https://aihorde.net/api/v2",
++    modelId: "stable_diffusion",
++    budgets: [],
++    hasActiveConnection: true,
++  });
++  assert.equal(verdict.status, "FREE_UNKNOWN");
++  assert.equal(verdict.reason, "NO_HARD_FREE_IMAGE_EVIDENCE");
++  assert.equal(isFreeImageEligibleStatus(verdict.status), false);
++});
++
++test("classification: a local endpoint without an active connection is not admitted", () => {
++  const verdict = classifyImageProviderFreeStatus({
++    providerId: "comfyui",
++    authType: "none",
++    baseUrl: LOCAL_COMFY,
++    modelId: "sd-xl",
++    budgets: [],
++    hasActiveConnection: false,
++  });
++  assert.equal(verdict.status, "FREE_UNKNOWN");
++  assert.equal(isFreeImageEligibleStatus(verdict.status), false);
++});
++
++test("classification: a hard-free budget row with hardStopGuaranteed is FREE_VERIFIED", () => {
++  const verdict = classifyImageProviderFreeStatus({
++    providerId: "freeimg",
++    authType: "apikey",
++    baseUrl: "https://freeimg.example.com",
++    modelId: "free-model",
++    budgets: [budgetRow("freeimg", "free-model", "recurring-daily", true)],
++    hasActiveConnection: true,
++  });
++  assert.equal(verdict.status, "FREE_VERIFIED");
++  assert.equal(verdict.reason, "HARD_STOP_FREE_TIER_VERIFIED");
++  assert.equal(isFreeImageEligibleStatus(verdict.status), true);
++});
++
++test("classification: a hard-free freeType without hardStopGuaranteed stays FREE_UNKNOWN", () => {
++  const verdict = classifyImageProviderFreeStatus({
++    providerId: "freeimg",
++    authType: "apikey",
++    baseUrl: "https://freeimg.example.com",
++    modelId: "free-model",
++    budgets: [budgetRow("freeimg", "free-model", "recurring-daily")],
++    hasActiveConnection: true,
++  });
++  assert.equal(verdict.status, "FREE_UNKNOWN");
++  assert.equal(verdict.reason, "NO_HARD_FREE_IMAGE_EVIDENCE");
++});
++
++test("classification: credit-shaped budget rows are CREDIT_BACKED", () => {
++  for (const freeType of ["one-time-initial", "recurring-credit"]) {
++    const verdict = classifyImageProviderFreeStatus({
++      providerId: "trialimg",
++      authType: "apikey",
++      baseUrl: "https://trialimg.example.com",
++      modelId: "trial-model",
++      budgets: [budgetRow("trialimg", "trial-model", freeType, true)],
++      hasActiveConnection: true,
++    });
++    assert.equal(verdict.status, "CREDIT_BACKED");
++    assert.equal(verdict.reason, "CREDIT_BACKED_IMAGE_EXCLUDED");
++    assert.equal(isFreeImageEligibleStatus(verdict.status), false);
++  }
++});
++
++test("classification: discontinued budget rows are DISCONTINUED", () => {
++  const verdict = classifyImageProviderFreeStatus({
++    providerId: "deadimg",
++    authType: "apikey",
++    baseUrl: "https://deadimg.example.com",
++    modelId: "dead-model",
++    budgets: [budgetRow("deadimg", "dead-model", "discontinued", true)],
++    hasActiveConnection: true,
++  });
++  assert.equal(verdict.status, "DISCONTINUED");
++  assert.equal(verdict.reason, "DISCONTINUED_IMAGE_EXCLUDED");
++  assert.equal(isFreeImageEligibleStatus(verdict.status), false);
++});
++
++test("resolver: the first eligible provider in registry order wins", () => {
++  const selection = resolveFreeImageProvider({
++    providers: {
++      "remote-first": provider("apikey", "https://remote.example.com", ["unknown-model"]),
++      "local-second": provider("none", LOCAL_COMFY, ["sd-xl"]),
++    },
++    budgets: [],
++    hasActiveConnection: () => true,
++    isCircuitOpen: () => false,
++  });
++  assert.equal(selection.ok, true);
++  if (selection.ok) {
++    assert.equal(selection.providerId, "local-second");
++    assert.equal(selection.modelId, "sd-xl");
++    assert.equal(selection.status, "SELF_HOSTED");
++  }
++});
++
++test("resolver: providers without an active connection are skipped", () => {
++  const selection = resolveFreeImageProvider({
++    providers: { "local-only": provider("none", LOCAL_COMFY, ["sd-xl"]) },
++    budgets: [],
++    hasActiveConnection: () => false,
++    isCircuitOpen: () => false,
++  });
++  assert.equal(selection.ok, false);
++  if (!selection.ok) {
++    assert.equal(selection.code, NO_FREE_IMAGE_PROVIDER_AVAILABLE);
++    assert.equal(selection.reason, "NO_ELIGIBLE_FREE_IMAGE_PROVIDER");
++  }
++});
++
++test("resolver: circuit-open providers are skipped and reported", () => {
++  const selection = resolveFreeImageProvider({
++    providers: { "local-only": provider("none", LOCAL_COMFY, ["sd-xl"]) },
++    budgets: [],
++    hasActiveConnection: () => true,
++    isCircuitOpen: () => true,
++  });
++  assert.equal(selection.ok, false);
++  if (!selection.ok) {
++    assert.equal(selection.code, NO_FREE_IMAGE_PROVIDER_AVAILABLE);
++    assert.equal(selection.reason, "ALL_FREE_IMAGE_PROVIDERS_CIRCUIT_OPEN");
++  }
++});
++
++test("resolver: nothing eligible returns the controlled code with considered entries", () => {
++  const selection = resolveFreeImageProvider({
++    providers: {
++      "remote-keyless": provider("none", "https://aihorde.net/api/v2", ["stable_diffusion"]),
++    },
++    budgets: [],
++    hasActiveConnection: () => true,
++    isCircuitOpen: () => false,
++  });
++  assert.equal(selection.ok, false);
++  if (!selection.ok) {
++    assert.equal(selection.code, NO_FREE_IMAGE_PROVIDER_AVAILABLE);
++    assert.equal(selection.reason, "NO_ELIGIBLE_FREE_IMAGE_PROVIDER");
++    assert.equal(selection.considered.length, 1);
++    assert.equal(selection.considered[0].status, "FREE_UNKNOWN");
++  }
++});
++
++test("separation: vision/chat model ids are never selected as image generators", () => {
++  const selection = resolveFreeImageProvider({
++    providers: { "local-only": provider("none", LOCAL_COMFY, ["sd-xl"]) },
++    budgets: [
++      budgetRow("freechat", "qwen-vision", "keyless", true),
++      budgetRow("freechat", "gemini-2.5-flash", "recurring-daily", true),
++    ],
++    hasActiveConnection: () => true,
++    isCircuitOpen: () => false,
++  });
++  assert.equal(selection.ok, true);
++  if (selection.ok) {
++    assert.equal(selection.providerId, "local-only");
++    assert.notEqual(selection.modelId, "qwen-vision");
++    assert.notEqual(selection.modelId, "gemini-2.5-flash");
++  }
++  assert.equal(FREE_IMAGE_ELIGIBLE_STATUSES.join(","), "FREE_VERIFIED,SELF_HOSTED");
++  assert.equal(isFreeImageEligibleStatus("PAID"), false);
++  assert.equal(isFreeImageEligibleStatus("CREDIT_BACKED"), false);
++  assert.equal(isFreeImageEligibleStatus("UNKNOWN_COST"), false);
++  assert.equal(isFreeImageEligibleStatus("NULL_COST"), false);
++  assert.equal(isFreeImageEligibleStatus("FREE_UNKNOWN"), false);
++  assert.equal(FREE_IMAGE_ROUTE_ID, "auto/image-gen");
++  assert.equal(FREE_IMAGE_ROUTE_ID_FREE, "auto/image-gen:free");
++  assert.equal(NO_FREE_IMAGE_PROVIDER_AVAILABLE, "NO_FREE_IMAGE_PROVIDER_AVAILABLE");
++});
+-- 
+2.53.0
+
+
+From ed30d298e17fa9ca45777c43a759dcd52cded7de Mon Sep 17 00:00:00 2001
+From: StockNewsBR <264292956+StockNewsBR@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 18:47:10 -0300
+Subject: [PATCH 08/11] docs(omniroute): record final R3 vision and image
+ reconstruction
+
+---
+ ...IROUTE_FINAL_R3_VISION_IMAGE_2026-09-21.md | 99 +++++++++++++++++++
+ 1 file changed, 99 insertions(+)
+ create mode 100644 docs/OMNIROUTE_FINAL_R3_VISION_IMAGE_2026-09-21.md
+
+diff --git a/docs/OMNIROUTE_FINAL_R3_VISION_IMAGE_2026-09-21.md b/docs/OMNIROUTE_FINAL_R3_VISION_IMAGE_2026-09-21.md
+new file mode 100644
+index 000000000..73db57584
+--- /dev/null
++++ b/docs/OMNIROUTE_FINAL_R3_VISION_IMAGE_2026-09-21.md
+@@ -0,0 +1,99 @@
++# OmniRoute — Final Free Autopilot: R3 FREE_ONLY Vision + Image Generation (redo)
++
++Mission: `OMNIROUTE_FREE_AUTOPILOT_FINAL_RECONSTRUCTION_R1_11_R4_LIVE_CLOSURE_2026_09_21`
++Phase: 5 (isolated candidate; not deployed)
++Date: 2026-09-21
++Workspace: `/home/dcima/omniroute-final-free-autopilot-20260921`
++Branch: `final/free-autopilot-2026-09-21`
++UPSTREAM_BASE_SHA=dea6bb8b6b64d3a3d9f639a044625c3452442c56
++R3_SHA=309ae65f6976947ec74ac5998343d92ddf4e755e
++R3_COMMIT=`309ae65f6 feat(omniroute): reconstruct FREE_ONLY vision and image routing` (4 files, +441/-12)
++
++## 1. Required fields
++
++| field                              | value                                                                                       |
++| ---------------------------------- | ------------------------------------------------------------------------------------------- |
++| R3                                 | PASS                                                                                        |
++| AUTO_VISION_FREE                   | PASS (alias advertised; vision admission is the native strict FREE_ONLY prepared-pool gate) |
++| AUTO_IMAGE_GEN_FREE                | CONTROLLED_UNAVAILABLE (correct controlled outcome — see §3/§5)                             |
++| VISION_IMAGE_SEPARATION            | PASS                                                                                        |
++| PAID_VISION_AUTO_USED              | NO                                                                                          |
++| PAID_IMAGE_AUTO_USED               | NO                                                                                          |
++| IMAGE_FREE_CLASSIFICATION_EVIDENCE | PASS                                                                                        |
++
++## 2. What was reconstructed
++
++**VISION (native reuse, no new code path).** `open-sse/services/autoCombo/builtinCatalog.ts::AUTO_SUFFIX_VARIANTS`
++now advertises `auto/vision:free` and `auto/multimodal:free` (2 added lines). Vision capability stays defined
++ONLY by `src/lib/modelCapabilities.ts::getResolvedModelCapabilities().supportsVision`, and admission is the
++existing strict FREE_ONLY prepared-pool gate (FREE_VERIFIED / SELF_HOSTED only) when
++`freeAccessPolicy === "strict"`. The image registry is never consulted for vision and vice versa.
++
++**IMAGE GENERATION.** New `open-sse/config/freeImageRouting.ts` (159 lines, pure, no I/O):
++
++- `FREE_IMAGE_ROUTE_ID = "auto/image-gen"`, `FREE_IMAGE_ROUTE_ID_FREE = "auto/image-gen:free"`,
++  `NO_FREE_IMAGE_PROVIDER_AVAILABLE`.
++- Metadata-only classification over the image registry (`IMAGE_PROVIDERS`, 43 providers / 235 models) and the
++  free-budget catalog — no hardcoded provider names, no chat/vision lookup:
++  - **SELF_HOSTED** — `authType === "none"` AND `isSelfHostedBaseUrl(baseUrl)` (loopback / private range /
++    `.internal` / `.local`) AND an active connection (the ComfyUI / SD WebUI pattern).
++  - **FREE_VERIFIED** — an explicit hard-free budget row (`keyless` | `recurring-daily` | `recurring-monthly` |
++    `recurring-uncapped`) with `hardStopGuaranteed === true`.
++  - **CREDIT_BACKED** — `one-time-initial` / `recurring-credit` rows; **DISCONTINUED** — discontinued rows.
++  - **FREE_UNKNOWN / NO_HARD_FREE_IMAGE_EVIDENCE** — everything else, including a remote price-0 provider.
++- `resolveFreeImageProvider(...)` iterates the registry in order, skips circuit-open providers and providers
++  without an active connection, and returns the first eligible generator as
++  `{ ok: true, providerId, modelId, status, reason }`; otherwise it returns the controlled failure
++  `{ ok: false, code: NO_FREE_IMAGE_PROVIDER_AVAILABLE, reason: NO_ELIGIBLE_FREE_IMAGE_PROVIDER | ALL_FREE_IMAGE_PROVIDERS_CIRCUIT_OPEN, considered }`.
++
++**ROUTE.** `src/app/api/v1/images/generations/route.ts` resolves the alias immediately after API-key policy
++enforcement and before combo detection: ineligible → `503 NO_FREE_IMAGE_PROVIDER_AVAILABLE`; eligible →
++`body.model` is rewritten to `<provider>/<model>` and continues through the native capability-specific image
++handler (`imageGeneration.ts` / `executeImageCombo`). It never dispatches to a chat/vision model and never falls
++back to a paid or credit-backed generator.
++
++## 3. AI Horde / R5 contradiction resolution
++
++Old R5 observed `aihorde/stable_diffusion` answering HTTP 200 live; old R3 had concluded there was no eligible
++free image generator. Resolution per the mission's rule — a remote provider must NOT be classified FREE_VERIFIED
++merely because its price is 0 or a previous probe succeeded:
++
++- `aihorde` has `authType: "none"` but a **remote** base URL and **no hard-free budget row** →
++  `FREE_UNKNOWN / NO_HARD_FREE_IMAGE_EVIDENCE` → **DENY** → the controlled
++  `503 NO_FREE_IMAGE_PROVIDER_AVAILABLE`. It is never treated as a paid fallback and never silently admitted.
++- An earlier draft of the resolver classified any `authType === "none"` provider with a connection as
++  SELF_HOSTED; that was corrected by additionally requiring a local/private base URL
++  (`isSelfHostedBaseUrl`), and the case now has a regression test.
++
++## 4. Test and gate evidence
++
++- `tests/unit/free-image-routing.test.ts` (node:test): **12/12 PASS** — classification matrix, the aihorde
++  remote-price-0 denial, credit-backed/discontinued denials, resolver ordering, connection/circuit skips,
++  `considered[]` population, controlled unavailability, vision≠image separation, alias constants.
++- autoCombo regression (`vitest.mcp.config.ts`): **4 files / 56 tests PASS**.
++- `npm run check:open-sse-typecheck`: no new errors — only the pre-existing
++  `src/app/api/v1/models/catalog.ts TS2367` (proven pre-existing at `dea6bb8` by the stash experiment).
++  One self-inflicted `TS2459` (importing the module-local, non-exported `ImageProviderConfig` interface) was
++  found and fixed before the commit.
++- scoped `eslint` + lint-staged (`prettier --write`, `eslint --fix`) clean; `docs-sync` PASS;
++  `check:any-budget:t11` PASS; `check:tracked-artifacts` OK; secret scan clean.
++
++## 5. Honest limitations
++
++- **No remote FREE_VERIFIED image generator exists** in `FREE_MODEL_BUDGETS`: every hard-free row is a
++  chat/text model. The free image path therefore requires a self-hosted ComfyUI / SD WebUI connection (or a new
++  explicit hard-stop free budget row). Without one, `AUTO_IMAGE_GEN_FREE` is a
++  **CONTROLLED_UNAVAILABLE** — which the mission explicitly allows as a valid PASS for policy correctness
++  ("do not weaken FREE_ONLY merely to turn image generation green").
++- Live end-to-end image generation was consequently not exercised (no eligible provider, and paid generation is
++  forbidden); Phase 8's final canary will re-verify the controlled 503 and the advertised aliases.
++- The free image resolver **consults** the native provider circuit breaker (`canExecute()`) but does not
++  implement failure recording — no parallel breaker implementation (upstream owns recording), consistent with
++  the R2/R4 approach.
++
++## 6. Data safety
++
++No paid/credit-backed/unknown-cost image or vision provider is reachable from the alias; no provider was
++called; AWS and Meta image integrations untouched; live `:20128` untouched; OpenCode / Hermes / Harness / IAMM /
++StockNewsBR untouched. `PROVIDERS_DELETED=0`, `CONNECTIONS_DELETED=0`, `CREDENTIALS_DELETED=0`,
++`PAID_INFERENCE_TRIGGERED=NO`, `SECRETS_EXPOSED=NO`.
+-- 
+2.53.0
+
+
+From f7f739e661919452bd0fe8355e629ef223a33d51 Mon Sep 17 00:00:00 2001
+From: StockNewsBR <264292956+StockNewsBR@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 18:51:55 -0300
+Subject: [PATCH 09/11] feat(omniroute): harden quota circuit and workload
+ isolation
+
+---
+ tests/unit/free-policy-resilience-r4.test.ts | 266 +++++++++++++++++++
+ 1 file changed, 266 insertions(+)
+ create mode 100644 tests/unit/free-policy-resilience-r4.test.ts
+
+diff --git a/tests/unit/free-policy-resilience-r4.test.ts b/tests/unit/free-policy-resilience-r4.test.ts
+new file mode 100644
+index 000000000..19d3ef973
+--- /dev/null
++++ b/tests/unit/free-policy-resilience-r4.test.ts
+@@ -0,0 +1,266 @@
++/**
++ * R4 verification — FREE_ONLY quota / circuit / cooldown / workload isolation.
++ *
++ * Node:test scope. These tests drive the SAME native components the live
++ * routing path uses (freeProviderSentinel, resilienceCandidateFilter,
++ * candidateOverrides, circuitBreaker) with deterministic injected state, so the
++ * R4 matrix is reproducible offline and without production history.
++ */
++import { test } from "node:test";
++import assert from "node:assert/strict";
++
++import {
++  AUTO_FREE_ALLOWED_COST_CLASSES,
++  classifyFreeCost,
++  evaluateFreeSentinel,
++  type FreeQuotaReading,
++} from "../../open-sse/services/autoCombo/freeProviderSentinel.ts";
++import { filterResilienceBlockedCandidates } from "../../open-sse/services/autoCombo/resilienceCandidateFilter.ts";
++import { filterExcludedCandidates } from "../../open-sse/services/autoCombo/candidateOverrides.ts";
++import { getCircuitBreaker } from "../../src/shared/utils/circuitBreaker.ts";
++import {
++  FREE_MODEL_BUDGETS,
++  type FreeModelBudget,
++} from "../../open-sse/config/freeModelCatalog.ts";
++
++const NOW = "2026-08-20T00:00:00.000Z";
++const REAL_CONN = "r4-conn-1";
++const HARD_STOP = { provider: "groq", model: "llama-3.3-70b-versatile" };
++const OPTIONS = { minRemainingAllowance: 1, maxStateAgeMs: 180_000, now: () => Date.parse(NOW) };
++
++function entryFor(provider: string, modelId: string): FreeModelBudget {
++  const entry = FREE_MODEL_BUDGETS.find(
++    (row) => row.provider === provider && row.modelId === modelId
++  );
++  assert.ok(entry, `catalog entry ${provider}/${modelId} must exist`);
++  return entry;
++}
++
++function unprovenEntry(): FreeModelBudget {
++  return {
++    ...entryFor(HARD_STOP.provider, HARD_STOP.model),
++    provider: "synthetic-unproven",
++    modelId: "synthetic-model",
++    freeType: "recurring-daily",
++    hardStopGuaranteed: undefined,
++  };
++}
++
++function reading(overrides: Partial<FreeQuotaReading> = {}): FreeQuotaReading {
++  return {
++    status: overrides.status ?? "SAFE",
++    remainingFreeAllowance:
++      overrides.remainingFreeAllowance === undefined ? 40 : overrides.remainingFreeAllowance,
++    resetAt: null,
++    checkedAt: overrides.checkedAt ?? NOW,
++  };
++}
++
++test("quota: positive EXHAUSTED evidence denies the connection", () => {
++  const facts = evaluateFreeSentinel(
++    { ...HARD_STOP, connectionId: REAL_CONN },
++    {
++      entry: entryFor(HARD_STOP.provider, HARD_STOP.model),
++      resolveFreeAccessState: () => reading({ status: "EXHAUSTED", remainingFreeAllowance: 0 }),
++      ...OPTIONS,
++    }
++  );
++  assert.deepEqual(facts.safeConnectionIds, []);
++  assert.equal(facts.quotaStatus, "EXHAUSTED");
++  assert.equal(facts.reason, "QUOTA_EXHAUSTED");
++});
++
++test("quota: fresh SAFE telemetry with headroom is kept and reported", () => {
++  const facts = evaluateFreeSentinel(
++    { ...HARD_STOP, connectionId: REAL_CONN },
++    {
++      entry: entryFor(HARD_STOP.provider, HARD_STOP.model),
++      resolveFreeAccessState: () => reading({ remainingFreeAllowance: 40 }),
++      ...OPTIONS,
++    }
++  );
++  assert.deepEqual(facts.safeConnectionIds, [REAL_CONN]);
++  assert.equal(facts.quotaStatus, "SAFE");
++  assert.equal(facts.quotaRemaining, 40);
++});
++
++test("quota: missing telemetry stays eligible for a provably hard-free route", () => {
++  const facts = evaluateFreeSentinel(
++    { ...HARD_STOP, connectionId: REAL_CONN },
++    {
++      entry: entryFor(HARD_STOP.provider, HARD_STOP.model),
++      resolveFreeAccessState: () => undefined,
++      ...OPTIONS,
++    }
++  );
++  assert.deepEqual(facts.safeConnectionIds, [REAL_CONN]);
++  assert.equal(facts.quotaStatus, "UNKNOWN");
++  assert.equal(facts.reason, "HARD_STOP_FREE_TIER_VERIFIED");
++});
++
++test("quota: stale telemetry is advisory only for a hard-free route", () => {
++  const facts = evaluateFreeSentinel(
++    { ...HARD_STOP, connectionId: REAL_CONN },
++    {
++      entry: entryFor(HARD_STOP.provider, HARD_STOP.model),
++      resolveFreeAccessState: () => reading({ checkedAt: "2026-08-19T00:00:00.000Z" }),
++      ...OPTIONS,
++    }
++  );
++  assert.deepEqual(facts.safeConnectionIds, [REAL_CONN]);
++  assert.equal(facts.quotaStatus, "UNKNOWN");
++});
++
++test("quota: missing telemetry never upgrades an unproven route", () => {
++  const facts = evaluateFreeSentinel(
++    { provider: "synthetic-unproven", model: "synthetic-model", connectionId: REAL_CONN },
++    {
++      entry: unprovenEntry(),
++      resolveFreeAccessState: () => undefined,
++      ...OPTIONS,
++    }
++  );
++  assert.equal(facts.autoFreeAllowed, false);
++  assert.equal(facts.costClass, "FREE_UNKNOWN");
++  assert.deepEqual(facts.safeConnectionIds, []);
++  assert.equal(facts.reason, "FREE_UNKNOWN_NO_HARD_STOP_PROOF");
++});
++
++test("circuit: breakers are keyed per provider and stay independently CLOSED", () => {
++  const providerA = getCircuitBreaker("r4-provider-a");
++  const providerB = getCircuitBreaker("r4-provider-b");
++  assert.notEqual(providerA, providerB);
++  assert.equal(String(providerA.getStatus().state), "CLOSED");
++  assert.equal(String(providerB.getStatus().state), "CLOSED");
++  assert.equal(providerA.canExecute(), true);
++  assert.equal(providerB.canExecute(), true);
++  providerA.reset();
++  assert.equal(String(providerA.getStatus().state), "CLOSED");
++  assert.equal(String(providerB.getStatus().state), "CLOSED");
++});
++
++test("cooldown: one connection's rate limit does not block an unrelated provider", () => {
++  const pool = [
++    { provider: "prov-a", connectionId: "conn-a", model: "m-a" },
++    { provider: "prov-b", connectionId: "conn-b", model: "m-b" },
++  ];
++  const connections = new Map([
++    [
++      "conn-a",
++      { id: "conn-a", rateLimitedUntil: "2099-01-01T00:00:00.000Z", testStatus: "active" },
++    ],
++    ["conn-b", { id: "conn-b", rateLimitedUntil: null, testStatus: "active" }],
++  ]);
++  const filtered = filterResilienceBlockedCandidates(pool, connections);
++  assert.deepEqual(
++    filtered.map((candidate) => candidate.provider),
++    ["prov-b"]
++  );
++});
++
++test("cooldown: a terminal connection status drops only its own connection", () => {
++  const pool = [
++    { provider: "prov-a", connectionId: "conn-a", model: "m-a" },
++    { provider: "prov-b", connectionId: "conn-b", model: "m-b" },
++  ];
++  const connections = new Map([
++    ["conn-a", { id: "conn-a", rateLimitedUntil: null, testStatus: "unavailable" }],
++    ["conn-b", { id: "conn-b", rateLimitedUntil: null, testStatus: "active" }],
++  ]);
++  const filtered = filterResilienceBlockedCandidates(pool, connections);
++  assert.deepEqual(
++    filtered.map((candidate) => candidate.provider),
++    ["prov-b"]
++  );
++});
++
++test("cooldown: a healthy connection set preserves the pool reference", () => {
++  const pool = [
++    { provider: "prov-a", connectionId: "conn-a", model: "m-a" },
++    { provider: "prov-b", connectionId: "conn-b", model: "m-b" },
++  ];
++  const connections = new Map([
++    ["conn-a", { id: "conn-a", rateLimitedUntil: null, testStatus: "active" }],
++    ["conn-b", { id: "conn-b", rateLimitedUntil: null, testStatus: "active" }],
++  ]);
++  assert.equal(filterResilienceBlockedCandidates(pool, connections), pool);
++});
++
++test("workload isolation: per-caller exclusions are scoped, never global", () => {
++  const pool = [
++    { connectionId: "conn-a", model: "m" },
++    { connectionId: "conn-b", model: "m" },
++  ];
++  const iammView = filterExcludedCandidates(pool, new Set(["conn-a"]));
++  const stocknewsbrView = filterExcludedCandidates(pool, new Set(["conn-b"]));
++  const legacyView = filterExcludedCandidates(pool, new Set());
++  assert.deepEqual(
++    iammView.map((candidate) => candidate.connectionId),
++    ["conn-b"]
++  );
++  assert.deepEqual(
++    stocknewsbrView.map((candidate) => candidate.connectionId),
++    ["conn-a"]
++  );
++  assert.equal(legacyView, pool);
++  assert.deepEqual(
++    pool.map((candidate) => candidate.connectionId),
++    ["conn-a", "conn-b"],
++    "the shared pool must not be mutated"
++  );
++});
++
++test("workload isolation: allowlist candidates narrow per caller without touching the input", () => {
++  const shared = [{ connectionId: null, allowedConnectionIds: ["conn-a", "conn-b"], model: "m" }];
++  const narrowed = filterExcludedCandidates(shared, new Set(["conn-a"]));
++  assert.deepEqual(narrowed[0].allowedConnectionIds, ["conn-b"]);
++  assert.deepEqual(shared[0].allowedConnectionIds, ["conn-a", "conn-b"]);
++});
++
++test("profiles: FREE_ONLY admission ignores profile identity markers", () => {
++  const base = { ...HARD_STOP, connectionId: REAL_CONN };
++  const candidates = [
++    { ...base, profile: "IAMM" },
++    { ...base, profile: "StockNewsBR" },
++    { ...base, profile: "default" },
++  ];
++  const facts = candidates.map((candidate) =>
++    evaluateFreeSentinel(candidate, {
++      entry: entryFor(HARD_STOP.provider, HARD_STOP.model),
++      resolveFreeAccessState: () => reading(),
++      ...OPTIONS,
++    })
++  );
++  for (const fact of facts) {
++    assert.equal(fact.autoFreeAllowed, true);
++    assert.equal(fact.costClass, "FREE_VERIFIED");
++    assert.deepEqual(fact.safeConnectionIds, [REAL_CONN]);
++  }
++});
++
++test("profiles: no profile can make a paid, credit or unknown class auto-eligible", () => {
++  const creditEntry: FreeModelBudget = {
++    ...entryFor(HARD_STOP.provider, HARD_STOP.model),
++    provider: "synthetic-credit",
++    modelId: "credit-model",
++    freeType: "one-time-initial",
++  };
++  const verdicts = [
++    classifyFreeCost({ provider: "synthetic-credit", model: "credit-model" }, creditEntry),
++    classifyFreeCost({ provider: "synthetic-paid", model: "paid-model", costPer1MTokens: 15 }),
++    classifyFreeCost({ provider: "synthetic-null", model: "null-model", costPer1MTokens: null }),
++    classifyFreeCost({ provider: "unlisted", model: "unlisted-model" }),
++  ];
++  assert.deepEqual(
++    verdicts.map((verdict) => verdict.costClass),
++    ["CREDIT_BACKED", "PAID", "NULL_COST", "UNKNOWN_COST"]
++  );
++  for (const verdict of verdicts) {
++    assert.equal(verdict.autoFreeAllowed, false);
++    assert.equal(AUTO_FREE_ALLOWED_COST_CLASSES.has(verdict.costClass), false);
++  }
++});
++
++test("manual/pinned: the admission set is exactly FREE_VERIFIED and SELF_HOSTED", () => {
++  assert.deepEqual([...AUTO_FREE_ALLOWED_COST_CLASSES].sort(), ["FREE_VERIFIED", "SELF_HOSTED"]);
++});
+-- 
+2.53.0
+
+
+From 7e5a2d80b23ea2e10b588581236abad1614a04a7 Mon Sep 17 00:00:00 2001
+From: StockNewsBR <264292956+StockNewsBR@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 18:53:21 -0300
+Subject: [PATCH 10/11] docs(omniroute): record final R4 quota circuit and
+ workload isolation
+
+---
+ ...AL_R4_QUOTA_CIRCUIT_WORKLOAD_2026-09-21.md | 118 ++++++++++++++++++
+ 1 file changed, 118 insertions(+)
+ create mode 100644 docs/OMNIROUTE_FINAL_R4_QUOTA_CIRCUIT_WORKLOAD_2026-09-21.md
+
+diff --git a/docs/OMNIROUTE_FINAL_R4_QUOTA_CIRCUIT_WORKLOAD_2026-09-21.md b/docs/OMNIROUTE_FINAL_R4_QUOTA_CIRCUIT_WORKLOAD_2026-09-21.md
+new file mode 100644
+index 000000000..e5f1f709f
+--- /dev/null
++++ b/docs/OMNIROUTE_FINAL_R4_QUOTA_CIRCUIT_WORKLOAD_2026-09-21.md
+@@ -0,0 +1,118 @@
++# OmniRoute — Final Free Autopilot: R4 Quota / Circuit Breaker / Workload Isolation (redo from primary source)
++
++Mission: OMNIROUTE_FREE_AUTOPILOT_FINAL_RECONSTRUCTION_R1_11_R4_LIVE_CLOSURE_2026_09_21
++Phase: 6 (isolated candidate; not deployed)
++Date: 2026-09-21
++Workspace: /home/dcima/omniroute-final-free-autopilot-20260921
++Branch: final/free-autopilot-2026-09-21
++
++- UPSTREAM_BASE_SHA=dea6bb8b6b64d3a3d9f639a044625c3452442c56
++- R4_SHA=f7f739e661919452bd0fe8355e629ef223a33d51
++- R4_COMMIT=f7f739e66 "feat(omniroute): harden quota circuit and workload isolation" (tests only: 1 file, +266)
++
++RETRO NOTE: the previous R4 final report was never saved, so R4 is treated as NOT certified
++and is redone here from primary source. No old R4 diff was imported; the work below is a
++verification/hardening pass over the native components of the final candidate.
++
++## 1. Required fields
++
++R4=PASS
++QUOTA_AWARENESS=PASS
++CIRCUIT_BREAKER=PASS
++COOLDOWN=PASS
++AUTO_RECOVERY=PASS
++WORKLOAD_ISOLATION=PASS
++IAMM_PROFILE_ISOLATION=PASS
++STOCKNEWSBR_PROFILE_ISOLATION=PASS
++LEGACY_PROFILE_ISOLATION=PASS
++PAID_AUTO_FALLBACK=NO
++
++## 2. What was verified (native components only — no second breaker, no parallel engine)
++
++QUOTA AWARENESS
++
++- Quota telemetry is headroom/negative evidence only, never cost classification (the sentinel
++  owns classification): a fresh EXHAUSTED reading denies the connection (`safeConnectionIds: []`,
++  reason `QUOTA_EXHAUSTED`); a fresh SAFE reading with headroom keeps the connection and reports
++  `quotaStatus: "SAFE"` + `quotaRemaining`; absent/stale/UNKNOWN telemetry never excludes a
++  provably hard-free route (hard-stop or self-hosted) but also never upgrades an unproven one.
++- Native state: `src/lib/quota/providerQuotaState.ts` (`getProviderQuota`, `recordProviderQuotaUsage`,
++  `clearProviderQuota`); the pool-level synchronous cache reader is `freeAccessQuota.ts`
++  (fail-closed, invalidated on 402/403 via `markAccountUnavailable`).
++
++CIRCUIT BREAKER + COOLDOWN + RECOVERY
++
++- The provider breaker is per provider name via the native registry
++  (`getCircuitBreaker(name, options?)`): the R4 suite asserts distinct instances per provider,
++  both CLOSED initially, `canExecute()` true, and `reset()` stable — i.e. a provider-specific
++  failure cannot globally disable unrelated free providers.
++- Component semantics (threshold trip, HALF_OPEN probe, recovery to CLOSED, per-kind thresholds)
++  are covered by the 52-test native breaker batch, all PASS:
++  `provider-breaker-halfopen-recovery`, `circuit-breaker-failure-kind`,
++  `resilience-settings-upstream429-breaker`, `circuit-breaker-abort-provider-trip-7907`,
++  `8376-econnrefused-breaker`, `breaker-network-error-guard`.
++- Connection-level cooldown/terminal isolation: `filterResilienceBlockedCandidates` drops only the
++  affected connection (future `rateLimitedUntil`, or `testStatus` unavailable/terminal) while
++  unrelated providers' candidates survive; the all-healthy case preserves the pool reference.
++- LIVE evidence from the R1.11 isolated canary: a forced 429 was recorded on the affected
++  connection (`error_code: "429.0"`, `last_error_type: "rate_limited"`,
++  `last_error: "Model mock-local-1 rate_limited"`), the candidate disappeared from the pool,
++  subsequent calls failed fast with 503 (no retry storm), and after the mode was cleared a 200
++  returned with the candidate back and eligibility intact (AUTO_RECOVERY).
++- HONEST LIMITATION: 16 forced 500s updated `last_failure_time` but did not increment
++  `failure_count` (`lastFailureKind: null`, `openCycleCount: 0`), so the provider-breaker OPEN
++  transition could not be forced from the canary with mock 500s; that transition is covered at
++  component level by the batch above instead (the DB row `domain_circuit_breakers` for
++  `ollama-local` remained CLOSED with `failureThreshold: 12`, `resetTimeout: 30000`,
++  `halfOpenRequests: 1`).
++
++WORKLOAD ISOLATION
++
++- There is no IAMM or StockNewsBR code inside the candidate (zero references): both are external
++  client workloads, and neither their code nor their keys were touched.
++- The isolation boundary in the candidate is the per-API-key scope: excluded-connection sets are
++  applied per caller (`getExcludedConnectionIds(apiKeyId, modelStr)` → `filterExcludedCandidates`),
++  so the IAMM view and the StockNewsBR view of the SAME pool differ only by their own exclusions
++  and the legacy/default view (empty set) returns the pool reference unchanged. No global mutation,
++  no cross-profile routing-history bleed.
++
++PROFILE SEMANTICS
++
++- FREE_ONLY cost admission takes NO profile input: `freeProviderSentinel` / `strictZeroCostFilter`
++  (R1), `searchFreeRouting` (R2) and `freeImageRouting` (R3) have no profile parameter.
++- Adding profile markers (IAMM / StockNewsBR / default) to a candidate changes nothing: the
++  FREE_VERIFIED verdict and `safeConnectionIds` are identical, and no profile can make PAID,
++  CREDIT_BACKED, FREE_UNKNOWN, UNKNOWN_COST or NULL_COST eligible (`autoFreeAllowed: false`;
++  `AUTO_FREE_ALLOWED_COST_CLASSES` is exactly `{FREE_VERIFIED, SELF_HOSTED}`).
++- Manual/pinned selections never pass through this module.
++
++## 3. Evidence
++
++- `tests/unit/free-policy-resilience-r4.test.ts`: 14/14 PASS — quota exhaustion/headroom/missing/
++  stale; unproven-never-upgraded; breaker registry keying; cooldown + terminal-status isolation;
++  healthy-identity reference; per-caller exclusion scoping without shared-pool mutation; allowlist
++  narrowing per caller; profile-marker independence; no class upgrade under any profile; admission-set
++  assertion.
++- Native breaker batch: 6 files / 52 tests PASS.
++- autoCombo regression: 4 files / 56 tests PASS (`vitest.mcp.config.ts`).
++- `npm run check:open-sse-typecheck`: no new errors (only the pre-existing
++  `src/app/api/v1/models/catalog.ts` TS2367, proven pre-existing at dea6bb8 via the stash experiment).
++- Scoped eslint, pre-commit hooks (prettier/eslint --fix, docs-sync, t11 any-budget,
++  tracked-artifacts) and the secret scan: all clean.
++
++## 4. Honest limitations
++
++- No new hardening code was required: the native components already satisfied the R4 matrix
++  (the mission explicitly allows component-level evidence where the live setup cannot force a
++  transition).
++- The provider-breaker OPEN transition was not forceable from the canary with mock 500s
++  (documented above); cooldown / rate-limit / recovery were proven live.
++- IAMM/StockNewsBR isolation is proven structurally at the routing layer with deterministic
++  fixtures — no production history was fabricated.
++
++## 5. Data safety
++
++No paid/credit-backed/unknown-cost provider is reachable in R4; no provider calls were made;
++live `:20128` untouched; OpenCode / Hermes / Harness / IAMM / StockNewsBR / AWS / Meta untouched;
++PROVIDERS_DELETED=0; CONNECTIONS_DELETED=0; CREDENTIALS_DELETED=0; PAID_INFERENCE_TRIGGERED=NO;
++SECRETS_EXPOSED=NO.
+-- 
+2.53.0
+
+
+From bd994e3c1b8dd0c887fc6d988b785a083b753e3a Mon Sep 17 00:00:00 2001
+From: StockNewsBR <264292956+StockNewsBR@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 19:00:28 -0300
+Subject: [PATCH 11/11] docs(omniroute): certify final FREE_ONLY candidate
+ (phases 3-8)
+
+---
+ ...INAL_CANDIDATE_CERTIFICATION_2026-09-21.md | 116 ++++++++++++++++++
+ 1 file changed, 116 insertions(+)
+ create mode 100644 docs/OMNIROUTE_FINAL_CANDIDATE_CERTIFICATION_2026-09-21.md
+
+diff --git a/docs/OMNIROUTE_FINAL_CANDIDATE_CERTIFICATION_2026-09-21.md b/docs/OMNIROUTE_FINAL_CANDIDATE_CERTIFICATION_2026-09-21.md
+new file mode 100644
+index 000000000..b3a830375
+--- /dev/null
++++ b/docs/OMNIROUTE_FINAL_CANDIDATE_CERTIFICATION_2026-09-21.md
+@@ -0,0 +1,116 @@
++# OmniRoute — Final Free Autopilot: Final Candidate Certification
++
++Mission: `OMNIROUTE_FREE_AUTOPILOT_FINAL_RECONSTRUCTION_R1_11_R4_LIVE_CLOSURE_2026_09_21`
++Phases covered: 3 → 8 (isolated candidate; **not promoted**, live :20128 untouched)
++Date: 2026-09-21
++Workspace: `/home/dcima/omniroute-final-free-autopilot-20260921`
++Branch: `final/free-autopilot-2026-09-21`
++Canary: `http://127.0.0.1:22128` (isolated DATA_DIR `/tmp/omniroute-final-r1-11-canary`)
++
++## 1. Required fields
++
++```
++UPSTREAM_BASE_SHA=dea6bb8b6b64d3a3d9f639a044625c3452442c56
++R1_SHA=864ddc1d57871827ab2be3a9235bab5f8c12bc48
++R2_SHA=af44c10b595cbe36d3e1168a9918d7f857ce5862
++R3_SHA=309ae65f6976947ec74ac5998343d92ddf4e755e
++R4_SHA=f7f739e661919452bd0fe8355e629ef223a33d51
++FINAL_SOURCE_HEAD=7e5a2d80b23ea2e10b588581236abad1614a04a7
++FINAL_SOURCE_TREE=e83f412187bf46256fbe5429a6a80e85a16acb8e
++
++R1=PASS
++R1_11=PASS
++R2=PASS
++R3=PASS
++R4=PASS
++
++STATIC_FREE_PROVIDER_ALLOWLIST=NO
++DYNAMIC_FREE_PROVIDER_DISCOVERY=PASS
++FREE_VERIFIED_ALLOW=PASS
++SELF_HOSTED_ALLOW=PASS
++FREE_UNKNOWN_DENY=PASS
++UNKNOWN_COST_DENY=PASS
++NULL_COST_DENY=PASS
++PAID_AUTO_DENY=PASS
++CREDIT_BACKED_AUTO_DENY=PASS
++MANUAL_PAID_SELECTION_ALLOWED=YES
++PAID_AUTO_FALLBACK=NO
++
++SEARCH_FREE=PASS
++VISION_FREE=PASS
++IMAGE_GEN_FREE=CONTROLLED_UNAVAILABLE
++
++QUOTA_AWARENESS=PASS
++CIRCUIT_BREAKER=PASS
++COOLDOWN=PASS
++AUTO_RECOVERY=PASS
++WORKLOAD_ISOLATION=PASS
++
++STREAMING=PASS
++TOOL_CALLS=PASS
++OPENAI_COMPAT=PASS
++
++TESTS=PASS (autoCombo 4 files/56; free-image-routing 12/12; R4 resilience 14/14; native breaker batch 6 files/52; search-free-routing 13/13)
++TYPECHECK_CORE=PASS (exit 0)
++OPEN_SSE_TYPECHECK=FAIL_PREEXISTING_BASELINE (only `src/app/api/v1/models/catalog.ts` TS2367, reproduced identically on the pristine base commit — proven pre-existing at dea6bb8 via the stash experiment)
++LINT=PASS (scoped eslint + lint-staged prettier/eslint --fix clean on every R1/R2/R3/R4 change set)
++BUILD=PASS (canonical `npm run build` exit 0 at the final tree; `✓ Compiled successfully in 120s`; standalone assembled)
++
++SECRETS_EXPOSED=NO
++PAID_INFERENCE_TRIGGERED=NO
++OPENCODE_CHANGED=NO
++OPENCODE_AUTH_CHANGED=NO
++OPENCODE_CONNECTIONS_CHANGED=NO
++OPENCODE_ACL_CHANGED=NO
++LIVE_20128_CHANGED=NO
++
++FINAL_CANDIDATE_CERTIFIED=YES
++FINAL_RESULT=PASS
++```
++
++## 2. Commit lineage (final branch)
++
++| SHA         | Subject                                                                                                                  |
++| ----------- | ------------------------------------------------------------------------------------------------------------------------ |
++| `dea6bb8b6` | upstream base (LIVE v3.8.50 baseline commit)                                                                             |
++| `864ddc1d5` | `feat(omniroute): reconstruct strict dynamic FREE_ONLY routing` (R1)                                                     |
++| `3f4d1219b` | `docs(omniroute): record final R1 reconstruction evidence`                                                               |
++| `2e10170e8` | `fix(omniroute): classify FREE_ONLY inspector candidates by bare model id` (R1 inspector correction found by the canary) |
++| `26066ca07` | `docs(omniroute): record final R1.11 isolated canary`                                                                    |
++| `af44c10b5` | `feat(omniroute): reconstruct dynamic FREE_ONLY search routing` (R2)                                                     |
++| `f0e40d969` | `docs(omniroute): record final R2 search reconstruction`                                                                 |
++| `309ae65f6` | `feat(omniroute): reconstruct FREE_ONLY vision and image routing` (R3)                                                   |
++| `ed30d298e` | `docs(omniroute): record final R3 vision and image reconstruction`                                                       |
++| `f7f739e66` | `feat(omniroute): harden quota circuit and workload isolation` (R4 verification suite)                                   |
++| `7e5a2d80b` | `docs(omniroute): record final R4 quota circuit and workload isolation` (= FINAL_SOURCE_HEAD)                            |
++
++## 3. Canary evidence (final build, isolated :22128, zero paid inference)
++
++- `GET /api/health` → 200 `{"status":"ok","timestamp":"2026-09-21T21:59:26.304Z"}`.
++- `GET /v1/models` (scoped canary key) → 200, catalog served (auto/best-coding, …).
++- `POST /v1/chat/completions` `model:"auto"` → 200, served by the local self-hosted mock (`ollama-local`, model `mock-local-1`, content `canary-mock-ok`).
++- Streaming → 200 SSE (`chat.completion.chunk` deltas + `[DONE]`); tool call → 200 `finish_reason:"tool_calls"` (`call_canary_1`).
++- Pinned `ollama-local/mock-local-1` → 200 (explicit/pinned semantics unchanged).
++- Strict candidates (`freeAccessPolicy=strict`) → 13 candidates: **1× SELF_HOSTED + 12× FREE_VERIFIED, all `autoFreeEligible=true`**, no denied class present.
++  - FREE_VERIFIED includes the 5 hard-stop-verified Groq models admitted **with no quota telemetry at all** (the R5 `provider_quota_state rows=0` fail-closed defect is fixed at dispatch).
++- Policy-off matrix showed the full classification (Groq FREE_VERIFIED, AgentRouter CREDIT_BACKED, glm-4.7-flash FREE_UNKNOWN, GPT-4o UNKNOWN_COST) and strict mode excluded every denied class.
++- `/v1/search` with `provider:"auto/search:free"` → **200 via the FREE_VERIFIED search provider `context7`** (real results; free→free selection live).
++- `/v1/images/generations` with `model:"auto/image-gen:free"` → **503 `NO_FREE_IMAGE_PROVIDER_AVAILABLE`** (the designed controlled outcome: no remote free-verified image generator exists and no self-hosted ComfyUI/SD WebUI connection is configured).
++- Live resilience (earlier in the same canary): forced 429 → `error_code 429.0` / `last_error_type rate_limited` recorded → the affected candidate left the pool → subsequent calls failed fast with 503 (no retry storm) → after clearing, a 200 and the candidate returned with eligibility intact.
++
++## 4. Honest limitations (recorded, not hidden)
++
++1. **Provider breaker OPEN transition** was not forceable from the canary with mock 500s: 16 consecutive forced 500s updated `last_failure_time` but left `failure_count=0` / `lastFailureKind=null`, so the breaker stayed CLOSED; the transition is covered by the native 52-test breaker batch instead. Live cooldown/rate-limit/recovery were proven.
++2. **Free image generation** is available only with a self-hosted ComfyUI/SD WebUI connection (or a new explicit hard-stop free budget row); without one, `AUTO_IMAGE_GEN_FREE=CONTROLLED_UNAVAILABLE` is correct by design.
++3. **Keyless no-auth model ids** carry route prefixes (`oc/…`, `felo/…`) while the free-budget catalog uses bare model ids; the dispatch-side filter matches the bare ids (the 7 keyless catalog entries survive strict mode), and the read-only inspector now classifies with the bare `modelId` (correction `2e10170e8`).
++4. **Self-hosted connections need an apiKey placeholder** (e.g. `sk-no-key-required`) to pass the upstream pool credential filter; without it the connection never reaches the FREE_ONLY admission layer (documented operator note).
++5. **Exposed-key rotation remains deferred** by the OpenCode freeze (no OpenCode/auth/credential changes were made in this mission).
++6. IAMM/StockNewsBR were neither edited nor key-touched; their workload isolation is proven structurally at the routing layer with deterministic fixtures (no fabricated production history).
++
++## 5. Data safety
++
++`PROVIDERS_DELETED=0`, `CONNECTIONS_DELETED=0`, `CREDENTIALS_DELETED=0`. All synthetic canary resources live under `/tmp/omniroute-final-r1-11-canary` and `/tmp/omniroute-canary-harness`. Live OmniRoute `127.0.0.1:20128` was never restarted, redeployed, reconfigured or DB-touched. OpenCode / Hermes / Harness / IAMM / StockNewsBR / AWS / Meta untouched. No secrets printed, no paid inference triggered.
++
++## 6. Stop note
++
++Per the mission's Phase 8 instruction: **STOP after this certification.** No promotion, no `:20128` restart, no production package/DB change was performed. Only a certified `FINAL_CANDIDATE_CERTIFIED=YES` + `FINAL_RESULT=PASS` candidate is ready for the separate production-promotion phase, which must be explicitly authorized.
+-- 
+2.53.0
+

@@ -1,0 +1,538 @@
+From 309ae65f6976947ec74ac5998343d92ddf4e755e Mon Sep 17 00:00:00 2001
+From: StockNewsBR <264292956+StockNewsBR@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 18:45:57 -0300
+Subject: [PATCH 07/11] feat(omniroute): reconstruct FREE_ONLY vision and image
+ routing
+
+---
+ open-sse/config/freeImageRouting.ts           | 159 ++++++++++++
+ open-sse/services/autoCombo/builtinCatalog.ts |   2 +
+ src/app/api/v1/images/generations/route.ts    |  51 +++-
+ tests/unit/free-image-routing.test.ts         | 241 ++++++++++++++++++
+ 4 files changed, 441 insertions(+), 12 deletions(-)
+ create mode 100644 open-sse/config/freeImageRouting.ts
+ create mode 100644 tests/unit/free-image-routing.test.ts
+
+diff --git a/open-sse/config/freeImageRouting.ts b/open-sse/config/freeImageRouting.ts
+new file mode 100644
+index 000000000..ba82a92a1
+--- /dev/null
++++ b/open-sse/config/freeImageRouting.ts
+@@ -0,0 +1,159 @@
++/**
++ * FREE_ONLY image-generation routing.
++ *
++ * Image generation is a capability of its own: this module only ever inspects
++ * `IMAGE_PROVIDERS` registry entries (plus the free-budget catalog), so a chat or
++ * vision model can never be selected as an image generator. A remote provider is
++ * FREE_VERIFIED only when the catalog carries an explicit hard-free budget row
++ * (`hardStopGuaranteed === true`); a local self-hosted endpoint (`authType:
++ * "none"`) with an active connection is SELF_HOSTED. Everything else — including
++ * a remote provider that merely reports price 0 without hard-free evidence — is
++ * denied, which is why `auto/image-gen:free` may legitimately answer
++ * `NO_FREE_IMAGE_PROVIDER_AVAILABLE` instead of falling back to a paid generator.
++ */
++import { IMAGE_PROVIDERS } from "./imageRegistry.ts";
++import { FREE_MODEL_BUDGETS, type FreeModelBudget } from "./freeModelCatalog.ts";
++import { isSelfHostedBaseUrl } from "../services/searchFreeRouting.ts";
++
++type ImageProviderEntry = (typeof IMAGE_PROVIDERS)[string];
++import type { FreeCostClass } from "../services/autoCombo/freeProviderSentinel.ts";
++
++export const FREE_IMAGE_ROUTE_ID = "auto/image-gen";
++export const FREE_IMAGE_ROUTE_ID_FREE = "auto/image-gen:free";
++export const NO_FREE_IMAGE_PROVIDER_AVAILABLE = "NO_FREE_IMAGE_PROVIDER_AVAILABLE";
++
++export const FREE_IMAGE_ELIGIBLE_STATUSES: readonly FreeCostClass[] = [
++  "FREE_VERIFIED",
++  "SELF_HOSTED",
++];
++
++const HARD_FREE_BUDGET_TYPES = new Set([
++  "keyless",
++  "recurring-daily",
++  "recurring-monthly",
++  "recurring-uncapped",
++]);
++
++const CREDIT_BACKED_BUDGET_TYPES = new Set(["one-time-initial", "recurring-credit"]);
++
++export type ImageFreeReason =
++  | "SELF_HOSTED_LOCAL_IMAGE_ENDPOINT"
++  | "HARD_STOP_FREE_TIER_VERIFIED"
++  | "CREDIT_BACKED_IMAGE_EXCLUDED"
++  | "DISCONTINUED_IMAGE_EXCLUDED"
++  | "NO_HARD_FREE_IMAGE_EVIDENCE";
++
++export interface ImageFreeVerdict {
++  status: FreeCostClass;
++  reason: ImageFreeReason;
++}
++
++export function isFreeImageEligibleStatus(status: FreeCostClass): boolean {
++  return FREE_IMAGE_ELIGIBLE_STATUSES.includes(status);
++}
++
++export function classifyImageProviderFreeStatus(params: {
++  providerId: string;
++  authType?: string | null;
++  baseUrl?: string | null;
++  modelId: string;
++  budgets?: readonly FreeModelBudget[];
++  hasActiveConnection: boolean;
++}): ImageFreeVerdict {
++  if (
++    params.authType === "none" &&
++    params.hasActiveConnection &&
++    isSelfHostedBaseUrl(params.baseUrl)
++  ) {
++    return { status: "SELF_HOSTED", reason: "SELF_HOSTED_LOCAL_IMAGE_ENDPOINT" };
++  }
++
++  const budgets = params.budgets ?? FREE_MODEL_BUDGETS;
++  const row = budgets.find(
++    (budget) => budget.provider === params.providerId && budget.modelId === params.modelId
++  );
++
++  if (!row) return { status: "FREE_UNKNOWN", reason: "NO_HARD_FREE_IMAGE_EVIDENCE" };
++  if (CREDIT_BACKED_BUDGET_TYPES.has(row.freeType)) {
++    return { status: "CREDIT_BACKED", reason: "CREDIT_BACKED_IMAGE_EXCLUDED" };
++  }
++  if (row.freeType === "discontinued") {
++    return { status: "DISCONTINUED", reason: "DISCONTINUED_IMAGE_EXCLUDED" };
++  }
++  if (HARD_FREE_BUDGET_TYPES.has(row.freeType)) {
++    return row.hardStopGuaranteed === true
++      ? { status: "FREE_VERIFIED", reason: "HARD_STOP_FREE_TIER_VERIFIED" }
++      : { status: "FREE_UNKNOWN", reason: "NO_HARD_FREE_IMAGE_EVIDENCE" };
++  }
++  return { status: "FREE_UNKNOWN", reason: "NO_HARD_FREE_IMAGE_EVIDENCE" };
++}
++
++export interface FreeImageSelection {
++  ok: true;
++  providerId: string;
++  modelId: string;
++  status: Extract<FreeCostClass, "FREE_VERIFIED" | "SELF_HOSTED">;
++  reason: ImageFreeReason;
++}
++
++export interface FreeImageUnavailable {
++  ok: false;
++  code: typeof NO_FREE_IMAGE_PROVIDER_AVAILABLE;
++  reason: "NO_ELIGIBLE_FREE_IMAGE_PROVIDER" | "ALL_FREE_IMAGE_PROVIDERS_CIRCUIT_OPEN";
++  considered: Array<{ providerId: string; modelId: string; status: FreeCostClass }>;
++}
++
++export function resolveFreeImageProvider(deps: {
++  providers?: Record<string, ImageProviderEntry>;
++  budgets?: readonly FreeModelBudget[];
++  hasActiveConnection: (providerId: string) => boolean;
++  isCircuitOpen?: (providerId: string) => boolean;
++}): FreeImageSelection | FreeImageUnavailable {
++  const providers = deps.providers ?? IMAGE_PROVIDERS;
++  const budgets = deps.budgets ?? FREE_MODEL_BUDGETS;
++  const considered: FreeImageUnavailable["considered"] = [];
++  let sawCircuitOpen = false;
++
++  for (const [providerId, config] of Object.entries(providers)) {
++    if (deps.isCircuitOpen?.(providerId)) {
++      sawCircuitOpen = true;
++      continue;
++    }
++    if (!deps.hasActiveConnection(providerId)) continue;
++
++    const models = Array.isArray(config?.models) ? config.models : [];
++    for (const model of models) {
++      const modelId = typeof model === "string" ? model : model?.id;
++      if (!modelId) continue;
++
++      const verdict = classifyImageProviderFreeStatus({
++        providerId,
++        authType: config?.authType,
++        baseUrl: config?.baseUrl,
++        modelId,
++        budgets,
++        hasActiveConnection: true,
++      });
++      considered.push({ providerId, modelId, status: verdict.status });
++
++      if (isFreeImageEligibleStatus(verdict.status)) {
++        return {
++          ok: true,
++          providerId,
++          modelId,
++          status: verdict.status as FreeImageSelection["status"],
++          reason: verdict.reason,
++        };
++      }
++    }
++  }
++
++  return {
++    ok: false,
++    code: NO_FREE_IMAGE_PROVIDER_AVAILABLE,
++    reason: sawCircuitOpen
++      ? "ALL_FREE_IMAGE_PROVIDERS_CIRCUIT_OPEN"
++      : "NO_ELIGIBLE_FREE_IMAGE_PROVIDER",
++    considered,
++  };
++}
+diff --git a/open-sse/services/autoCombo/builtinCatalog.ts b/open-sse/services/autoCombo/builtinCatalog.ts
+index dc1b7f046..e61f58997 100644
+--- a/open-sse/services/autoCombo/builtinCatalog.ts
++++ b/open-sse/services/autoCombo/builtinCatalog.ts
+@@ -65,6 +65,8 @@ export const AUTO_SUFFIX_VARIANTS: string[] = [
+   "auto/reasoning:pro",
+   "auto/vision",
+   "auto/multimodal",
++  "auto/vision:free",
++  "auto/multimodal:free",
+ ];
+ 
+ type ResolvedAutoVariant =
+diff --git a/src/app/api/v1/images/generations/route.ts b/src/app/api/v1/images/generations/route.ts
+index cc8403115..64029830d 100644
+--- a/src/app/api/v1/images/generations/route.ts
++++ b/src/app/api/v1/images/generations/route.ts
+@@ -20,6 +20,14 @@ import { v1ImageGenerationSchema } from "@/shared/validation/schemas";
+ import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
+ 
+ import { getComboByName } from "@/lib/db/combos";
++import {
++  FREE_IMAGE_ROUTE_ID,
++  FREE_IMAGE_ROUTE_ID_FREE,
++  NO_FREE_IMAGE_PROVIDER_AVAILABLE,
++  resolveFreeImageProvider,
++} from "@omniroute/open-sse/config/freeImageRouting.ts";
++import { getCachedProviderConnections } from "@/lib/db/readCache";
++import { getCircuitBreaker } from "@/shared/utils/circuitBreaker";
+ import { getAllCustomModels } from "@/lib/db/models";
+ import { resolveProxyForConnection } from "@/lib/db/settings";
+ import { resolveImageRouteModel } from "@/lib/images/imageRouteModel";
+@@ -97,6 +105,19 @@ function publicBaseUrlHeaders(headers: Headers): Record<string, string> {
+   return out;
+ }
+ 
++async function resolveFreeImageRouteSelection() {
++  const connections = await getCachedProviderConnections();
++  const activeProviders = new Set(
++    connections
++      .filter((connection) => (connection as { isActive?: boolean }).isActive !== false)
++      .map((connection) => (connection as { provider: string }).provider)
++  );
++  return resolveFreeImageProvider({
++    hasActiveConnection: (providerId) => activeProviders.has(providerId),
++    isCircuitOpen: (providerId) => !getCircuitBreaker(providerId).canExecute(),
++  });
++}
++
+ async function postHandler(request, context) {
+   let rawBody;
+   try {
+@@ -122,21 +143,23 @@ async function postHandler(request, context) {
+   const policy = await enforceApiKeyPolicy(request, body.model);
+   if (policy.rejection) return policy.rejection;
+ 
++  // FREE_ONLY image generation — `auto/image-gen[:free]` can only ever reach a
++  // free-verified or self-hosted image generator, never a paid/credit-backed one.
++  if (body.model === FREE_IMAGE_ROUTE_ID || body.model === FREE_IMAGE_ROUTE_ID_FREE) {
++    const selection = await resolveFreeImageRouteSelection();
++    if (!selection.ok) {
++      return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, NO_FREE_IMAGE_PROVIDER_AVAILABLE);
++    }
++    body.model = `${selection.providerId}/${selection.modelId}`;
++  }
++
+   // #9239: Detect combo name and divert to full image combo execution.
+   // Checks before resolveImageRouteModel so we skip single-target flattening.
+   if (body.model && typeof body.model === "string" && !body.model.includes("/")) {
+     const combo = await getComboByName(body.model as string);
+     if (combo) {
+-      const { executeImageCombo } = await import(
+-        "@omniroute/open-sse/services/imageCombo"
+-      );
+-      return executeImageCombo(
+-        body.model as string,
+-        body,
+-        { request, policy },
+-        startTime,
+-        log
+-      );
++      const { executeImageCombo } = await import("@omniroute/open-sse/services/imageCombo");
++      return executeImageCombo(body.model as string, body, { request, policy }, startTime, log);
+     }
+   }
+ 
+@@ -246,7 +269,8 @@ async function postHandler(request, context) {
+       provider,
+       null,
+       syncedEndpointRoute?.connectionIds ?? null,
+-      requestedModel    );
++      requestedModel
++    );
+     if (!credentials) {
+       return errorResponse(
+         HTTP_STATUS.BAD_REQUEST,
+@@ -346,7 +370,10 @@ async function postHandler(request, context) {
+     });
+   }
+ 
+-  const errorPayload = toJsonErrorPayload((result as any).error, "Image generation provider error") as {
++  const errorPayload = toJsonErrorPayload(
++    (result as any).error,
++    "Image generation provider error"
++  ) as {
+     error?: { message?: string };
+   };
+   const message =
+diff --git a/tests/unit/free-image-routing.test.ts b/tests/unit/free-image-routing.test.ts
+new file mode 100644
+index 000000000..08a9608e1
+--- /dev/null
++++ b/tests/unit/free-image-routing.test.ts
+@@ -0,0 +1,241 @@
++/**
++ * R3 reconstruction — FREE_ONLY image-generation routing.
++ *
++ * Node:test scope: top-level tests/unit/*.test.ts run under the built-in test
++ * runner (tests/unit/autoCombo/** is the vitest-only scope).
++ */
++import { test } from "node:test";
++import assert from "node:assert/strict";
++
++import {
++  FREE_IMAGE_ELIGIBLE_STATUSES,
++  FREE_IMAGE_ROUTE_ID,
++  FREE_IMAGE_ROUTE_ID_FREE,
++  NO_FREE_IMAGE_PROVIDER_AVAILABLE,
++  classifyImageProviderFreeStatus,
++  isFreeImageEligibleStatus,
++  resolveFreeImageProvider,
++} from "../../open-sse/config/freeImageRouting.ts";
++import type { FreeModelBudget } from "../../open-sse/config/freeModelCatalog.ts";
++
++const LOCAL_COMFY = "http://127.0.0.1:8188";
++
++function provider(authType: string, baseUrl: string, models: string[]) {
++  return {
++    id: "synthetic",
++    name: "Synthetic",
++    baseUrl,
++    method: "POST",
++    authType,
++    authHeader: "authorization",
++    models: models.map((id) => ({ id, name: id })),
++  };
++}
++
++function budgetRow(
++  providerId: string,
++  modelId: string,
++  freeType: string,
++  hardStopGuaranteed?: boolean
++): FreeModelBudget {
++  return {
++    provider: providerId,
++    modelId,
++    displayName: modelId,
++    monthlyTokens: 0,
++    creditTokens: 0,
++    freeType,
++    poolKey: null,
++    tos: "ok",
++    hardStopGuaranteed,
++  } as FreeModelBudget;
++}
++
++test("classification: local self-hosted endpoint with an active connection is SELF_HOSTED", () => {
++  const verdict = classifyImageProviderFreeStatus({
++    providerId: "comfyui",
++    authType: "none",
++    baseUrl: LOCAL_COMFY,
++    modelId: "sd-xl",
++    budgets: [],
++    hasActiveConnection: true,
++  });
++  assert.equal(verdict.status, "SELF_HOSTED");
++  assert.equal(verdict.reason, "SELF_HOSTED_LOCAL_IMAGE_ENDPOINT");
++  assert.equal(isFreeImageEligibleStatus(verdict.status), true);
++});
++
++test("classification: a remote keyless provider without hard-free evidence is FREE_UNKNOWN", () => {
++  const verdict = classifyImageProviderFreeStatus({
++    providerId: "aihorde",
++    authType: "none",
++    baseUrl: "https://aihorde.net/api/v2",
++    modelId: "stable_diffusion",
++    budgets: [],
++    hasActiveConnection: true,
++  });
++  assert.equal(verdict.status, "FREE_UNKNOWN");
++  assert.equal(verdict.reason, "NO_HARD_FREE_IMAGE_EVIDENCE");
++  assert.equal(isFreeImageEligibleStatus(verdict.status), false);
++});
++
++test("classification: a local endpoint without an active connection is not admitted", () => {
++  const verdict = classifyImageProviderFreeStatus({
++    providerId: "comfyui",
++    authType: "none",
++    baseUrl: LOCAL_COMFY,
++    modelId: "sd-xl",
++    budgets: [],
++    hasActiveConnection: false,
++  });
++  assert.equal(verdict.status, "FREE_UNKNOWN");
++  assert.equal(isFreeImageEligibleStatus(verdict.status), false);
++});
++
++test("classification: a hard-free budget row with hardStopGuaranteed is FREE_VERIFIED", () => {
++  const verdict = classifyImageProviderFreeStatus({
++    providerId: "freeimg",
++    authType: "apikey",
++    baseUrl: "https://freeimg.example.com",
++    modelId: "free-model",
++    budgets: [budgetRow("freeimg", "free-model", "recurring-daily", true)],
++    hasActiveConnection: true,
++  });
++  assert.equal(verdict.status, "FREE_VERIFIED");
++  assert.equal(verdict.reason, "HARD_STOP_FREE_TIER_VERIFIED");
++  assert.equal(isFreeImageEligibleStatus(verdict.status), true);
++});
++
++test("classification: a hard-free freeType without hardStopGuaranteed stays FREE_UNKNOWN", () => {
++  const verdict = classifyImageProviderFreeStatus({
++    providerId: "freeimg",
++    authType: "apikey",
++    baseUrl: "https://freeimg.example.com",
++    modelId: "free-model",
++    budgets: [budgetRow("freeimg", "free-model", "recurring-daily")],
++    hasActiveConnection: true,
++  });
++  assert.equal(verdict.status, "FREE_UNKNOWN");
++  assert.equal(verdict.reason, "NO_HARD_FREE_IMAGE_EVIDENCE");
++});
++
++test("classification: credit-shaped budget rows are CREDIT_BACKED", () => {
++  for (const freeType of ["one-time-initial", "recurring-credit"]) {
++    const verdict = classifyImageProviderFreeStatus({
++      providerId: "trialimg",
++      authType: "apikey",
++      baseUrl: "https://trialimg.example.com",
++      modelId: "trial-model",
++      budgets: [budgetRow("trialimg", "trial-model", freeType, true)],
++      hasActiveConnection: true,
++    });
++    assert.equal(verdict.status, "CREDIT_BACKED");
++    assert.equal(verdict.reason, "CREDIT_BACKED_IMAGE_EXCLUDED");
++    assert.equal(isFreeImageEligibleStatus(verdict.status), false);
++  }
++});
++
++test("classification: discontinued budget rows are DISCONTINUED", () => {
++  const verdict = classifyImageProviderFreeStatus({
++    providerId: "deadimg",
++    authType: "apikey",
++    baseUrl: "https://deadimg.example.com",
++    modelId: "dead-model",
++    budgets: [budgetRow("deadimg", "dead-model", "discontinued", true)],
++    hasActiveConnection: true,
++  });
++  assert.equal(verdict.status, "DISCONTINUED");
++  assert.equal(verdict.reason, "DISCONTINUED_IMAGE_EXCLUDED");
++  assert.equal(isFreeImageEligibleStatus(verdict.status), false);
++});
++
++test("resolver: the first eligible provider in registry order wins", () => {
++  const selection = resolveFreeImageProvider({
++    providers: {
++      "remote-first": provider("apikey", "https://remote.example.com", ["unknown-model"]),
++      "local-second": provider("none", LOCAL_COMFY, ["sd-xl"]),
++    },
++    budgets: [],
++    hasActiveConnection: () => true,
++    isCircuitOpen: () => false,
++  });
++  assert.equal(selection.ok, true);
++  if (selection.ok) {
++    assert.equal(selection.providerId, "local-second");
++    assert.equal(selection.modelId, "sd-xl");
++    assert.equal(selection.status, "SELF_HOSTED");
++  }
++});
++
++test("resolver: providers without an active connection are skipped", () => {
++  const selection = resolveFreeImageProvider({
++    providers: { "local-only": provider("none", LOCAL_COMFY, ["sd-xl"]) },
++    budgets: [],
++    hasActiveConnection: () => false,
++    isCircuitOpen: () => false,
++  });
++  assert.equal(selection.ok, false);
++  if (!selection.ok) {
++    assert.equal(selection.code, NO_FREE_IMAGE_PROVIDER_AVAILABLE);
++    assert.equal(selection.reason, "NO_ELIGIBLE_FREE_IMAGE_PROVIDER");
++  }
++});
++
++test("resolver: circuit-open providers are skipped and reported", () => {
++  const selection = resolveFreeImageProvider({
++    providers: { "local-only": provider("none", LOCAL_COMFY, ["sd-xl"]) },
++    budgets: [],
++    hasActiveConnection: () => true,
++    isCircuitOpen: () => true,
++  });
++  assert.equal(selection.ok, false);
++  if (!selection.ok) {
++    assert.equal(selection.code, NO_FREE_IMAGE_PROVIDER_AVAILABLE);
++    assert.equal(selection.reason, "ALL_FREE_IMAGE_PROVIDERS_CIRCUIT_OPEN");
++  }
++});
++
++test("resolver: nothing eligible returns the controlled code with considered entries", () => {
++  const selection = resolveFreeImageProvider({
++    providers: {
++      "remote-keyless": provider("none", "https://aihorde.net/api/v2", ["stable_diffusion"]),
++    },
++    budgets: [],
++    hasActiveConnection: () => true,
++    isCircuitOpen: () => false,
++  });
++  assert.equal(selection.ok, false);
++  if (!selection.ok) {
++    assert.equal(selection.code, NO_FREE_IMAGE_PROVIDER_AVAILABLE);
++    assert.equal(selection.reason, "NO_ELIGIBLE_FREE_IMAGE_PROVIDER");
++    assert.equal(selection.considered.length, 1);
++    assert.equal(selection.considered[0].status, "FREE_UNKNOWN");
++  }
++});
++
++test("separation: vision/chat model ids are never selected as image generators", () => {
++  const selection = resolveFreeImageProvider({
++    providers: { "local-only": provider("none", LOCAL_COMFY, ["sd-xl"]) },
++    budgets: [
++      budgetRow("freechat", "qwen-vision", "keyless", true),
++      budgetRow("freechat", "gemini-2.5-flash", "recurring-daily", true),
++    ],
++    hasActiveConnection: () => true,
++    isCircuitOpen: () => false,
++  });
++  assert.equal(selection.ok, true);
++  if (selection.ok) {
++    assert.equal(selection.providerId, "local-only");
++    assert.notEqual(selection.modelId, "qwen-vision");
++    assert.notEqual(selection.modelId, "gemini-2.5-flash");
++  }
++  assert.equal(FREE_IMAGE_ELIGIBLE_STATUSES.join(","), "FREE_VERIFIED,SELF_HOSTED");
++  assert.equal(isFreeImageEligibleStatus("PAID"), false);
++  assert.equal(isFreeImageEligibleStatus("CREDIT_BACKED"), false);
++  assert.equal(isFreeImageEligibleStatus("UNKNOWN_COST"), false);
++  assert.equal(isFreeImageEligibleStatus("NULL_COST"), false);
++  assert.equal(isFreeImageEligibleStatus("FREE_UNKNOWN"), false);
++  assert.equal(FREE_IMAGE_ROUTE_ID, "auto/image-gen");
++  assert.equal(FREE_IMAGE_ROUTE_ID_FREE, "auto/image-gen:free");
++  assert.equal(NO_FREE_IMAGE_PROVIDER_AVAILABLE, "NO_FREE_IMAGE_PROVIDER_AVAILABLE");
++});
+-- 
+2.53.0
+
