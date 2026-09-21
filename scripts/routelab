@@ -520,16 +520,20 @@ async function streamChat(model) {
   out.chat_stream = { status: streamed.status, ms: streamed.ms, chunks: streamed.chunks, done: streamed.done, model: work };
   const tools = await chat(work, { tools: [{ type: "function", function: { name: "get_time", description: "get time", parameters: { type: "object", properties: {} } } }], tool_choice: "auto" });
   out.chat_tools = { status: tools.status, has_tool_calls: tools.text ? tools.text.includes("tool_calls") : false, model: work };
-  const search = await call("/search", { body: { query: "omniroute", max_results: 2 } });
-  out.search = { status: search.status, ms: search.ms };
+  const search = await call("/search", { body: { provider: "auto/search:free", query: "omniroute", max_results: 2 } });
+  let searchProvider = null;
+  try { searchProvider = JSON.parse(search.text || "{}")?.data?.provider ?? null; } catch {}
+  out.search = { status: search.status, ms: search.ms, provider: searchProvider, route: "auto/search:free" };
   out.vision = { model: null, status: null, note: "no_free_vision_model_found" };
   for (const vm of visionList.slice(0, 4)) {
     const v = await chat(vm, { timeout: 20000, messages: [{ role: "user", content: [{ type: "text", text: "what color is this? one word" }, { type: "image_url", image_url: { url: "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" } }] }], max_tokens: 8 });
     if (v.status === 200) { out.vision = { model: vm, status: v.status, ms: v.ms }; break; }
     out.vision = { model: vm, status: v.status, ms: v.ms, note: "candidate_failed" };
   }
-  const img = await call("/images/generations", { body: { model: "route-lab-nonexistent-image-model", prompt: "x" } });
-  out.image_route = { status: img.status, note: "route_liveness_only_no_generation" };
+  const img = await call("/images/generations", { body: { model: "auto/image-gen:free", prompt: "routelab capability check" } });
+  let imgCode = null;
+  try { imgCode = JSON.parse(img.text || "{}")?.error?.code ?? null; } catch {}
+  out.image_route = { status: img.status, code: imgCode, note: "free_image_route_capability_no_paid_substitution" };
   process.stdout.write(JSON.stringify(out));
 })();
 `;
@@ -550,9 +554,9 @@ async function streamChat(model) {
   console.log(`PROBE_CHAT_AUTO_FREE=${ok(parsed.chat_auto_free.status)}`);
   console.log(`PROBE_CHAT_STREAMING=${ok(parsed.chat_stream.status)} chunks=${parsed.chat_stream.chunks} done=${parsed.chat_stream.done === true}`);
   console.log(`PROBE_CHAT_TOOL_CALLING=${ok(parsed.chat_tools.status)} tool_calls=${parsed.chat_tools.has_tool_calls}`);
-  console.log(`PROBE_SEARCH=${parsed.search.status === null ? "N/A" : ok(parsed.search.status)}`);
+  console.log(`PROBE_SEARCH_FREE=${parsed.search.status === null ? "N/A" : ok(parsed.search.status)} route=auto/search:free provider=${parsed.search.provider || "n/a"}`);
   console.log(`PROBE_VISION=${parsed.vision.status === null ? "N/A" : ok(parsed.vision.status)} model=${parsed.vision.model || parsed.vision.note || "n/a"}`);
-  console.log(`PROBE_IMAGE_ROUTE_LIVENESS=${ok(parsed.image_route.status)} (no generation executed)`);
+  console.log(`PROBE_IMAGE_GEN_FREE=${parsed.image_route.status === 503 ? "CONTROLLED_UNAVAILABLE" : ok(parsed.image_route.status)} code=${parsed.image_route.code || "n/a"} (no paid substitution)`);
 }
 
 function selftest() {

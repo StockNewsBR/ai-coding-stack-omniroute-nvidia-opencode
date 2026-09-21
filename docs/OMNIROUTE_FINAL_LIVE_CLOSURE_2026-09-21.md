@@ -162,3 +162,40 @@ The bundle also contains `storage.sqlite` (91 MB), the systemd unit and drop-ins
 
 `FINAL_LIVE_CERTIFIED=YES` · `FINAL_RESULT=PASS`
 The certified FREE_ONLY candidate (`7e5a2d80b`) is live on `127.0.0.1:20128` with dynamic free-provider discovery, strict free-only auto routing, unchanged manual/pinned paid access, and zero paid fallback. OpenCode, Hermes, Harness, IAMM, StockNewsBR, AWS and Meta remain untouched; no credential was rotated and no paid inference was triggered.
+
+## 9. Re-verification addendum (independent pass, 2026-09-21T23:12Z)
+
+A second pass re-ran the live checks against the same promoted runtime: no re-promotion, no service restart, no runtime code change.
+
+**Runtime identity (unchanged)**
+
+- `omniroute.service` active, MainPID 391192, NRestarts=0, listener on 127.0.0.1:20128, `GET /api/health` → 200 `{"status":"ok"}`.
+- Installed package version 3.8.50 with `dist/BUILD_SHA=7e5a2d80b`; the installed runtime tree diffs clean against the certified tarball (`omniroute-3.8.50.tgz`, sha256 `5899689363d8910a171fef65d28326bf9b26f16af95a74ff18d6db6492eb8bb3`) ⇒ `LIVE_RUNTIME==CERTIFIED_ARTIFACT=YES` (no content differences; excludes `node_modules`/dist data dirs).
+
+**Live capability probes (free-only, no paid inference)**
+
+| probe | route / target | result |
+|---|---|---|
+| health | `GET /api/health` | 200 |
+| catalog | `GET /v1/models` | 200, count 674 (dynamic; see below) |
+| text auto free | `auto/best-free` | 200 |
+| streaming | `nvidia/openai/gpt-oss-20b` | 200, `done`, 8 chunks |
+| tool calls | `nvidia/openai/gpt-oss-20b` | 200, `tool_calls=true` |
+| search auto free | `POST /search` `provider=auto/search:free` | 200, provider `context7` |
+| vision auto free | `agnes/agnes-2.5-flash` | 200 |
+| image gen free | `auto/image-gen:free` | 503 `NO_FREE_IMAGE_PROVIDER_AVAILABLE` (controlled; no paid substitution) |
+| pinned free model | `oc/deepseek-v4-flash-free` | 400 upstream "Model is unavailable" (provider state) |
+| pinned free provider | `openrouter/cohere/north-mini-code:free` | 429 free-models-per-day (rate limit) |
+
+Probe semantics correction: RouteLab's earlier search probe used the legacy no-`provider` path (`ollama-search`, 401) — that is not the certified contract; the probe now sends `provider:"auto/search:free"` (context7, 200). The image probe now targets the real free route id (`auto/image-gen:free`) instead of a fake model id, and observes the controlled 503.
+
+**Dynamic behavior (live evidence)**
+
+- Catalog size moves with free-provider availability (671 → 674 observed post-promotion; 676 at promotion). The `+2` entries `auto/vision:free` and `auto/multimodal:free` are present ⇒ dynamic FREE provider discovery, not a regression.
+- With the pinned free model unavailable upstream and a pinned free provider quota-limited, `auto/best-free` still served 200 — the FREE candidate moved to another eligible provider ⇒ FREE→FREE failover/recovery live evidence; no paid fallback.
+
+**Deterministic re-run against the certified source (66/66)**
+
+- R1 sentinel policy matrix 21/21 (vitest config), R2 search-free 13/13, R3 image-free 12/12, R4 resilience 14/14, free-model-catalog 6/6.
+
+**Scope of this pass:** evidence/tooling only (`scripts/routelab` probe alignment + reports); no runtime source change, no service restart, no production DB write, no OpenCode/Hermes/Harness/IAMM/StockNewsBR/AWS/Meta change; no paid inference; no secret material printed. Verdict unchanged: `FINAL_LIVE_CERTIFIED=YES` · `FINAL_RESULT=PASS`.
