@@ -1,0 +1,601 @@
+#!/usr/bin/env node
+"use strict";
+
+/**
+ * RouteLab - read-only routing evaluation + explainability for OmniRoute Free Autopilot.
+ *
+ * Evaluates task classes (coding | general | search | vision | image) over existing
+ * OmniRoute telemetry (call_logs, routing_decisions, circuit/quota/health tables).
+ * Emits safe metadata only: never prompts, request bodies, or API keys.
+ * Emits factual signals only: never fabricated numeric scores.
+ *
+ * Usage:
+ *   scripts/routelab summary [--since YYYY-MM-DD] [--json]
+ *   scripts/routelab classes [--json]
+ *   scripts/routelab explain <request|correlation|response id>
+ *   scripts/routelab smart [--json]
+ *   scripts/routelab snapshot [--out DIR]
+ *   scripts/routelab selftest
+ */
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+
+const HOME = process.env.HOME || process.env.USERPROFILE;
+const DB = path.join(HOME, ".omniroute/storage.sqlite");
+const INFERENCE_PATHS = [
+  "/v1/chat/completions",
+  "/chat/completions",
+  "/v1/responses",
+  "/v1/embeddings",
+  "/v1/images/generations",
+  "/v1/image/generations",
+  "/v1/search",
+  "/v1/media",
+];
+
+const IMAGE_RE = /(^|[\/\-\s])(image|imagen|dall-?e|flux|stable-diffusion|sdxl|sd3|qwen-image|z-image|agnes-image|gpt-image|nano-banana)/;
+const VISION_RE = /(vision|-vl($|[^a-z])|\bvl\b|multimodal|glm-4\.6v|vision-exp)/;
+const SEARCH_RE = /(search|websearch|browse|perplex)/;
+const CODING_RE = /(coder|deepseek-v4|qwen3[^\/]*code|glm-4\.[0-9]+-code|kilo-auto)/;
+
+function sql(query) {
+  const res = spawnSync("sqlite3", ["-json", DB, query], {
+    encoding: "utf8",
+    maxBuffer: 256 * 1024 * 1024,
+    env: { ...process.env, NO_COLOR: "1" },
+  });
+  if (res.status !== 0) throw new Error(`sqlite3 failed: ${res.stderr || res.error}`);
+  return JSON.parse((res.stdout || "").trim() || "[]");
+}
+
+function esc(value) {
+  return String(value == null ? "" : value).replace(/'/g, "''");
+}
+
+function safeJson(value) {
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function classify(row, cap) {
+  const model = String(row.requested_model || row.model || "").toLowerCase();
+  const p = String(row.path || "").toLowerCase();
+  const out = safeJson(cap && cap.modalities_output).map((s) => String(s).toLowerCase());
+  const inp = safeJson(cap && cap.modalities_input).map((s) => String(s).toLowerCase());
+  if (out.includes("image") || IMAGE_RE.test(model) || /images\/generations|imagegeneration/.test(p)) return "image";
+  if (inp.includes("image") || VISION_RE.test(model) || /\/media|vision/.test(p)) return "vision";
+  if (SEARCH_RE.test(p) || SEARCH_RE.test(model)) return "search";
+  if (CODING_RE.test(model)) return "coding";
+  return "general";
+}
+
+function profileFor(apiKeyName) {
+  const name = String(apiKeyName || "");
+  if (/aimmarket|stocknews/i.test(name)) return "STOCKNEWSBR";
+  if (/\baimm\b/i.test(name)) return "IAMM";
+  return "LEGACY_DEFAULT";
+}
+
+function loadCaps() {
+  const rows = sql(
+    "SELECT provider,model_id,tool_call,reasoning,attachment,structured_output,modalities_input,modalities_output,family,status FROM model_capabilities"
+  );
+  const byPm = new Map();
+  const byModel = new Map();
+  for (const row of rows) {
+    byPm.set(`${row.provider}\u0000${row.model_id}`, row);
+    if (!byModel.has(row.model_id)) byModel.set(row.model_id, row);
+  }
+  return { byPm, byModel };
+}
+
+function capFor(caps, row) {
+  return (
+    caps.byPm.get(`${row.provider}\u0000${row.model}`) ||
+    caps.byPm.get(`${row.provider}\u0000${row.requested_model}`) ||
+    caps.byModel.get(row.requested_model) ||
+    caps.byModel.get(row.model) ||
+    null
+  );
+}
+
+function readJson(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function configApiKey(config) {
+  const value = config && config.provider && config.provider.omniroute && config.provider.omniroute.options
+    ? config.provider.omniroute.options.apiKey
+    : null;
+  if (typeof value !== "string") return null;
+  const envMatch = value.match(/^\{env:([^}]+)\}$/);
+  if (envMatch) return process.env[envMatch[1]] || null;
+  const fileMatch = value.match(/^\{file:(.+)\}$/);
+  if (fileMatch) {
+    try { return fs.readFileSync(fileMatch[1], "utf8").trim(); } catch { return null; }
+  }
+  return value;
+}
+
+function liveInventory() {
+  const config = readJson(path.join(HOME, ".config/opencode/opencode.json")) || readJson(path.join(HOME, ".opencode/opencode.json"));
+  const key = configApiKey(config);
+  const baseURL = config && config.provider && config.provider.omniroute && config.provider.omniroute.options
+    ? config.provider.omniroute.options.baseURL
+    : "http://localhost:20128/v1";
+  if (!key || !baseURL) return { models: [], error: "missing_key_or_endpoint" };
+  const res = spawnSync("node", ["-e", `
+    const baseURL = ${JSON.stringify(baseURL)};
+    const key = process.env.RL_KEY;
+    fetch(baseURL.replace(/\\/$/, "") + "/models", { headers: { authorization: "Bearer " + key }, signal: AbortSignal.timeout(10000) })
+      .then(async (r) => { process.stdout.write(JSON.stringify(r.ok ? await r.json() : { error: r.status })); })
+      .catch((e) => { process.stdout.write(JSON.stringify({ error: String(e) })); });
+  `], { encoding: "utf8", env: { ...process.env, RL_KEY: key }, timeout: 20000 });
+  try {
+    const payload = JSON.parse((res.stdout || "").trim() || "{}");
+    return { models: Array.isArray(payload.data) ? payload.data : [], error: payload.error || null };
+  } catch {
+    return { models: [], error: "unparseable_inventory" };
+  }
+}
+
+function isFree(model) {
+  return Number(model && model.pricing && model.pricing.input) === 0 && Number(model && model.pricing && model.pricing.output) === 0;
+}
+
+function managementModels() {
+  const res = spawnSync("omniroute", ["--quiet", "--no-color", "--output", "json", "api", "models", "get-api-models"], {
+    encoding: "utf8",
+    env: { ...process.env, NO_COLOR: "1" },
+  });
+  const clean = `${res.stdout || ""}\n${res.stderr || ""}`.replace(/\x1b\[[0-9;]*m/g, "");
+  const start = clean.indexOf("{");
+  const end = clean.lastIndexOf("}");
+  if (start < 0 || end < start) return [];
+  try {
+    const parsed = JSON.parse(clean.slice(start, end + 1));
+    return Array.isArray(parsed.models) ? parsed.models : [];
+  } catch {
+    return [];
+  }
+}
+
+function settings() {
+  const res = spawnSync("omniroute", ["--quiet", "--no-color", "--output", "json", "api", "settings", "get-api-settings"], {
+    encoding: "utf8",
+    env: { ...process.env, NO_COLOR: "1" },
+  });
+  const clean = `${res.stdout || ""}\n${res.stderr || ""}`.replace(/\x1b\[[0-9;]*m/g, "");
+  const start = clean.indexOf("{");
+  const end = clean.lastIndexOf("}");
+  if (start < 0 || end < start) return null;
+  try { return JSON.parse(clean.slice(start, end + 1)); } catch { return null; }
+}
+
+function inferenceRows(since) {
+  const paths = INFERENCE_PATHS.map((p) => `'${esc(p)}'`).join(",");
+  const where = [`path IN (${paths})`];
+  if (since) where.push(`timestamp >= date('${esc(since)}')`);
+  return sql(
+    `SELECT id,correlation_id,response_id,status,model,requested_model,provider,api_key_name,duration,` +
+      `tokens_in,tokens_out,combo_name,combo_step_id,error_type,error_summary,model_pinned,timestamp,path ` +
+      `FROM call_logs WHERE ${where.join(" AND ")} ORDER BY timestamp`
+  );
+}
+
+function percentile(sorted, p) {
+  if (!sorted.length) return null;
+  const idx = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length));
+  return sorted[idx];
+}
+
+function summarize(rows, caps) {
+  const buckets = new Map();
+  for (const row of rows) {
+    const cap = capFor(caps, row);
+    const cls = classify(row, cap);
+    const prof = profileFor(row.api_key_name);
+    for (const key of [`class:${cls}`, `provider:${row.provider || "?"}`, `model:${row.provider || "?"}/${row.model || "?"}`]) {
+      if (!buckets.has(key)) buckets.set(key, []);
+      buckets.get(key).push(row);
+    }
+    if (!buckets.has(`profile:${prof}`)) buckets.set(`profile:${prof}`, []);
+    buckets.get(`profile:${prof}`).push(row);
+  }
+  const out = {};
+  for (const [key, list] of buckets) {
+    const durations = list.map((r) => Number(r.duration) || 0).filter((d) => d > 0).sort((a, b) => a - b);
+    const ok = list.filter((r) => Number(r.status) >= 200 && Number(r.status) < 300).length;
+    out[key] = {
+      requests: list.length,
+      success: ok,
+      failure: list.length - ok,
+      success_rate: list.length ? Number((ok / list.length).toFixed(3)) : null,
+      avg_ms: durations.length ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length) : null,
+      p50_ms: percentile(durations, 50),
+      p95_ms: percentile(durations, 95),
+      combo_requests: list.filter((r) => r.combo_name).length,
+      pinned_requests: list.filter((r) => Number(r.model_pinned) === 1).length,
+      free_eligible_models: null,
+    };
+  }
+  return out;
+}
+
+function cmdSummary(args) {
+  const sinceIdx = args.indexOf("--since");
+  const since = sinceIdx >= 0 ? args[sinceIdx + 1] : null;
+  const json = args.includes("--json");
+  const caps = loadCaps();
+  const rows = inferenceRows(since);
+  const summary = summarize(rows, caps);
+  const inv = liveInventory();
+  const freeIds = new Set(inv.models.filter(isFree).map((m) => m.id));
+  for (const [key, bucket] of Object.entries(summary)) {
+    if (!key.startsWith("model:")) continue;
+    const id = key.slice(6);
+    bucket.free_eligible_models = freeIds.has(id) || freeIds.has(key.slice(6).split("/").slice(1).join("/"));
+  }
+  if (json) {
+    console.log(JSON.stringify({ since, inventory_models: inv.models.length, inventory_error: inv.error, buckets: summary }, null, 2));
+    return;
+  }
+  console.log(`ROUTELAB_INFERENCE_ROWS=${rows.length}`);
+  console.log(`ROUTELAB_SINCE=${since || "ALL"}`);
+  console.log(`ROUTELAB_INVENTORY_MODELS=${inv.models.length}${inv.error ? ` (error=${inv.error})` : ""}`);
+  const order = ["class:", "profile:", "provider:", "model:"];
+  for (const prefix of order) {
+    const keys = Object.keys(summary).filter((k) => k.startsWith(prefix)).sort();
+    if (!keys.length) continue;
+    console.log(`\n## ${prefix.slice(0, -1)}`);
+    for (const key of keys) {
+      const b = summary[key];
+      const free = prefix === "model:" ? ` free=${b.free_eligible_models === true ? "YES" : b.free_eligible_models === false ? "NO" : "UNKNOWN"}` : "";
+      console.log(
+        `${key.slice(prefix.length).padEnd(46)} n=${String(b.requests).padStart(4)} ok=${String(b.success).padStart(4)} ` +
+          `fail=${String(b.failure).padStart(4)} rate=${b.success_rate} avg=${b.avg_ms}ms p95=${b.p95_ms}ms combo=${b.combo_requests} pinned=${b.pinned_requests}${free}`
+      );
+    }
+  }
+}
+
+function cmdClasses(args) {
+  const json = args.includes("--json");
+  const caps = loadCaps();
+  const rows = inferenceRows(null);
+  const counts = {};
+  for (const row of rows) {
+    const cls = classify(row, capFor(caps, row));
+    counts[cls] = (counts[cls] || 0) + 1;
+  }
+  if (json) { console.log(JSON.stringify(counts, null, 2)); return; }
+  for (const cls of ["coding", "general", "search", "vision", "image"]) {
+    console.log(`CLASS_${cls.toUpperCase()}=${counts[cls] || 0}`);
+  }
+}
+
+function factualExplain(row, caps) {
+  const cap = capFor(caps, row);
+  const health = sql(`SELECT provider,test_status,error_code,is_active,priority FROM provider_connections WHERE provider='${esc(row.provider)}'`);
+  const circuit = sql(`SELECT name,state,failure_count,last_failure_time FROM domain_circuit_breakers WHERE name='${esc(row.provider)}'`);
+  const quota = sql(`SELECT provider,connection_id,remaining_percentage,is_exhausted,next_reset_at,created_at FROM quota_snapshots WHERE provider='${esc(row.provider)}' ORDER BY created_at DESC LIMIT 3`);
+  const recent = sql(`SELECT status,count(*) c FROM call_logs WHERE provider='${esc(row.provider)}' AND timestamp >= datetime('now','-1 day') GROUP BY status`);
+  const inv = liveInventory();
+  const freeSet = inv.models.filter(isFree).map((m) => m.id);
+  const modelId = row.requested_model || row.model;
+  return {
+    request_id: row.id,
+    correlation_id: row.correlation_id,
+    response_id: row.response_id,
+    task_class: classify(row, cap),
+    profile: profileFor(row.api_key_name),
+    selected_provider: row.provider,
+    selected_model: modelId,
+    resolved_model: row.model,
+    model_pinned: Number(row.model_pinned) === 1,
+    status: row.status,
+    latency_ms: row.duration,
+    error_type: row.error_type || null,
+    error_summary: row.error_summary || null,
+    free_eligibility: {
+      catalog_verified_free: freeSet.includes(modelId) || freeSet.includes(row.model),
+      inventory_source: inv.error ? `unavailable:${inv.error}` : "v1/models",
+    },
+    capability_match: cap
+      ? { tool_call: !!cap.tool_call, reasoning: !!cap.reasoning, attachment: !!cap.attachment, modalities_input: safeJson(cap.modalities_input), modalities_output: safeJson(cap.modalities_output) }
+      : null,
+    health,
+    circuit_breakers: circuit,
+    quota_snapshots: quota,
+    recent_provider_status_24h: recent,
+    fallback: {
+      combo_name: row.combo_name || null,
+      combo_step_id: row.combo_step_id || null,
+      reason: row.status >= 400 ? row.error_type || row.error_summary || "upstream_non_2xx" : null,
+    },
+  };
+}
+
+function cmdExplain(args) {
+  const id = args.find((a) => !a.startsWith("--"));
+  if (!id) { console.error("usage: routelab explain <id>"); process.exitCode = 2; return; }
+  const rows = sql(
+    `SELECT * FROM call_logs WHERE id='${esc(id)}' OR correlation_id='${esc(id)}' OR response_id='${esc(id)}' ORDER BY timestamp`
+  );
+  if (!rows.length) { console.log(`ROUTELAB_EXPLAIN=NOT_FOUND id=${id}`); process.exitCode = 3; return; }
+  const caps = loadCaps();
+  const attempts = rows.map((row) => factualExplain(row, caps));
+  const selected = attempts[attempts.length - 1];
+  console.log(JSON.stringify({ attempts: attempts.length, fallbacks: attempts.length - 1, selected, chain: attempts.map((a) => ({ provider: a.selected_provider, model: a.selected_model, status: a.status, latency_ms: a.latency_ms, error_type: a.error_type })) }, null, 2));
+}
+
+function cmdSmart(args) {
+  const json = args.includes("--json");
+  const kv = sql("SELECT key,value FROM key_value WHERE key LIKE 'auto/%'");
+  const byVariant = new Map();
+  for (const row of kv) {
+    const variant = row.key.includes(":") ? row.key.slice(0, row.key.indexOf(":")) : row.key;
+    let provider = null;
+    try { provider = JSON.parse(row.value).provider; } catch { provider = null; }
+    if (!provider) continue;
+    if (!byVariant.has(variant)) byVariant.set(variant, new Map());
+    byVariant.get(variant).set(provider, (byVariant.get(variant).get(provider) || 0) + 1);
+  }
+  const health = new Map(sql("SELECT provider,test_status,is_active FROM provider_connections").map((r) => [r.provider, r]));
+  const circuit = new Map(sql("SELECT name,state FROM domain_circuit_breakers").map((r) => [r.name, r]));
+  const s = settings();
+  const inv = liveInventory();
+  const freeModels = inv.models.filter(isFree);
+  const freeProviders = [...new Set(freeModels.map((m) => String(m.id || "").split("/")[0]))].sort();
+  const result = {
+    hide_paid_models: s ? s.hidePaidModels : null,
+    free_access_policy: s ? s.freeAccessPolicy : null,
+    dynamic_free_eligible_models: freeModels.length,
+    dynamic_free_providers: freeProviders,
+    inventory_error: inv.error,
+    variants: {},
+  };
+  for (const [variant, providers] of [...byVariant.entries()].sort()) {
+    const candidates = [...providers.entries()].map(([provider, count]) => {
+      const h = health.get(provider) || {};
+      const c = circuit.get(provider) || {};
+      return {
+        provider,
+        candidates: count,
+        health: h.test_status || "unknown",
+        active: h.is_active === undefined ? null : Number(h.is_active) === 1,
+        circuit: c.state || "CLOSED",
+        free_eligible_provider: freeProviders.includes(provider),
+      };
+    });
+    result.variants[variant] = {
+      candidate_providers: candidates.length,
+      candidates,
+      all_healthy: candidates.every((c) => c.active !== false),
+      any_circuit_open: candidates.some((c) => c.circuit === "OPEN"),
+    };
+  }
+  result.management_models = managementModels().length;
+  if (json) { console.log(JSON.stringify(result, null, 2)); return; }
+  console.log(`SMART_HIDE_PAID_MODELS=${result.hide_paid_models}`);
+  console.log(`SMART_FREE_ACCESS_POLICY=${result.free_access_policy}`);
+  console.log(`SMART_VARIANTS=${Object.keys(result.variants).length}`);
+  console.log(`SMART_MANAGEMENT_MODELS=${result.management_models}`);
+  console.log(`SMART_DYNAMIC_FREE_ELIGIBLE_MODELS=${result.dynamic_free_eligible_models}`);
+  console.log(`SMART_DYNAMIC_FREE_PROVIDERS=${result.dynamic_free_providers.join(",")}`);
+  for (const [variant, info] of Object.entries(result.variants)) {
+    console.log(`SMART_VARIANT ${variant} providers=${info.candidate_providers} any_open=${info.any_circuit_open} free_providers=${info.candidates.filter((c) => c.free_eligible_provider).map((c) => c.provider).join(",") || "none"} providers_list=${info.candidates.map((c) => c.provider).join(",")}`);
+  }
+}
+
+function cmdSnapshot(args) {
+  const outIdx = args.indexOf("--out");
+  const outDir = outIdx >= 0 ? args[outIdx + 1] : path.join(__dirname, "..", "docs", "routelab");
+  fs.mkdirSync(outDir, { recursive: true });
+  const caps = loadCaps();
+  const rows = inferenceRows(null);
+  const payload = {
+    generated_at: new Date().toISOString(),
+    source: "scripts/routelab snapshot",
+    inference_rows: rows.length,
+    classes: {},
+    summary: summarize(rows, caps),
+    smart: null,
+  };
+  for (const row of rows) {
+    const cls = classify(row, capFor(caps, row));
+    payload.classes[cls] = (payload.classes[cls] || 0) + 1;
+  }
+  const file = path.join(outDir, "latest.json");
+  fs.writeFileSync(file, JSON.stringify(payload, null, 2));
+  console.log(`ROUTELAB_SNAPSHOT=${file}`);
+  console.log(`ROUTELAB_SNAPSHOT_ROWS=${rows.length}`);
+}
+
+function endpointConfig() {
+  const config =
+    readJson(path.join(HOME, ".config/opencode/opencode.json")) ||
+    readJson(path.join(HOME, ".opencode/opencode.json"));
+  const options = config && config.provider && config.provider.omniroute && config.provider.omniroute.options;
+  return { key: configApiKey(config), baseURL: (options && options.baseURL) || "http://localhost:20128/v1" };
+}
+
+function freeVisionModels() {
+  const rows = sql(
+    "SELECT provider,model_id,modalities_input FROM model_capabilities WHERE modalities_input LIKE '%image%'"
+  );
+  const inv = liveInventory();
+  const freeIds = new Set(inv.models.filter(isFree).map((m) => m.id));
+  return rows
+    .map((r) => `${r.provider}/${r.model_id}`)
+    .filter((id) => freeIds.has(id))
+    .sort((a, b) => {
+      const rank = (id) => (/gemma-4-31b-it/.test(id) ? 0 : /^agnes\//.test(id) ? 1 : /^openrouter\//.test(id) ? 2 : 3);
+      return rank(a) - rank(b);
+    });
+}
+
+function cmdProbes(args) {
+  const { key, baseURL } = endpointConfig();
+  if (!key) { console.log("ROUTELAB_PROBES=BLOCKED_NO_KEY"); process.exitCode = 3; return; }
+  const visionModels = freeVisionModels();
+  const workModel = process.env.ROUTELAB_WORK_MODEL || (liveInventory().models.filter(isFree).map((m) => m.id).find((id) => id === "nvidia/openai/gpt-oss-20b")) || "nvidia/openai/gpt-oss-20b";
+  const inline = `
+const base = ${JSON.stringify(baseURL)};
+const key = process.env.RL_KEY;
+const visionList = JSON.parse(process.env.RL_VISION || "[]");
+const work = process.env.RL_WORK || "nvidia/openai/gpt-oss-20b";
+const root = base.replace(/\\/v1\\/?$/, "");
+async function call(pathname, opts = {}) {
+  const t0 = Date.now();
+  try {
+    const res = await fetch(base.replace(/\\/$/, "") + pathname, {
+      method: opts.method || "POST",
+      headers: { authorization: "Bearer " + key, "content-type": "application/json" },
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
+      signal: AbortSignal.timeout(opts.timeout || 45000),
+    });
+    const text = await res.text();
+    return { status: res.status, ms: Date.now() - t0, len: text.length, text };
+  } catch (error) {
+    return { status: 0, ms: Date.now() - t0, error: String((error && error.message) || error) };
+  }
+}
+async function chat(model, extra = {}, timeout) {
+  const body = Object.assign({ model, messages: [{ role: "user", content: "ping" }], max_tokens: 8 }, extra);
+  return call("/chat/completions", { body, timeout });
+}
+async function streamChat(model) {
+  const t0 = Date.now();
+  let res;
+  try {
+    res = await fetch(base.replace(/\\/$/, "") + "/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer " + key, "content-type": "application/json" },
+      body: JSON.stringify({ model, messages: [{ role: "user", content: "ping" }], max_tokens: 8, stream: true }),
+      signal: AbortSignal.timeout(45000),
+    });
+  } catch (error) {
+    return { status: 0, ms: Date.now() - t0, error: String((error && error.message) || error) };
+  }
+  if (!res.ok) { const t = await res.text(); return { status: res.status, ms: Date.now() - t0, chunks: 0, text: t }; }
+  let chunks = 0, done = false, buf = "";
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  while (true) {
+    const { value, done: finished } = await reader.read();
+    if (finished) break;
+    buf += dec.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf("\\n")) >= 0) {
+      const line = buf.slice(0, idx).trim();
+      buf = buf.slice(idx + 1);
+      if (line.startsWith("data:")) { chunks++; if (line.includes("[DONE]")) done = true; }
+    }
+  }
+  return { status: res.status, ms: Date.now() - t0, chunks, done };
+}
+(async () => {
+  const out = {};
+  try { const r = await fetch(root + "/api/health", { signal: AbortSignal.timeout(8000) }); out.health = { status: r.status }; }
+  catch (e) { out.health = { status: 0, error: String(e) }; }
+  const models = await call("/models", { method: "GET" });
+  out.models = { status: models.status, ms: models.ms, count: models.text ? (JSON.parse(models.text).data || []).length : 0 };
+  const free = await chat("oc/deepseek-v4-flash-free");
+  out.chat_free_pinned = { status: free.status, ms: free.ms, len: free.len };
+  out.chat_pinned_provider = await (async () => { const r = await chat("openrouter/cohere/north-mini-code:free"); return { status: r.status, ms: r.ms }; })();
+  const autoFree = await chat("auto/best-free");
+  out.chat_auto_free = { status: autoFree.status, ms: autoFree.ms };
+  const streamed = await streamChat(work);
+  out.chat_stream = { status: streamed.status, ms: streamed.ms, chunks: streamed.chunks, done: streamed.done, model: work };
+  const tools = await chat(work, { tools: [{ type: "function", function: { name: "get_time", description: "get time", parameters: { type: "object", properties: {} } } }], tool_choice: "auto" });
+  out.chat_tools = { status: tools.status, has_tool_calls: tools.text ? tools.text.includes("tool_calls") : false, model: work };
+  const search = await call("/search", { body: { query: "omniroute", max_results: 2 } });
+  out.search = { status: search.status, ms: search.ms };
+  out.vision = { model: null, status: null, note: "no_free_vision_model_found" };
+  for (const vm of visionList.slice(0, 4)) {
+    const v = await chat(vm, { timeout: 20000, messages: [{ role: "user", content: [{ type: "text", text: "what color is this? one word" }, { type: "image_url", image_url: { url: "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" } }] }], max_tokens: 8 });
+    if (v.status === 200) { out.vision = { model: vm, status: v.status, ms: v.ms }; break; }
+    out.vision = { model: vm, status: v.status, ms: v.ms, note: "candidate_failed" };
+  }
+  const img = await call("/images/generations", { body: { model: "route-lab-nonexistent-image-model", prompt: "x" } });
+  out.image_route = { status: img.status, note: "route_liveness_only_no_generation" };
+  process.stdout.write(JSON.stringify(out));
+})();
+`;
+  const res = spawnSync("node", ["-e", inline], {
+    encoding: "utf8",
+    env: { ...process.env, RL_KEY: key, RL_VISION: JSON.stringify(visionModels), RL_WORK: workModel },
+    timeout: 180000,
+    maxBuffer: 32 * 1024 * 1024,
+  });
+  let parsed;
+  try { parsed = JSON.parse((res.stdout || "").trim()); } catch { console.log(`ROUTELAB_PROBES=UNPARSEABLE stderr=${(res.stderr || "").slice(0, 400)}`); process.exitCode = 1; return; }
+  if (args.includes("--json")) { console.log(JSON.stringify(parsed, null, 2)); return; }
+  const ok = (s) => (s >= 200 && s < 300 ? "PASS" : s === 0 ? "ERROR" : `HTTP_${s}`);
+  console.log(`PROBE_HEALTH=${ok(parsed.health.status)}`);
+  console.log(`PROBE_MODELS=${ok(parsed.models.status)} count=${parsed.models.count}`);
+  console.log(`PROBE_CHAT_FREE_PINNED_MODEL=${ok(parsed.chat_free_pinned.status)}`);
+  console.log(`PROBE_CHAT_PINNED_PROVIDER=${ok(parsed.chat_pinned_provider.status)}`);
+  console.log(`PROBE_CHAT_AUTO_FREE=${ok(parsed.chat_auto_free.status)}`);
+  console.log(`PROBE_CHAT_STREAMING=${ok(parsed.chat_stream.status)} chunks=${parsed.chat_stream.chunks} done=${parsed.chat_stream.done === true}`);
+  console.log(`PROBE_CHAT_TOOL_CALLING=${ok(parsed.chat_tools.status)} tool_calls=${parsed.chat_tools.has_tool_calls}`);
+  console.log(`PROBE_SEARCH=${parsed.search.status === null ? "N/A" : ok(parsed.search.status)}`);
+  console.log(`PROBE_VISION=${parsed.vision.status === null ? "N/A" : ok(parsed.vision.status)} model=${parsed.vision.model || parsed.vision.note || "n/a"}`);
+  console.log(`PROBE_IMAGE_ROUTE_LIVENESS=${ok(parsed.image_route.status)} (no generation executed)`);
+}
+
+function selftest() {
+  const caps = { byPm: new Map(), byModel: new Map() };
+  const assert = (label, cond) => { if (!cond) throw new Error(`selftest failed: ${label}`); };
+  assert("coding deepseek", classify({ requested_model: "opencode/deepseek-v4-flash-free" }, null) === "coding");
+  assert("coding qwen coder", classify({ requested_model: "qwen3-coder-30b" }, null) === "coding");
+  assert("image z-image", classify({ requested_model: "z-image-turbo" }, null) === "image");
+  assert("image agnes", classify({ requested_model: "agnes-image-2.1-flash" }, null) === "image");
+  assert("vision via capability", classify({ requested_model: "mystery" }, { modalities_input: '["text","image"]', modalities_output: '["text"]' }) === "vision");
+  assert("image via capability", classify({ requested_model: "mystery" }, { modalities_input: '["text"]', modalities_output: '["image"]' }) === "image");
+  assert("search path", classify({ path: "/v1/search", requested_model: "x" }, null) === "search");
+  assert("general fallback", classify({ requested_model: "glm-4.7-flash" }, null) === "general");
+  assert("profile iamm", profileFor("AIMM OmniRoute FREE_ONLY production") === "IAMM");
+  assert("profile stocknews", profileFor("aimmarketmaster-r10") === "STOCKNEWSBR");
+  assert("profile legacy", profileFor("OpenCode") === "LEGACY_DEFAULT");
+  assert("percentile", percentile([1, 2, 3, 4, 5], 95) === 5);
+  console.log("ROUTELAB_SELFTEST=PASS");
+}
+
+function main() {
+  const [cmd, ...args] = process.argv.slice(2);
+  switch (cmd) {
+    case "summary": return cmdSummary(args);
+    case "classes": return cmdClasses(args);
+    case "explain": return cmdExplain(args);
+    case "smart": return cmdSmart(args);
+    case "snapshot": return cmdSnapshot(args);
+    case "probes": return cmdProbes(args);
+    case "selftest": return selftest();
+    default:
+      console.error("usage: routelab <summary|classes|explain|smart|snapshot|selftest> [options]");
+      process.exitCode = 2;
+  }
+}
+
+if (require.main === module) {
+  try {
+    main();
+  } catch (error) {
+    console.error(`ROUTELAB_ERROR=${error.message}`);
+    process.exitCode = 1;
+  }
+}
+
+module.exports = { classify, profileFor, percentile, safeJson };
