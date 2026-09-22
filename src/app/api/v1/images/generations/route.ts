@@ -26,6 +26,7 @@ import {
   NO_FREE_IMAGE_PROVIDER_AVAILABLE,
   resolveFreeImageProvider,
 } from "@omniroute/open-sse/config/freeImageRouting.ts";
+import { resolveImageRouteSelection } from "@omniroute/open-sse/config/paidImageRouting.ts";
 import { getCachedProviderConnections } from "@/lib/db/readCache";
 import { getCircuitBreaker } from "@/shared/utils/circuitBreaker";
 import { getAllCustomModels } from "@/lib/db/models";
@@ -112,10 +113,13 @@ async function resolveFreeImageRouteSelection() {
       .filter((connection) => (connection as { isActive?: boolean }).isActive !== false)
       .map((connection) => (connection as { provider: string }).provider)
   );
-  return resolveFreeImageProvider({
+  const free = await resolveFreeImageProvider({
     hasActiveConnection: (providerId) => activeProviders.has(providerId),
     isCircuitOpen: (providerId) => !getCircuitBreaker(providerId).canExecute(),
   });
+  // FREE_FIRST: paid fallback stays disabled until a policy explicitly enables it.
+  // The default policy denies, so this composes to the same FREE_ONLY behavior.
+  return resolveImageRouteSelection({ capability: "image-generation", free });
 }
 
 async function postHandler(request, context) {
@@ -144,13 +148,17 @@ async function postHandler(request, context) {
   if (policy.rejection) return policy.rejection;
 
   // FREE_ONLY image generation — `auto/image-gen[:free]` can only ever reach a
-  // free-verified or self-hosted image generator, never a paid/credit-backed one.
+  // free-verified or self-hosted image generator. Paid fallback is routed through
+  // the paid image framework but is disabled by default policy, so nothing paid
+  // executes unless a future policy explicitly enables it.
   if (body.model === FREE_IMAGE_ROUTE_ID || body.model === FREE_IMAGE_ROUTE_ID_FREE) {
     const selection = await resolveFreeImageRouteSelection();
     if (!selection.ok) {
       return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, NO_FREE_IMAGE_PROVIDER_AVAILABLE);
     }
-    body.model = `${selection.providerId}/${selection.modelId}`;
+    body.model = selection.modelId
+      ? `${selection.providerId}/${selection.modelId}`
+      : selection.providerId;
   }
 
   // #9239: Detect combo name and divert to full image combo execution.
