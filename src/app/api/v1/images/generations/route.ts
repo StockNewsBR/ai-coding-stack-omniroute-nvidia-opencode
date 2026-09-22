@@ -27,6 +27,7 @@ import {
   resolveFreeImageProvider,
 } from "@omniroute/open-sse/config/freeImageRouting.ts";
 import { resolveImageRouteSelection } from "@omniroute/open-sse/config/paidImageRouting.ts";
+import { buildPaidImageRoutingDeps } from "@omniroute/open-sse/config/paidImageRouteFallback.ts";
 import { getCachedProviderConnections } from "@/lib/db/readCache";
 import { getCircuitBreaker } from "@/shared/utils/circuitBreaker";
 import { getAllCustomModels } from "@/lib/db/models";
@@ -119,7 +120,15 @@ async function resolveFreeImageRouteSelection() {
   });
   // FREE_FIRST: paid fallback stays disabled until a policy explicitly enables it.
   // The default policy denies, so this composes to the same FREE_ONLY behavior.
-  return resolveImageRouteSelection({ capability: "image-generation", free });
+  // Fail closed: paid deps stay undefined unless the paid policy is explicitly enabled and funded.
+  const paid = buildPaidImageRoutingDeps({
+    isCircuitOpen: (providerId) => !getCircuitBreaker(providerId).canExecute(),
+  });
+  return resolveImageRouteSelection({
+    capability: "image-generation",
+    free,
+    ...(paid ? { paid } : {}),
+  });
 }
 
 async function postHandler(request, context) {

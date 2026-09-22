@@ -1,0 +1,42 @@
+{
+  "canary": "OMNIROUTE_IMAGE_PAID_FALLBACK_CANARY_R1_1_RETRY",
+  "generatedAt": "2026-09-22T00:00:00.000Z",
+  "currency": "USD",
+  "unit": "image",
+  "ceilingUsd": 0.1,
+  "maxImagesPerProvider": 1,
+  "evidence": [
+    {
+      "providerId": "meta-muse-image",
+      "modelId": "muse-image-1.0",
+      "currency": "USD",
+      "unit": "image",
+      "unitPrice": 0.01,
+      "verifiedAt": "2026-09-22T00:00:00.000Z",
+      "source": "https://ai.developer.meta.com/docs/pricing-rate-limits",
+      "maxAgeMs": 2592000000
+    }
+  ],
+  "verificationAttempts": [
+    {
+      "providerId": "meta-muse-image",
+      "modelId": "muse-image-1.0",
+      "status": "VERIFIED",
+      "unitPrice": 0.01,
+      "verifiedAt": "2026-09-22T00:00:00.000Z",
+      "maxAgeMs": 2592000000,
+      "source": "https://ai.developer.meta.com/docs/pricing-rate-limits",
+      "reason": "Official Meta Model API pricing page states a flat 0.01 USD per generated image."
+    },
+    {
+      "providerId": "aws-bedrock-image",
+      "modelId": "stability.stable-image-core-v1:1",
+      "status": "UNVERIFIED",
+      "unitPrice": null,
+      "verifiedAt": null,
+      "maxAgeMs": null,
+      "source": "https://aws.amazon.com/bedrock/pricing/",
+      "reason": "No official on-demand price published for Stable Image Core: the Bedrock pricing page Stability AI section lists only the 13 Stability image SERVICES per generation, and the AWS Price List API (offers/v1.0/aws/AmazonBedrock/current/us-west-2/index.json, 1052 products) contains zero Stability SKUs. Only a non-official aggregator quotes ~0.04 USD/image, which is not acceptable evidence."
+    }
+  ]
+}

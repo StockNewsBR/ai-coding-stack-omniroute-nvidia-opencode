@@ -1,0 +1,11 @@
+{
+  "_comment": "NON-SECRET price-evidence template (OMNIROUTE_IMAGE_PROVIDER_SETUP_R2). Copy into a real evidence array consumed by buildPaidImageQuote. Never put a credential in this file.",
+  "providerId": "meta-muse-image",
+  "modelId": "muse-image-1.0",
+  "currency": "USD",
+  "unit": "image",
+  "unitPrice": 0.01,
+  "verifiedAt": "2026-09-22T00:00:00.000Z",
+  "source": "https://ai.developer.meta.com/docs/pricing-rate-limits",
+  "maxAgeMs": 2592000000
+}

@@ -37,6 +37,8 @@
     "open-sse/config/paidImagePolicyLoader.ts",
     "open-sse/config/paidImageAwsAdapter.ts",
     "open-sse/config/paidImageMetaAdapter.ts",
+    "open-sse/config/paidImageProviderConfig.ts",
+    "open-sse/config/paidImageRouteFallback.ts",
     "src/lib/usage/domainPaidImageLedger.ts",
     "open-sse/mcp-server/audit.ts",
     "open-sse/mcp-server/server.ts",

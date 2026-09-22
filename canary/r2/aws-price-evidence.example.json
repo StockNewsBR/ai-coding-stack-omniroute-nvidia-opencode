@@ -1,0 +1,12 @@
+{
+  "_comment": "NON-SECRET price-evidence template (OMNIROUTE_IMAGE_PROVIDER_SETUP_R2). Copy into a real evidence array consumed by buildPaidImageQuote. Never put a credential in this file.",
+  "providerId": "aws-bedrock-image",
+  "modelId": "stability.stable-image-core-v1:1",
+  "currency": "USD",
+  "unit": "image",
+  "unitPrice": null,
+  "verifiedAt": null,
+  "source": "https://aws.amazon.com/bedrock/pricing/",
+  "maxAgeMs": null,
+  "_blockedReason": "No official on-demand price is published for Stable Image Core. The Bedrock pricing page prices only the 13 Stability AI image SERVICES per generation, and the AWS Price List API for us-west-2 contains zero Stability SKUs. Obtain an official figure (pricing page row, AWS Cost Explorer / invoice line item, or account-team quote) and fill unitPrice + verifiedAt + maxAgeMs here before any AWS canary call. Do NOT invent a price."
+}

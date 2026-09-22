@@ -61,6 +61,18 @@ export interface PaidImageGenerationResult {
   readonly error?: string;
 }
 
+/** Optional self-reported ranking telemetry. Omitted signals rank as neutral. */
+export interface PaidImageProviderTelemetry {
+  /** Most recently observed generation latency, in milliseconds. */
+  readonly latencyMs?: number;
+  /** Consecutive recent failures observed for this provider. */
+  readonly recentFailures?: number;
+  /** True while the provider is actively rate-limited. */
+  readonly rateLimited?: boolean;
+  /** Observed quality score; overrides the quote's quality score when present. */
+  readonly qualityScore?: number;
+}
+
 export interface PaidImageProviderAdapter {
   readonly providerId: string;
 
@@ -77,6 +89,12 @@ export interface PaidImageProviderAdapter {
   ): PaidImageQuote | null | Promise<PaidImageQuote | null>;
 
   quotaState(): PaidImageQuotaState | Promise<PaidImageQuotaState>;
+
+  /** Self-reported ranking signals; omitted by adapters that own no telemetry. */
+  telemetry?():
+    | PaidImageProviderTelemetry
+    | undefined
+    | Promise<PaidImageProviderTelemetry | undefined>;
 
   generateImage(request: PaidImageGenerationRequest): Promise<PaidImageGenerationResult>;
 

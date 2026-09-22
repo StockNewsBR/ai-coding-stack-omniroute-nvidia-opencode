@@ -29,6 +29,8 @@ import {
 import type {
   PaidImageGenerationRequest,
   PaidImageProviderAdapter,
+  PaidImageProviderHealth,
+  PaidImageProviderTelemetry,
   PaidImageRequestCapability,
 } from "./paidImageProviderAdapter.ts";
 import type { PaidImageBudgetLedger, PaidImageLedgerEntry } from "./paidImageLedger.ts";
@@ -40,6 +42,47 @@ export interface PaidImageCandidateRejection {
   readonly estimatedCostUsd?: number;
 }
 
+export interface PaidImageRankingSignals {
+  readonly providerId: string;
+  readonly health: PaidImageProviderHealth;
+  readonly rateLimited: boolean;
+  readonly recentFailures: number;
+  readonly latencyMs?: number;
+  readonly qualityScore?: number;
+  readonly estimatedCostUsd: number;
+}
+
+const HEALTH_RANK: Record<PaidImageProviderHealth, number> = {
+  healthy: 0,
+  degraded: 1,
+  unhealthy: 2,
+  unknown: 3,
+};
+
+function latencyRank(value: number | undefined): number {
+  return isFiniteNumber(value) && value >= 0 ? value : Number.POSITIVE_INFINITY;
+}
+
+function qualityRank(value: number | undefined): number {
+  return isFiniteNumber(value) ? value : Number.NEGATIVE_INFINITY;
+}
+
+/**
+ * Health, then rate limiting, then recent failures, then latency, then quality,
+ * then cost, then providerId. Cost stays the decider when every other signal ties.
+ */
+function compareRankingSignals(left: PaidImageRankingSignals, right: PaidImageRankingSignals): number {
+  return (
+    HEALTH_RANK[left.health] - HEALTH_RANK[right.health] ||
+    Number(left.rateLimited) - Number(right.rateLimited) ||
+    left.recentFailures - right.recentFailures ||
+    latencyRank(left.latencyMs) - latencyRank(right.latencyMs) ||
+    qualityRank(right.qualityScore) - qualityRank(left.qualityScore) ||
+    left.estimatedCostUsd - right.estimatedCostUsd ||
+    left.providerId.localeCompare(right.providerId)
+  );
+}
+
 export interface PaidImageSelection {
   readonly ok: true;
   readonly providerId: string;
@@ -47,6 +90,8 @@ export interface PaidImageSelection {
   readonly adapter: PaidImageProviderAdapter;
   readonly estimatedCostUsd: number;
   readonly qualityScore?: number;
+  readonly rank?: PaidImageRankingSignals;
+  readonly considered?: readonly PaidImageCandidateRejection[];
 }
 
 export interface PaidImageUnavailable {
@@ -67,6 +112,7 @@ export interface PaidImageRoutingDeps {
   readonly adapters?: readonly PaidImageProviderAdapter[];
   readonly ledger?: PaidImageBudgetLedger;
   readonly isCircuitOpen?: (providerId: string) => boolean;
+  readonly excludeProviderIds?: readonly string[];
   readonly now?: Date;
   readonly fallbackReason?: PaidImageFallbackReason;
 }
@@ -134,6 +180,10 @@ export async function resolvePaidImageProvider(
       reject(allowed.code ?? "PROVIDER_NOT_ALLOWED", allowed.reason);
       continue;
     }
+    if (deps.excludeProviderIds?.includes(providerId) === true) {
+      reject("PROVIDER_DENIED", `paid image provider ${providerId} is excluded for this request`);
+      continue;
+    }
     if (!(await adapter.capabilities()).includes("image-generation")) {
       reject(
         "CAPABILITY_NOT_IMAGE_GENERATION",
@@ -158,6 +208,7 @@ export async function resolvePaidImageProvider(
       reject("PROVIDER_UNHEALTHY", `paid image provider ${providerId} health is ${health}`);
       continue;
     }
+    const telemetry: PaidImageProviderTelemetry = (await adapter.telemetry?.()) ?? {};
     const quota = await adapter.quotaState();
     if (quota.status !== "available") {
       reject(
@@ -188,9 +239,13 @@ export async function resolvePaidImageProvider(
       continue;
     }
 
+    const effectiveQualityScore = isFiniteNumber(telemetry.qualityScore)
+      ? telemetry.qualityScore
+      : quote.qualityScore;
+
     const qualityFloor = policy.qualityFloor;
     if (qualityFloor !== undefined) {
-      const qualityScore = quote.qualityScore;
+      const qualityScore = effectiveQualityScore;
       if (!isFiniteNumber(qualityScore)) {
         reject(
           "QUALITY_FLOOR_UNVERIFIED",
@@ -227,7 +282,20 @@ export async function resolvePaidImageProvider(
       modelId: deps.modelId,
       adapter,
       estimatedCostUsd,
-      qualityScore: quote.qualityScore,
+      qualityScore: effectiveQualityScore,
+      rank: {
+        providerId,
+        health,
+        rateLimited: telemetry.rateLimited === true,
+        recentFailures:
+          isFiniteNumber(telemetry.recentFailures) && telemetry.recentFailures > 0
+            ? telemetry.recentFailures
+            : 0,
+        latencyMs: isFiniteNumber(telemetry.latencyMs) ? telemetry.latencyMs : undefined,
+        qualityScore: effectiveQualityScore,
+        estimatedCostUsd,
+      },
+      considered: [...considered],
     });
   }
 
@@ -239,12 +307,16 @@ export async function resolvePaidImageProvider(
     return denied("NO_ACCEPTABLE_PAID_PROVIDER", "no acceptable paid image provider", considered);
   }
 
-  acceptable.sort(
-    (left, right) =>
-      left.estimatedCostUsd - right.estimatedCostUsd ||
-      left.providerId.localeCompare(right.providerId)
-  );
-  return acceptable[0];
+  const ranked = [...acceptable].sort((left, right) => {
+    const leftRank = left.rank;
+    const rightRank = right.rank;
+    if (!leftRank || !rightRank) {
+      return left.providerId.localeCompare(right.providerId);
+    }
+    return compareRankingSignals(leftRank, rightRank);
+  });
+  const selected = ranked[0];
+  return { ...selected, considered: [...considered] };
 }
 
 export type PaidImageExecutionCode = PaidImageDenyCode | "PAID_IMAGE_EXECUTION_FAILED";

@@ -1,13 +1,22 @@
 /**
- * AWS paid image adapter (R1) — Amazon Bedrock Runtime `InvokeModel`.
+ * AWS paid image adapter (R1/R2) — Amazon Bedrock Runtime `InvokeModel`.
  *
- * Verified official interface (2026-09):
+ * Verified official interfaces (2026-09):
  *   POST https://bedrock-runtime.{region}.amazonaws.com/model/{modelId}/invoke
- *   Request (TEXT_IMAGE):
- *     { taskType: "TEXT_IMAGE",
- *       textToImageParams: { text },
- *       imageGenerationConfig: { numberOfImages } }
- *   Response: { images: [ "<base64>" ] }  (bytes at images[0])
+ *
+ * Two request/response schemas are supported, selected from the model id:
+ *
+ *  1. Stability AI (selected R2 route — Stable Image Core):
+ *     model id  `stability.stable-image-core-v1:1` (official AWS sample)
+ *     request   { prompt, aspect_ratio?, output_format?, seed?, negative_prompt? }
+ *     response  { seeds, finish_reasons, images: [ "<base64>" ] }
+ *     A non-null `finish_reasons` entry means the request was filtered/failed.
+ *
+ *  2. Amazon-native (legacy back-compat — Nova Canvas):
+ *     request   { taskType: "TEXT_IMAGE",
+ *                 textToImageParams: { text },
+ *                 imageGenerationConfig: { numberOfImages } }
+ *     response  { images: [ "<base64>" ] }
  *
  * Auth: real AWS uses SigV4 + IAM `bedrock:InvokeModel`; OmniRoute's existing
  * Bedrock integration authenticates with a Bearer API key, which this adapter
@@ -15,7 +24,7 @@
  * eternal default, and NO price is hardcoded (quotes come from configurable
  * price evidence; absent evidence => COST_QUOTE_UNAVAILABLE).
  *
- * Capability: image-generation ONLY. No real paid call is made during R1.
+ * Capability: image-generation ONLY. No real paid call is made during R2.
  */
 import {
   buildBedrockRuntimeBaseUrl,
@@ -37,6 +46,8 @@ export const AWS_IMAGE_PROVIDER_ID = "aws-bedrock-image";
 /** Documented model identifiers — exported for configuration convenience, never used as a silent default. */
 export const AWS_NOVA_CANVAS_MODEL_ID = "amazon.nova-canvas-v1:0";
 export const AWS_TITAN_IMAGE_V2_MODEL_ID = "amazon.titan-image-generator-v2:0";
+/** Selected R2 Bedrock Stability text-to-image route (region: us-west-2 only). */
+export const AWS_STABLE_IMAGE_CORE_MODEL_ID = "stability.stable-image-core-v1:1";
 export const DEFAULT_AWS_IMAGE_TIMEOUT_MS = 60_000;
 
 const AWS_IMAGE_MAX_IMAGES = 5;
@@ -73,6 +84,20 @@ export function normalizeAwsImageError(status: number, body: unknown): Normalize
   return { code, status, message };
 }
 
+export type AwsImageRequestSchema = "stability" | "amazon-native";
+
+/**
+ * Selects the wire schema for a model id. Only Stability AI models (`stability.*`)
+ * use the Stability text-to-image schema; everything else keeps the Amazon-native
+ * schema so existing Nova/Titan wiring is unaffected.
+ */
+export function resolveAwsImageRequestSchema(modelId?: string): AwsImageRequestSchema {
+  if (typeof modelId === "string" && modelId.trim().toLowerCase().startsWith("stability.")) {
+    return "stability";
+  }
+  return "amazon-native";
+}
+
 export function buildAwsImageRequestBody(
   request: PaidImageGenerationRequest
 ): Record<string, unknown> {
@@ -83,6 +108,17 @@ export function buildAwsImageRequestBody(
     textToImageParams: { text: request.prompt ?? "" },
     imageGenerationConfig: { numberOfImages },
   };
+}
+
+/**
+ * Stability AI text-to-image body for `stability.stable-image-core-v1:1`.
+ * `prompt` is the only required field; optional params are omitted unless the
+ * request actually carries them (no invented defaults).
+ */
+export function buildAwsStabilityImageRequestBody(
+  request: PaidImageGenerationRequest
+): Record<string, unknown> {
+  return { prompt: request.prompt ?? "" };
 }
 
 export type AwsImageParseResult =
@@ -105,6 +141,39 @@ export function parseAwsImageResponse(payload: unknown): AwsImageParseResult {
   }
   if (imageUrls.length === 0) {
     return { ok: false, error: "AWS_IMAGE_RESPONSE_NO_IMAGES" };
+  }
+  return { ok: true, imageUrls };
+}
+
+/**
+ * Stability AI response parser: `{ seeds, finish_reasons, images: ["<base64>"] }`.
+ * An empty `images` array with a non-empty `finish_reasons` entry means the
+ * provider filtered the request or failed inference.
+ */
+export function parseAwsStabilityImageResponse(payload: unknown): AwsImageParseResult {
+  if (!payload || typeof payload !== "object") {
+    return { ok: false, error: "AWS_IMAGE_RESPONSE_MALFORMED" };
+  }
+  const record = payload as Record<string, unknown>;
+  const images = record.images;
+  if (!Array.isArray(images)) {
+    return { ok: false, error: "AWS_IMAGE_RESPONSE_MALFORMED" };
+  }
+  const imageUrls: string[] = [];
+  for (const image of images) {
+    if (typeof image === "string" && image.trim() !== "") {
+      imageUrls.push(`data:image/png;base64,${image.trim()}`);
+    }
+  }
+  if (imageUrls.length === 0) {
+    const reasons = record.finish_reasons;
+    const filtered =
+      Array.isArray(reasons) &&
+      reasons.some((reason) => typeof reason === "string" && reason.trim() !== "");
+    return {
+      ok: false,
+      error: filtered ? "AWS_IMAGE_RESPONSE_FILTERED" : "AWS_IMAGE_RESPONSE_NO_IMAGES",
+    };
   }
   return { ok: true, imageUrls };
 }
@@ -149,6 +218,11 @@ export function createAwsImageAdapter(config: AwsImageAdapterConfig = {}): PaidI
   const doFetch = config.fetcher ?? fetch;
   const now = config.now ?? (() => new Date());
   const invokeUrl = modelId ? `${baseUrl}/model/${encodeURIComponent(modelId)}/invoke` : baseUrl;
+  const requestSchema = resolveAwsImageRequestSchema(modelId);
+  const buildRequestBody =
+    requestSchema === "stability" ? buildAwsStabilityImageRequestBody : buildAwsImageRequestBody;
+  const parseResponse =
+    requestSchema === "stability" ? parseAwsStabilityImageResponse : parseAwsImageResponse;
 
   const configured = (): boolean => Boolean(apiKey && modelId);
 
@@ -183,17 +257,26 @@ export function createAwsImageAdapter(config: AwsImageAdapterConfig = {}): PaidI
         return { ok: false, providerId, error: "AWS_IMAGE_MODEL_MISSING", latencyMs: Date.now() - started };
       }
 
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      };
+      const requestId =
+        typeof request.requestId === "string" && request.requestId.trim() !== ""
+          ? request.requestId.trim()
+          : undefined;
+      if (requestId) {
+        headers["X-Request-Id"] = requestId;
+      }
+
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
         const response = await doFetch(invokeUrl, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Accept: "application/json",
-            Authorization: `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify(buildAwsImageRequestBody(request)),
+          headers,
+          body: JSON.stringify(buildRequestBody(request)),
           signal: controller.signal,
         });
         const text = await response.text();
@@ -210,7 +293,7 @@ export function createAwsImageAdapter(config: AwsImageAdapterConfig = {}): PaidI
           return { ok: false, providerId, modelId, error: normalized.code, latencyMs };
         }
 
-        const parsed = parseAwsImageResponse(payload);
+        const parsed = parseResponse(payload);
         if (!parsed.ok) {
           return { ok: false, providerId, modelId, error: parsed.error, latencyMs };
         }
