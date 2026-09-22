@@ -314,6 +314,37 @@ export async function executePaidImageProvider(
   const estimatedCostUsd = deps.selection.estimatedCostUsd;
   const timestamp = (deps.now ?? new Date()).toISOString();
 
+  // Phase 11: reserve atomically before spending so concurrent requests cannot overspend the cap.
+  if (deps.ledger?.tryReserve) {
+    const reservation = await deps.ledger.tryReserve({
+      requestId: deps.requestId,
+      estimatedCostUsd,
+      maxCostPerImage: policy.maxCostPerImage as number,
+      dailyImageBudget: policy.dailyImageBudget as number,
+      monthlyImageBudget: policy.monthlyImageBudget as number,
+      now: deps.now ?? new Date(),
+    });
+    if (!reservation.reserved) {
+      await deps.ledger.record({
+        requestId: deps.requestId,
+        providerId: adapter.providerId,
+        modelId: deps.modelId,
+        capability: "image-generation",
+        timestamp,
+        estimatedCostUsd,
+        fallbackReason,
+        decisionReason: reservation.reason,
+        outcome: "denied",
+      });
+      return {
+        ok: false,
+        code: reservation.code ?? "DAILY_BUDGET_EXCEEDED",
+        reason: reservation.reason,
+        providerId,
+      };
+    }
+  }
+
   const recordLedger = async (entry: PaidImageLedgerEntry): Promise<void> => {
     if (deps.ledger) await deps.ledger.record(entry);
   };
