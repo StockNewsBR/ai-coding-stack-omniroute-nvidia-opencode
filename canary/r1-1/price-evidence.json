@@ -1,0 +1,31 @@
+{
+  "canary": "OMNIROUTE_IMAGE_PAID_FALLBACK_CANARY_R1_1",
+  "generatedAt": "2026-09-22T16:38:38.000Z",
+  "currency": "USD",
+  "unit": "image",
+  "ceilingUsd": 0.1,
+  "maxImagesPerProvider": 1,
+  "evidence": [],
+  "verificationAttempts": [
+    {
+      "providerId": "aws-bedrock-image",
+      "modelId": "amazon.nova-canvas-v1:0",
+      "status": "UNVERIFIED",
+      "unitPrice": null,
+      "verifiedAt": null,
+      "maxAgeMs": null,
+      "source": "https://aws.amazon.com/bedrock/pricing/",
+      "reason": "Official Nova Canvas per-image price not exposed in fetchable HTML (client-rendered accordion); docs.aws.amazon.com pages return no body to plain fetch; Context7 returned schema but no pricing; google_search tool unauthenticated in this environment."
+    },
+    {
+      "providerId": "meta-muse-image",
+      "modelId": "muse-image-1.0",
+      "status": "UNVERIFIED",
+      "unitPrice": null,
+      "verifiedAt": null,
+      "maxAgeMs": null,
+      "source": "https://api.meta.ai/v1/images/generations",
+      "reason": "Host and POST route exist (HTTP 401 with allow: POST, x-route: model-api-rust) but no public official pricing documentation reachable; model id muse-image-1.0 unconfirmed from official sources."
+    }
+  ]
+}
