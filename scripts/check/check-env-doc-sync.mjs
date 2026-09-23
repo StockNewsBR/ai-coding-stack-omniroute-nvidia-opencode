@@ -218,6 +218,9 @@ const IGNORE_FROM_CODE = new Set([
   // Test-only override: points setup-open-code.mjs at a fixture plugin dir without
   // requiring the real bundled plugin to be built.
   "OMNIROUTE_OPENCODE_PLUGIN_DIR",
+  // Offline storage-migration verifier passes an explicit snapshot path only to
+  // its short-lived child process; this is not runtime application configuration.
+  "OMNIROUTE_VERIFY_DB",
 ]);
 
 // Vars documented in ENVIRONMENT.md but intentionally absent from .env.example.

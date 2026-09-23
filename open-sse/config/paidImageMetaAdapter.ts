@@ -189,7 +189,12 @@ export function createMetaImageAdapter(
       }
       const effectiveModel = modelId ?? request.modelId;
       if (!effectiveModel) {
-        return { ok: false, providerId, error: "META_IMAGE_MODEL_MISSING", latencyMs: Date.now() - started };
+        return {
+          ok: false,
+          providerId,
+          error: "META_IMAGE_MODEL_MISSING",
+          latencyMs: Date.now() - started,
+        };
       }
 
       const controller = new AbortController();
@@ -216,11 +221,17 @@ export function createMetaImageAdapter(
 
         if (!response.ok) {
           const normalized = normalizeMetaImageError(response.status, payload);
-          return { ok: false, providerId, modelId: effectiveModel, error: normalized.code, latencyMs };
+          return {
+            ok: false,
+            providerId,
+            modelId: effectiveModel,
+            error: normalized.code,
+            latencyMs,
+          };
         }
 
         const parsed = parseMetaImageResponse(payload);
-        if (!parsed.ok) {
+        if (parsed.ok === false) {
           return { ok: false, providerId, modelId: effectiveModel, error: parsed.error, latencyMs };
         }
         return {

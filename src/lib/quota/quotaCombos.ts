@@ -194,9 +194,19 @@ export async function syncQuotaCombos(poolId: string): Promise<void> {
   }
   for (const [modelId, conns] of byModel) {
     const provider = conns[0].provider;
+    const currentPool = getPool(poolId);
+    if (!currentPool) return;
+    const currentGroupName = getGroupName(currentPool.groupId) ?? currentPool.name;
+    if (quotaGroupSlug(currentGroupName) !== groupSlug) return;
+    const currentConnectionIds = new Set(currentPool.connectionIds);
+    const liveConnections = conns.filter((connection) =>
+      currentConnectionIds.has(connection.connId)
+    );
+    if (liveConnections.length === 0) continue;
+
     // B4: use groupName for the combo name.
     const comboName = quotaModelName(groupName, provider, modelId);
-    const steps = conns.map((c) => ({
+    const steps = liveConnections.map((c) => ({
       kind: "model" as const,
       model: `${provider}/${modelId}`,
       providerId: provider,

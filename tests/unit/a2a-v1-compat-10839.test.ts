@@ -4,10 +4,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { NextRequest } from "next/server";
+import { AUTHZ_HEADER_PEER_LOCALITY } from "../../src/server/authz/headers.ts";
 
 const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-a2a-v1-compat-"));
 process.env.DATA_DIR = TEST_DATA_DIR;
+const previousOmnirouteApiKey = process.env.OMNIROUTE_API_KEY;
+const previousRouterApiKey = process.env.ROUTER_API_KEY;
 delete process.env.OMNIROUTE_API_KEY;
+delete process.env.ROUTER_API_KEY;
 
 const core = await import("../../src/lib/db/core.ts");
 const settingsDb = await import("../../src/lib/db/settings.ts");
@@ -30,7 +34,10 @@ function makeCardRequest(
 function makeJsonRpcRequest(body: unknown): NextRequest {
   return new Request("http://localhost/a2a", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      [AUTHZ_HEADER_PEER_LOCALITY]: "loopback",
+    },
     body: JSON.stringify(body),
   }) as unknown as NextRequest;
 }
@@ -45,6 +52,10 @@ test.beforeEach(async () => {
 test.after(() => {
   core.resetDbInstance();
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  if (previousOmnirouteApiKey === undefined) delete process.env.OMNIROUTE_API_KEY;
+  else process.env.OMNIROUTE_API_KEY = previousOmnirouteApiKey;
+  if (previousRouterApiKey === undefined) delete process.env.ROUTER_API_KEY;
+  else process.env.ROUTER_API_KEY = previousRouterApiKey;
 });
 
 test("#10839: v1.0 SendMessage is aliased to message/send and reshapes the response", async () => {

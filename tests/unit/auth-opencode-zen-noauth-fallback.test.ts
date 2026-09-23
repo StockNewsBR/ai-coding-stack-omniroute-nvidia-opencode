@@ -20,58 +20,79 @@ process.env.DATA_DIR = TEST_DATA_DIR;
 const core = await import("../../src/lib/db/core.ts");
 const { getProviderCredentials } = await import("../../src/sse/services/auth.ts");
 const { createProviderConnection } = await import("../../src/lib/db/providers.ts");
+const serial = { concurrency: false };
 
 test.after(() => {
   core.resetDbInstance();
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
 });
 
-test("#2962 opencode-zen with no connection falls back to anonymous no-auth credentials", async () => {
-  const creds = await getProviderCredentials("opencode-zen");
-  assert.ok(creds, "opencode-zen must resolve to credentials, not null (no-auth free tier)");
-  assert.equal(
-    (creds as { connectionId?: string }).connectionId,
-    "noauth",
-    "should be synthetic no-auth credentials"
-  );
-  assert.equal((creds as { apiKey?: unknown }).apiKey, null, "anonymous access carries no api key");
-});
+test(
+  "#2962 opencode-zen with no connection falls back to anonymous no-auth credentials",
+  serial,
+  async () => {
+    const creds = await getProviderCredentials("opencode-zen");
+    assert.ok(creds, "opencode-zen must resolve to credentials, not null (no-auth free tier)");
+    assert.equal(
+      (creds as { connectionId?: string }).connectionId,
+      "noauth",
+      "should be synthetic no-auth credentials"
+    );
+    assert.equal(
+      (creds as { apiKey?: unknown }).apiKey,
+      null,
+      "anonymous access carries no api key"
+    );
+  }
+);
 
-test("apikey providers with anonymous fallback use no-auth when saved rows are terminal", async () => {
-  await createProviderConnection({
-    provider: "pollinations",
-    authType: "apikey",
-    name: "expired-pollinations-key",
-    apiKey: "pollinations-expired",
-    isActive: true,
-    testStatus: "expired",
-  });
+test(
+  "apikey providers with anonymous fallback use no-auth when saved rows are terminal",
+  serial,
+  async () => {
+    await createProviderConnection({
+      provider: "pollinations",
+      authType: "apikey",
+      name: "expired-pollinations-key",
+      apiKey: "pollinations-expired",
+      isActive: true,
+      testStatus: "expired",
+    });
 
-  const creds = await getProviderCredentials("pollinations");
-  assert.ok(creds, "pollinations should fall back to anonymous credentials");
-  assert.equal((creds as { connectionId?: string }).connectionId, "noauth");
-  assert.equal((creds as { apiKey?: unknown }).apiKey, null);
-});
+    const creds = await getProviderCredentials("pollinations");
+    assert.ok(creds, "pollinations should fall back to anonymous credentials");
+    assert.equal((creds as { connectionId?: string }).connectionId, "noauth");
+    assert.equal((creds as { apiKey?: unknown }).apiKey, null);
+  }
+);
 
-test("#2962 a normal api-key provider with no connection still returns null (no over-broadening)", async () => {
-  const creds = await getProviderCredentials("openai");
-  // Must NOT synthesize no-auth creds for a real api-key provider.
-  const connectionId = (creds as { connectionId?: string } | null)?.connectionId;
-  assert.notEqual(connectionId, "noauth", "openai must not get anonymous no-auth credentials");
-});
+test(
+  "#2962 a normal api-key provider with no connection still returns null (no over-broadening)",
+  serial,
+  async () => {
+    const creds = await getProviderCredentials("openai");
+    // Must NOT synthesize no-auth creds for a real api-key provider.
+    const connectionId = (creds as { connectionId?: string } | null)?.connectionId;
+    assert.notEqual(connectionId, "noauth", "openai must not get anonymous no-auth credentials");
+  }
+);
 
-test("#2962 opencode-zen falls back to no-auth when saved key rows are unusable", async () => {
-  await createProviderConnection({
-    provider: "opencode-zen",
-    authType: "apikey",
-    name: "expired-test-key",
-    apiKey: "oa_test_expired",
-    isActive: true,
-    testStatus: "expired",
-  });
+test(
+  "#2962 opencode-zen falls back to no-auth when saved key rows are unusable",
+  serial,
+  async () => {
+    await createProviderConnection({
+      provider: "opencode-zen",
+      authType: "apikey",
+      name: "expired-test-key",
+      apiKey: "oa_test_expired",
+      isActive: true,
+      testStatus: "expired",
+    });
 
-  const creds = await getProviderCredentials("opencode-zen");
-  assert.ok(creds, "opencode-zen should still resolve to anonymous no-auth credentials");
-  assert.equal((creds as { connectionId?: string }).connectionId, "noauth");
-  assert.equal((creds as { apiKey?: unknown }).apiKey, null);
-});
+    const creds = await getProviderCredentials("opencode-zen");
+    assert.ok(creds, "opencode-zen should still resolve to anonymous no-auth credentials");
+    assert.equal((creds as { connectionId?: string }).connectionId, "noauth");
+    assert.equal((creds as { apiKey?: unknown }).apiKey, null);
+  }
+);

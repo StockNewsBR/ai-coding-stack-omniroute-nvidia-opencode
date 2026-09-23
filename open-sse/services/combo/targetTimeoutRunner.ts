@@ -34,13 +34,13 @@ const lastTimeoutContexts: Array<{
 }> = [];
 let contextRingIndex = 0;
 
-async function settleAfterAbort<T>(operation: Promise<T>): Promise<void> {
-  await Promise.race([
+async function settleAfterAbort<T>(operation: Promise<T>): Promise<T | undefined> {
+  return Promise.race([
     operation.then(
-      () => undefined,
+      (value) => value,
       () => undefined
     ),
-    new Promise<void>((resolve) => setTimeout(resolve, 100)),
+    new Promise<undefined>((resolve) => setTimeout(resolve, 100)),
   ]);
 }
 
@@ -179,14 +179,23 @@ export function buildTargetTimeoutRunner(deps: {
       modelAbortSignal: timeoutController.signal,
     };
     const parentHedgeSignal = target?.modelAbortSignal ?? null;
+    let parentAborted = false;
+    let resolveParentAbort: ((response: Response) => void) | null = null;
+    const parentAbortPromise = new Promise<Response>((resolve) => {
+      resolveParentAbort = resolve;
+    });
+    const cancelFromParent = () => {
+      if (parentAborted) return;
+      parentAborted = true;
+      timeoutController.abort(new Error(COMBO_HEDGE_CANCELLED_REASON));
+      resolveParentAbort?.(new Response(null, { status: 599 }));
+    };
     let onParentHedgeAbort: (() => void) | null = null;
     if (parentHedgeSignal) {
       if (parentHedgeSignal.aborted) {
-        timeoutController.abort(new Error(COMBO_HEDGE_CANCELLED_REASON));
+        cancelFromParent();
       } else {
-        onParentHedgeAbort = () => {
-          timeoutController.abort(new Error(COMBO_HEDGE_CANCELLED_REASON));
-        };
+        onParentHedgeAbort = cancelFromParent;
         parentHedgeSignal.addEventListener("abort", onParentHedgeAbort, { once: true });
       }
     }
@@ -210,17 +219,26 @@ export function buildTargetTimeoutRunner(deps: {
       // Observe the loser even when the timeout response wins. Providers should
       // honor the abort signal; the bounded settle window prevents a broken
       // adapter from holding the combo forever.
-      const raced = await Promise.race([operation, timeoutPromise]).catch((raceErr) => {
-        // Defensive: should never fire — both race branches always resolve.
-        // Include the error message so the root cause is not masked.
-        const detail = raceErr instanceof Error ? raceErr.message : String(raceErr);
-        log.error?.(
-          "COMBO",
-          `Unexpected rejection in combo timeout race for ${modelStr}: ${detail}`
-        );
-        return errorResponse(502, `Combo timeout dispatch error: ${detail}`);
-      });
+      const raced = await Promise.race([operation, timeoutPromise, parentAbortPromise]).catch(
+        (raceErr) => {
+          // Defensive: should never fire — both race branches always resolve.
+          // Include the error message so the root cause is not masked.
+          const detail = raceErr instanceof Error ? raceErr.message : String(raceErr);
+          log.error?.(
+            "COMBO",
+            `Unexpected rejection in combo timeout race for ${modelStr}: ${detail}`
+          );
+          return errorResponse(502, `Combo timeout dispatch error: ${detail}`);
+        }
+      );
+      const cancelledByParent = parentAborted;
       if (timedOut) await settleAfterAbort(operation);
+      if (cancelledByParent) {
+        const settled = await settleAfterAbort(operation);
+        return settled ?? new Response(null, { status: 599 });
+      }
+      // A local timeout returns its typed 504; otherwise return the operation's
+      // response unchanged.
       return raced;
     } finally {
       clearTimeout(timeoutId);

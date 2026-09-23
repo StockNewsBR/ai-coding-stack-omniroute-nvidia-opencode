@@ -15,6 +15,7 @@
 
 import { createConnection } from "node:net";
 import { spawn } from "node:child_process";
+import { readdirSync, readFileSync, readlinkSync } from "node:fs";
 import os from "node:os";
 
 /** Result of probing the service before spawning. */
@@ -294,6 +295,53 @@ function runPidProbe(
   });
 }
 
+/** Linux fallback when ss/lsof cannot expose socket ownership in a container. */
+function resolveProcNetPid(port: number): number | null {
+  if (os.platform() !== "linux") return null;
+  const wantedPort = port.toString(16).toUpperCase().padStart(4, "0");
+  const inodes = new Set<string>();
+
+  for (const table of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+    try {
+      for (const line of readFileSync(table, "utf8").split("\n").slice(1)) {
+        const columns = line.trim().split(/\s+/);
+        if (columns.length < 10 || columns[3] !== "0A") continue;
+        if (columns[1]?.split(":")[1]?.toUpperCase() === wantedPort) {
+          inodes.add(columns[9]);
+        }
+      }
+    } catch {
+      // A non-Linux or restricted /proc is handled by the command probes.
+    }
+  }
+  if (inodes.size === 0) return null;
+
+  try {
+    for (const entry of readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      let fds: string[];
+      try {
+        fds = readdirSync(`/proc/${entry}/fd`);
+      } catch {
+        continue;
+      }
+      for (const fd of fds) {
+        try {
+          const link = readlinkSync(`/proc/${entry}/fd/${fd}`);
+          if (link.startsWith("socket:[") && inodes.has(link.slice(8, -1))) {
+            return Number.parseInt(entry, 10);
+          }
+        } catch {
+          // Processes can exit while their descriptor directory is scanned.
+        }
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 /**
  * Resolve the pid of whatever process is listening on `port`, if any.
  *
@@ -316,6 +364,10 @@ export async function resolvePortPid(port: number): Promise<number | null> {
   for (const probe of PID_PROBES) {
     const pid = await runPidProbe(probe, port, deadline - Date.now());
     if (pid !== null) return pid;
+    if (probe.command === "lsof") {
+      const procPid = resolveProcNetPid(port);
+      if (procPid !== null) return procPid;
+    }
   }
 
   return null;

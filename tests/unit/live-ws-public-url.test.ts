@@ -8,6 +8,10 @@ const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-live-ws-p
 const ORIGINAL_DATA_DIR = process.env.DATA_DIR;
 const ORIGINAL_API_KEY_SECRET = process.env.API_KEY_SECRET;
 const ORIGINAL_PUBLIC_URL = process.env.NEXT_PUBLIC_LIVE_WS_PUBLIC_URL;
+const LOOPBACK_HEADERS = {
+  origin: "http://localhost",
+  "x-omniroute-peer-locality": "loopback",
+};
 
 process.env.DATA_DIR = TEST_DATA_DIR;
 process.env.API_KEY_SECRET = process.env.API_KEY_SECRET || "test-live-ws-public-url-secret";
@@ -63,7 +67,7 @@ test("handshake response includes publicUrl when NEXT_PUBLIC_LIVE_WS_PUBLIC_URL 
 
   const response = await wsRoute.GET(
     new Request("http://localhost/api/v1/ws?handshake=1", {
-      headers: { origin: "http://localhost" },
+      headers: LOOPBACK_HEADERS,
     })
   );
 
@@ -77,7 +81,7 @@ test("handshake response includes null publicUrl when NEXT_PUBLIC_LIVE_WS_PUBLIC
 
   const response = await wsRoute.GET(
     new Request("http://localhost/api/v1/ws?handshake=1", {
-      headers: { origin: "http://localhost" },
+      headers: LOOPBACK_HEADERS,
     })
   );
 
@@ -101,7 +105,7 @@ test("publicUrl with non-WebSocket scheme is rejected (null)", async () => {
 
   const response = await wsRoute.GET(
     new Request("http://localhost/api/v1/ws?handshake=1", {
-      headers: { origin: "http://localhost" },
+      headers: LOOPBACK_HEADERS,
     })
   );
 
@@ -116,7 +120,7 @@ test("publicUrl with ws:// scheme is accepted", async () => {
 
   const response = await wsRoute.GET(
     new Request("http://localhost/api/v1/ws?handshake=1", {
-      headers: { origin: "http://localhost" },
+      headers: LOOPBACK_HEADERS,
     })
   );
 
@@ -130,7 +134,7 @@ test("handshake path is derived from NEXT_PUBLIC_LIVE_WS_PUBLIC_URL pathname", a
 
   const response = await wsRoute.GET(
     new Request("http://localhost/api/v1/ws?handshake=1", {
-      headers: { origin: "http://localhost" },
+      headers: LOOPBACK_HEADERS,
     })
   );
 
@@ -144,7 +148,7 @@ test("handshake path defaults to /live-ws when NEXT_PUBLIC_LIVE_WS_PUBLIC_URL is
 
   const response = await wsRoute.GET(
     new Request("http://localhost/api/v1/ws?handshake=1", {
-      headers: { origin: "http://localhost" },
+      headers: LOOPBACK_HEADERS,
     })
   );
 

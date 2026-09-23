@@ -20,6 +20,7 @@ process.env.DATA_DIR = TEST_DATA_DIR;
 process.env.NODE_ENV = "test";
 process.env.DISABLE_SQLITE_AUTO_BACKUP = "true";
 process.env.API_KEY_SECRET = "warmup-exclusive-lease-test-secret";
+const serial = { concurrency: false };
 
 const core = await import("../../src/lib/db/core.ts");
 const providersDb = await import("../../src/lib/db/providers.ts");
@@ -62,7 +63,15 @@ function installMockFetch(
   };
 }
 
+async function waitForWarmupIdle(): Promise<void> {
+  const { __waitForWarmupIdle } = await import("../../src/lib/warmupScheduler.ts");
+  await __waitForWarmupIdle();
+}
+
 test.beforeEach(async () => {
+  const { __resetWarmupState, __waitForWarmupIdle } =
+    await import("../../src/lib/warmupScheduler.ts");
+  await __waitForWarmupIdle();
   await resetStorage();
   delete process.env.OMNIROUTE_WARMUP_ENABLED;
   delete process.env.OMNIROUTE_WARMUP_CRON;
@@ -71,23 +80,29 @@ test.beforeEach(async () => {
   delete process.env.REDIS_URL;
   // Reset the globalThis scheduler singleton so lastFireMinute/minuteKey latch
   // from a prior test does not suppress the tick in the next test.
-  const { __resetWarmupState } = await import("../../src/lib/warmupScheduler.ts");
   __resetWarmupState();
 });
 
-test.after(() => {
+test.afterEach(async () => {
+  const { __waitForWarmupIdle } = await import("../../src/lib/warmupScheduler.ts");
+  await __waitForWarmupIdle();
+});
+
+test.after(async () => {
+  const { __waitForWarmupIdle } = await import("../../src/lib/warmupScheduler.ts");
+  await __waitForWarmupIdle();
   core.resetDbInstance();
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
 });
 
-test("startWarmupScheduler: disabled → null (default)", async () => {
+test("startWarmupScheduler: disabled → null (default)", serial, async () => {
   const { startWarmupScheduler, stopWarmupScheduler } =
     await import("../../src/lib/warmupScheduler.ts");
   assert.equal(startWarmupScheduler(), null);
   stopWarmupScheduler();
 });
 
-test("startWarmupScheduler: enabled → returns timer and is a singleton", async () => {
+test("startWarmupScheduler: enabled → returns timer and is a singleton", serial, async () => {
   const { startWarmupScheduler, stopWarmupScheduler } =
     await import("../../src/lib/warmupScheduler.ts");
   process.env.OMNIROUTE_WARMUP_ENABLED = "1";
@@ -101,7 +116,7 @@ test("startWarmupScheduler: enabled → returns timer and is a singleton", async
   delete process.env.OMNIROUTE_WARMUP_ENABLED;
 });
 
-test("env parsing: cron default + concurrency clamp", async () => {
+test("env parsing: cron default + concurrency clamp", serial, async () => {
   const { startWarmupScheduler, stopWarmupScheduler } =
     await import("../../src/lib/warmupScheduler.ts");
   process.env.OMNIROUTE_WARMUP_ENABLED = "1";
@@ -113,201 +128,220 @@ test("env parsing: cron default + concurrency clamp", async () => {
   delete process.env.OMNIROUTE_WARMUP_CONCURRENCY;
 });
 
-test("integration: opt-in gating — connection not in claudeWarmup.connections is skipped", async () => {
-  const { startWarmupScheduler, stopWarmupScheduler, __resetWarmupState } =
-    await import("../../src/lib/warmupScheduler.ts");
-  const settingsDb = await import("../../src/lib/db/settings.ts");
+test(
+  "integration: opt-in gating — connection not in claudeWarmup.connections is skipped",
+  serial,
+  async () => {
+    const { startWarmupScheduler, stopWarmupScheduler, __resetWarmupState } =
+      await import("../../src/lib/warmupScheduler.ts");
+    const settingsDb = await import("../../src/lib/db/settings.ts");
 
-  await providersDb.createProviderConnection({
-    provider: "claude",
-    authType: "oauth",
-    name: "Pro User",
-    email: "pro@example.com",
-    accessToken: "tok-123",
-    refreshToken: "rt-123",
-    isActive: true,
-    providerSpecificData: { organizationType: "claude_pro" },
-  });
+    await providersDb.createProviderConnection({
+      provider: "claude",
+      authType: "oauth",
+      name: "Pro User",
+      email: "pro@example.com",
+      accessToken: "tok-123",
+      refreshToken: "rt-123",
+      isActive: true,
+      providerSpecificData: { organizationType: "claude_pro" },
+    });
 
-  // Do NOT opt in — leave claudeWarmup.connections empty.
-  const mock = installMockFetch(() => ({
-    status: 200,
-    body: { usage: { input_tokens: 3, output_tokens: 1 } },
-  }));
+    // Do NOT opt in — leave claudeWarmup.connections empty.
+    const mock = installMockFetch(() => ({
+      status: 200,
+      body: { usage: { input_tokens: 3, output_tokens: 1 } },
+    }));
 
-  process.env.OMNIROUTE_WARMUP_ENABLED = "1";
-  process.env.OMNIROUTE_WARMUP_CRON = "*/1 * * * *"; // every minute
-  startWarmupScheduler();
-  // Allow the immediate tick + any scheduled ticks to run.
-  await new Promise((r) => setTimeout(r, 50));
-  stopWarmupScheduler();
-  mock.restore();
+    process.env.OMNIROUTE_WARMUP_ENABLED = "1";
+    process.env.OMNIROUTE_WARMUP_CRON = "*/1 * * * *"; // every minute
+    startWarmupScheduler();
+    await waitForWarmupIdle();
+    stopWarmupScheduler();
+    mock.restore();
 
-  assert.equal(mock.calls.length, 0, "no fetch should fire when no connection is opted in");
-  delete process.env.OMNIROUTE_WARMUP_ENABLED;
-  delete process.env.OMNIROUTE_WARMUP_CRON;
-});
+    assert.equal(mock.calls.length, 0, "no fetch should fire when no connection is opted in");
+    delete process.env.OMNIROUTE_WARMUP_ENABLED;
+    delete process.env.OMNIROUTE_WARMUP_CRON;
+  }
+);
 
-test("integration: opted-in claude_pro connection → fetch fires with Bearer token + beta suffix", async () => {
-  const { startWarmupScheduler, stopWarmupScheduler } =
-    await import("../../src/lib/warmupScheduler.ts");
-  const settingsDb = await import("../../src/lib/db/settings.ts");
+test(
+  "integration: opted-in claude_pro connection → fetch fires with Bearer token + beta suffix",
+  serial,
+  async () => {
+    const { startWarmupScheduler, stopWarmupScheduler } =
+      await import("../../src/lib/warmupScheduler.ts");
+    const settingsDb = await import("../../src/lib/db/settings.ts");
 
-  const conn = await providersDb.createProviderConnection({
-    provider: "claude",
-    authType: "oauth",
-    name: "Pro User",
-    email: "pro@example.com",
-    accessToken: "tok-abc",
-    refreshToken: "rt-abc",
-    isActive: true,
-    providerSpecificData: { organizationType: "claude_pro" },
-  });
+    const conn = await providersDb.createProviderConnection({
+      provider: "claude",
+      authType: "oauth",
+      name: "Pro User",
+      email: "pro@example.com",
+      accessToken: "tok-abc",
+      refreshToken: "rt-abc",
+      isActive: true,
+      providerSpecificData: { organizationType: "claude_pro" },
+    });
 
-  // Opt in via settings.
-  await settingsDb.updateSettings({ claudeWarmup: { connections: { [conn.id]: true } } });
+    // Opt in via settings.
+    await settingsDb.updateSettings({ claudeWarmup: { connections: { [conn.id]: true } } });
 
-  const mock = installMockFetch(() => ({
-    status: 200,
-    body: { usage: { input_tokens: 3, output_tokens: 1 } },
-  }));
+    const mock = installMockFetch(() => ({
+      status: 200,
+      body: { usage: { input_tokens: 3, output_tokens: 1 } },
+    }));
 
-  process.env.OMNIROUTE_WARMUP_ENABLED = "1";
-  process.env.OMNIROUTE_WARMUP_CRON = "*/1 * * * *";
-  startWarmupScheduler();
-  await new Promise((r) => setTimeout(r, 50));
-  stopWarmupScheduler();
-  mock.restore();
+    process.env.OMNIROUTE_WARMUP_ENABLED = "1";
+    process.env.OMNIROUTE_WARMUP_CRON = "*/1 * * * *";
+    startWarmupScheduler();
+    await waitForWarmupIdle();
+    stopWarmupScheduler();
+    mock.restore();
 
-  assert.ok(mock.calls.length >= 1, "at least one fetch should fire");
-  const call = mock.calls[0];
-  assert.ok(call.url.includes("api.anthropic.com/v1/messages"), `url was ${call.url}`);
-  assert.ok(call.url.includes("beta=true"), "url should carry ?beta=true");
-  assert.equal((call.init?.headers as Record<string, string>)?.Authorization, "Bearer tok-abc");
-  assert.equal((call.init?.headers as Record<string, string>)?.model, undefined); // model is in body, not headers
+    assert.ok(mock.calls.length >= 1, "at least one fetch should fire");
+    const call = mock.calls[0];
+    assert.ok(call.url.includes("api.anthropic.com/v1/messages"), `url was ${call.url}`);
+    assert.ok(call.url.includes("beta=true"), "url should carry ?beta=true");
+    assert.equal((call.init?.headers as Record<string, string>)?.Authorization, "Bearer tok-abc");
+    assert.equal((call.init?.headers as Record<string, string>)?.model, undefined); // model is in body, not headers
 
-  const body = JSON.parse(call.init?.body as string);
-  assert.equal(body.max_tokens, 1, "warmup must use max_tokens=1 to minimize quota burn");
-  assert.equal(body.model, "claude-3-5-haiku-20241022");
+    const body = JSON.parse(call.init?.body as string);
+    assert.equal(body.max_tokens, 1, "warmup must use max_tokens=1 to minimize quota burn");
+    assert.equal(body.model, "claude-3-5-haiku-20241022");
 
-  delete process.env.OMNIROUTE_WARMUP_ENABLED;
-  delete process.env.OMNIROUTE_WARMUP_CRON;
-});
+    delete process.env.OMNIROUTE_WARMUP_ENABLED;
+    delete process.env.OMNIROUTE_WARMUP_CRON;
+  }
+);
 
-test("hard lease isolation skips an opted-in lease-only connection with zero model calls", async () => {
-  const { startWarmupScheduler, stopWarmupScheduler } =
-    await import("../../src/lib/warmupScheduler.ts");
-  const settingsDb = await import("../../src/lib/db/settings.ts");
-  const apiKeysDb = await import("../../src/lib/db/apiKeys.ts");
+test(
+  "hard lease isolation skips an opted-in lease-only connection with zero model calls",
+  serial,
+  async () => {
+    const { startWarmupScheduler, stopWarmupScheduler } =
+      await import("../../src/lib/warmupScheduler.ts");
+    const settingsDb = await import("../../src/lib/db/settings.ts");
+    const apiKeysDb = await import("../../src/lib/db/apiKeys.ts");
 
-  const conn = await providersDb.createProviderConnection({
-    provider: "claude",
-    authType: "oauth",
-    name: "Managed Pro User",
-    accessToken: "synthetic-token",
-    refreshToken: "synthetic-refresh",
-    isActive: true,
-    providerSpecificData: { organizationType: "claude_pro" },
-  });
-  await apiKeysDb.createApiKey("managed warmup key", "test", ["lease:exclusive"], {
-    allowedConnections: [conn.id],
-  });
-  await settingsDb.updateSettings({ claudeWarmup: { connections: { [conn.id]: true } } });
+    const conn = await providersDb.createProviderConnection({
+      provider: "claude",
+      authType: "oauth",
+      name: "Managed Pro User",
+      accessToken: "synthetic-token",
+      refreshToken: "synthetic-refresh",
+      isActive: true,
+      providerSpecificData: { organizationType: "claude_pro" },
+    });
+    await apiKeysDb.createApiKey("managed warmup key", "test", ["lease:exclusive"], {
+      allowedConnections: [conn.id],
+    });
+    await settingsDb.updateSettings({ claudeWarmup: { connections: { [conn.id]: true } } });
 
-  const mock = installMockFetch(() => {
-    throw new Error("unexpected model warmup call");
-  });
-  process.env.OMNIROUTE_WARMUP_ENABLED = "1";
-  process.env.OMNIROUTE_WARMUP_CRON = "*/1 * * * *";
-  startWarmupScheduler();
-  await new Promise((resolve) => setTimeout(resolve, 50));
-  stopWarmupScheduler();
-  mock.restore();
+    const mock = installMockFetch(() => {
+      throw new Error("unexpected model warmup call");
+    });
+    process.env.OMNIROUTE_WARMUP_ENABLED = "1";
+    process.env.OMNIROUTE_WARMUP_CRON = "*/1 * * * *";
+    startWarmupScheduler();
+    await waitForWarmupIdle();
+    stopWarmupScheduler();
+    mock.restore();
 
-  assert.equal(mock.calls.length, 0);
-  delete process.env.OMNIROUTE_WARMUP_ENABLED;
-  delete process.env.OMNIROUTE_WARMUP_CRON;
-});
+    assert.equal(mock.calls.length, 0);
+    delete process.env.OMNIROUTE_WARMUP_ENABLED;
+    delete process.env.OMNIROUTE_WARMUP_CRON;
+  }
+);
 
-test("integration: message rotation — different content across sequential pings", async () => {
-  const { startWarmupScheduler, stopWarmupScheduler } =
-    await import("../../src/lib/warmupScheduler.ts");
-  const settingsDb = await import("../../src/lib/db/settings.ts");
+test(
+  "integration: message rotation — different content across sequential pings",
+  serial,
+  async () => {
+    const { startWarmupScheduler, stopWarmupScheduler } =
+      await import("../../src/lib/warmupScheduler.ts");
+    const settingsDb = await import("../../src/lib/db/settings.ts");
 
-  const conn = await providersDb.createProviderConnection({
-    provider: "claude",
-    authType: "oauth",
-    name: "Pro User",
-    email: "pro@example.com",
-    accessToken: "tok-abc",
-    refreshToken: "rt-abc",
-    isActive: true,
-    providerSpecificData: { organizationType: "claude_pro" },
-  });
-  await settingsDb.updateSettings({ claudeWarmup: { connections: { [conn.id]: true } } });
+    const conn = await providersDb.createProviderConnection({
+      provider: "claude",
+      authType: "oauth",
+      name: "Pro User",
+      email: "pro@example.com",
+      accessToken: "tok-abc",
+      refreshToken: "rt-abc",
+      isActive: true,
+      providerSpecificData: { organizationType: "claude_pro" },
+    });
+    await settingsDb.updateSettings({ claudeWarmup: { connections: { [conn.id]: true } } });
 
-  const mock = installMockFetch(() => ({
-    status: 200,
-    body: { usage: { input_tokens: 1, output_tokens: 1 } },
-  }));
+    const mock = installMockFetch(() => ({
+      status: 200,
+      body: { usage: { input_tokens: 1, output_tokens: 1 } },
+    }));
 
-  process.env.OMNIROUTE_WARMUP_ENABLED = "1";
-  process.env.OMNIROUTE_WARMUP_CRON = "*/1 * * * *";
-  // First ping.
-  startWarmupScheduler();
-  await new Promise((r) => setTimeout(r, 30));
-  stopWarmupScheduler();
-  // Reset module-level message counter is not exported; instead verify content is one of the rotation set.
-  const firstBody = JSON.parse(mock.calls[0].init?.body as string);
-  assert.ok(["hi", "hello", "ping", "ready"].includes(firstBody.messages[0].content));
+    process.env.OMNIROUTE_WARMUP_ENABLED = "1";
+    process.env.OMNIROUTE_WARMUP_CRON = "*/1 * * * *";
+    // First ping.
+    startWarmupScheduler();
+    await waitForWarmupIdle();
+    stopWarmupScheduler();
+    // Reset module-level message counter is not exported; instead verify content is one of the rotation set.
+    const firstBody = JSON.parse(mock.calls[0].init?.body as string);
+    assert.ok(["hi", "hello", "ping", "ready"].includes(firstBody.messages[0].content));
 
-  // Second ping (new scheduler instance, same counter continues) — content should differ eventually.
-  startWarmupScheduler();
-  await new Promise((r) => setTimeout(r, 30));
-  stopWarmupScheduler();
-  mock.restore();
+    // Second ping (new scheduler instance, same counter continues) — content should differ eventually.
+    startWarmupScheduler();
+    await waitForWarmupIdle();
+    stopWarmupScheduler();
+    mock.restore();
 
-  assert.ok(mock.calls.length >= 2, "expected at least two pings across both runs");
-  delete process.env.OMNIROUTE_WARMUP_ENABLED;
-  delete process.env.OMNIROUTE_WARMUP_CRON;
-});
+    assert.ok(mock.calls.length >= 2, "expected at least two pings across both runs");
+    delete process.env.OMNIROUTE_WARMUP_ENABLED;
+    delete process.env.OMNIROUTE_WARMUP_CRON;
+  }
+);
 
-test("integration: 403 → forbidden persisted, no further fetch for that connection", async () => {
-  const { startWarmupScheduler, stopWarmupScheduler } =
-    await import("../../src/lib/warmupScheduler.ts");
-  const settingsDb = await import("../../src/lib/db/settings.ts");
-  const crs = await import("../../src/lib/db/connectionRuntimeState.ts");
+test(
+  "integration: 403 → forbidden persisted, no further fetch for that connection",
+  serial,
+  async () => {
+    const { startWarmupScheduler, stopWarmupScheduler } =
+      await import("../../src/lib/warmupScheduler.ts");
+    const settingsDb = await import("../../src/lib/db/settings.ts");
+    const crs = await import("../../src/lib/db/connectionRuntimeState.ts");
 
-  const conn = await providersDb.createProviderConnection({
-    provider: "claude",
-    authType: "oauth",
-    name: "Pro User",
-    email: "pro@example.com",
-    accessToken: "tok-forbidden",
-    refreshToken: "rt",
-    isActive: true,
-    providerSpecificData: { organizationType: "claude_pro" },
-  });
-  await settingsDb.updateSettings({ claudeWarmup: { connections: { [conn.id]: true } } });
+    const conn = await providersDb.createProviderConnection({
+      provider: "claude",
+      authType: "oauth",
+      name: "Pro User",
+      email: "pro@example.com",
+      accessToken: "tok-forbidden",
+      refreshToken: "rt",
+      isActive: true,
+      providerSpecificData: { organizationType: "claude_pro" },
+    });
+    await settingsDb.updateSettings({ claudeWarmup: { connections: { [conn.id]: true } } });
 
-  const mock = installMockFetch(() => ({ status: 403, body: { error: "forbidden" } }));
+    const mock = installMockFetch(() => ({ status: 403, body: { error: "forbidden" } }));
 
-  process.env.OMNIROUTE_WARMUP_ENABLED = "1";
-  process.env.OMNIROUTE_WARMUP_CRON = "*/1 * * * *";
-  startWarmupScheduler();
-  await new Promise((r) => setTimeout(r, 50));
-  stopWarmupScheduler();
-  mock.restore();
+    process.env.OMNIROUTE_WARMUP_ENABLED = "1";
+    process.env.OMNIROUTE_WARMUP_CRON = "*/1 * * * *";
+    startWarmupScheduler();
+    await waitForWarmupIdle();
+    stopWarmupScheduler();
+    mock.restore();
 
-  assert.equal(mock.calls.length, 1, "exactly one fetch on 403");
-  const state = crs.getConnectionRuntimeState(conn.id);
-  assert.equal(state?.lastWarmupResult, "forbidden", "forbidden must be persisted to SQLite");
+    assert.equal(mock.calls.length, 1, "exactly one fetch on 403");
+    const state = crs.getConnectionRuntimeState(conn.id);
+    assert.equal(state?.lastWarmupResult, "forbidden", "forbidden must be persisted to SQLite");
 
-  delete process.env.OMNIROUTE_WARMUP_ENABLED;
-  delete process.env.OMNIROUTE_WARMUP_CRON;
-});
+    delete process.env.OMNIROUTE_WARMUP_ENABLED;
+    delete process.env.OMNIROUTE_WARMUP_CRON;
+  }
+);
 
-test("integration: 429 → rate_limit with Retry-After parsed", async () => {
+test("integration: 429 → rate_limit with Retry-After parsed", serial, async () => {
   const { startWarmupScheduler, stopWarmupScheduler } =
     await import("../../src/lib/warmupScheduler.ts");
   const settingsDb = await import("../../src/lib/db/settings.ts");
@@ -334,7 +368,7 @@ test("integration: 429 → rate_limit with Retry-After parsed", async () => {
   process.env.OMNIROUTE_WARMUP_ENABLED = "1";
   process.env.OMNIROUTE_WARMUP_CRON = "*/1 * * * *";
   startWarmupScheduler();
-  await new Promise((r) => setTimeout(r, 50));
+  await waitForWarmupIdle();
   stopWarmupScheduler();
   mock.restore();
 
@@ -352,7 +386,7 @@ test("integration: 429 → rate_limit with Retry-After parsed", async () => {
   delete process.env.OMNIROUTE_WARMUP_CRON;
 });
 
-test("integration: api_key connection is skipped even when opted in", async () => {
+test("integration: api_key connection is skipped even when opted in", serial, async () => {
   const { startWarmupScheduler, stopWarmupScheduler } =
     await import("../../src/lib/warmupScheduler.ts");
   const settingsDb = await import("../../src/lib/db/settings.ts");

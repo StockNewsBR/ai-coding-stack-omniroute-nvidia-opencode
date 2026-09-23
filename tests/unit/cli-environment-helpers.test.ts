@@ -1,9 +1,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+const DETECTION_ENV_KEYS = [
+  "CODESPACES",
+  "WSL_DISTRO_NAME",
+  "WSL_INTEROP",
+  "GITPOD_WORKSPACE_ID",
+  "REPL_ID",
+  "REPL_SLUG",
+  "CI",
+];
+
 function withEnv(vars: Record<string, string | undefined>, fn: () => void) {
+  const scopedVars = Object.fromEntries(
+    DETECTION_ENV_KEYS.map((key) => [key, vars[key]])
+  ) as Record<string, string | undefined>;
+  Object.assign(scopedVars, vars);
   const saved: Record<string, string | undefined> = {};
-  for (const [k, v] of Object.entries(vars)) {
+  for (const [k, v] of Object.entries(scopedVars)) {
     saved[k] = process.env[k];
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;

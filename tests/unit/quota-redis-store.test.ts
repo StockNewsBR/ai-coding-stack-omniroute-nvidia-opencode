@@ -53,11 +53,35 @@ test.beforeEach(async () => {
   await resetStorage();
 });
 
+test.afterEach(async () => {
+  const { resetRedisClient, resetRedisQuotaStore } =
+    await import("../../src/lib/quota/redisQuotaStore.ts");
+  resetRedisClient();
+  resetRedisQuotaStore();
+});
+
 test.after(async () => {
   core.resetDbInstance();
   if (fs.existsSync(TEST_DATA_DIR)) {
     fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
   }
+});
+
+test("redisQuotaStore: unavailable client teardown closes the retrying client", async () => {
+  const { getRedisClient, resetRedisClient } =
+    await import("../../src/lib/quota/redisQuotaStore.ts");
+
+  const client = await getRedisClient("redis://localhost:6399");
+  let disconnected = false;
+  const disconnect = client.disconnect.bind(client);
+  client.disconnect = () => {
+    disconnected = true;
+    disconnect();
+  };
+
+  resetRedisClient();
+
+  assert.equal(disconnected, true, "reset must synchronously close an unavailable Redis client");
 });
 
 // ─── Mock Redis client ───────────────────────────────────────────────────────

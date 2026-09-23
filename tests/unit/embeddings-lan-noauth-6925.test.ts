@@ -9,10 +9,12 @@ const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-embed-lan
 process.env.DATA_DIR = TEST_DATA_DIR;
 
 const core = await import("../../src/lib/db/core.ts");
+const { closeCallLogSaves } = await import("../../src/lib/usage/callLogs.ts");
 const { createProviderNode } = await import("../../src/lib/db/providers/nodes.ts");
 const { createEmbeddingResponse } = await import("../../src/lib/embeddings/service.ts");
 
-test.after(() => {
+test.after(async () => {
+  await closeCallLogSaves(2_000);
   core.resetDbInstance();
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
 });

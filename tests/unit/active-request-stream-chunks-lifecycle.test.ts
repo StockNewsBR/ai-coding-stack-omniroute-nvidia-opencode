@@ -16,7 +16,8 @@ const callLogs = await import("../../src/lib/usage/callLogs.ts");
 // before comparing the raw chunk payload.
 const stripChunkTs = (chunk: string): string => chunk.replace(/^\[\d{2}:\d{2}:\d{2}\.\d{3}\] /, "");
 
-test.after(() => {
+test.after(async () => {
+  await callLogs.closeCallLogSaves(2_000);
   core.resetDbInstance();
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
 });

@@ -25,6 +25,10 @@ import path from "node:path";
 
 const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-8779-agy-"));
 process.env.DATA_DIR = TEST_DATA_DIR;
+const previousGeminiApiKey = process.env.GEMINI_API_KEY;
+const previousGoogleApiKey = process.env.GOOGLE_API_KEY;
+delete process.env.GEMINI_API_KEY;
+delete process.env.GOOGLE_API_KEY;
 
 const core = await import("../../src/lib/db/core.ts");
 const providersDb = await import("../../src/lib/db/providers.ts");
@@ -53,6 +57,10 @@ async function seedOnly(provider: string) {
 test.after(() => {
   core.resetDbInstance();
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  if (previousGeminiApiKey === undefined) delete process.env.GEMINI_API_KEY;
+  else process.env.GEMINI_API_KEY = previousGeminiApiKey;
+  if (previousGoogleApiKey === undefined) delete process.env.GOOGLE_API_KEY;
+  else process.env.GOOGLE_API_KEY = previousGoogleApiKey;
 });
 
 test("the agy/ prefix still canonicalizes to antigravity (#8013 unchanged)", () => {

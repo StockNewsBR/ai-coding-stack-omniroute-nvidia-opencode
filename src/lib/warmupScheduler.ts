@@ -41,12 +41,14 @@ declare global {
     timer: NodeJS.Timeout | null;
     executing: boolean;
     lastFireMinute: number;
+    executionPromise: Promise<void> | null;
   };
 }
 const STATE = (globalThis.__omnirouteWarmupScheduler ??= {
   timer: null,
   executing: false,
   lastFireMinute: -1,
+  executionPromise: null,
 });
 
 const TRUE_ENV_VALUES = new Set(["1", "true", "yes", "on"]);
@@ -108,7 +110,7 @@ export function stopWarmupScheduler(): void {
     clearInterval(STATE.timer);
     STATE.timer = null;
   }
-  STATE.executing = false;
+  if (!STATE.executionPromise) STATE.executing = false;
   STATE.lastFireMinute = -1;
 }
 
@@ -118,8 +120,13 @@ export function __resetWarmupState(): void {
     clearInterval(STATE.timer);
   }
   STATE.timer = null;
-  STATE.executing = false;
+  if (!STATE.executionPromise) STATE.executing = false;
   STATE.lastFireMinute = -1;
+}
+
+/** Test-only: wait for a tick that was stopped after it started. */
+export async function __waitForWarmupIdle(): Promise<void> {
+  await STATE.executionPromise;
 }
 
 async function tick(): Promise<void> {
@@ -134,13 +141,16 @@ async function tick(): Promise<void> {
   if (minuteKey === STATE.lastFireMinute) return;
   STATE.lastFireMinute = minuteKey;
   STATE.executing = true;
-  try {
-    await executeWarmup();
-  } catch (err) {
-    log.error("tick failed", { err });
-  } finally {
-    STATE.executing = false;
-  }
+  const execution = executeWarmup()
+    .catch((err) => {
+      log.error("tick failed", { err });
+    })
+    .finally(() => {
+      STATE.executing = false;
+      STATE.executionPromise = null;
+    });
+  STATE.executionPromise = execution;
+  await execution;
 }
 
 async function executeWarmup(): Promise<void> {

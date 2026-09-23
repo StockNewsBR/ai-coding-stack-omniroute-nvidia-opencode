@@ -3,10 +3,12 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { AUTHZ_HEADER_PEER_LOCALITY } from "../../src/server/authz/headers.ts";
 
 const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-codex-ws-fingerprint-"));
 process.env.DATA_DIR = TEST_DATA_DIR;
 process.env.APP_LOG_TO_FILE = "false";
+const previousBridgeSecret = process.env.OMNIROUTE_WS_BRIDGE_SECRET;
 process.env.OMNIROUTE_WS_BRIDGE_SECRET = "bridge-secret";
 
 const core = await import("../../src/lib/db/core.ts");
@@ -23,6 +25,8 @@ test.beforeEach(resetDb);
 test.after(() => {
   core.resetDbInstance();
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  if (previousBridgeSecret === undefined) delete process.env.OMNIROUTE_WS_BRIDGE_SECRET;
+  else process.env.OMNIROUTE_WS_BRIDGE_SECRET = previousBridgeSecret;
 });
 
 test("Codex internal websocket bridge prepare preserves original OAuth identity in off mode", async () => {
@@ -46,7 +50,11 @@ test("Codex internal websocket bridge prepare preserves original OAuth identity 
       body: JSON.stringify({
         action: "prepare",
         requestUrl: "http://omniroute.local/v1/responses",
-        headers: { "session-id": "client-session", "thread-id": "client-thread" },
+        headers: {
+          "session-id": "client-session",
+          "thread-id": "client-thread",
+          [AUTHZ_HEADER_PEER_LOCALITY]: "loopback",
+        },
         response: { model: "codex/gpt-5.5", input: "hello" },
       }),
     })

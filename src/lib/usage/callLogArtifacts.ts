@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { RequestPipelinePayloads } from "@omniroute/open-sse/utils/requestLogger.ts";
-import { resolveDataDir } from "../dataPaths";
-import { getCallLogPipelineMaxSizeBytes, isChatDebugFileEnabled } from "../logEnv";
+import { resolveDataDir } from "../dataPaths.ts";
+import { getCallLogPipelineMaxSizeBytes, isChatDebugFileEnabled } from "../logEnv.ts";
 
 const isCloud = typeof globalThis.caches === "object" && globalThis.caches !== null;
 const isBuildPhase =

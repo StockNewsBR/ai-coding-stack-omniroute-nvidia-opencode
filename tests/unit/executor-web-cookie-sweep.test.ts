@@ -25,10 +25,11 @@
  * If this file ever flags a missing executor, the fix is in the executor
  * — the contract is the executor's responsibility.
  */
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { getExecutor } from "../../open-sse/executors/index.ts";
 import { WEB_COOKIE_PROVIDERS, NOAUTH_PROVIDERS } from "../../src/shared/constants/providers.ts";
+import type { TlsFetchOptions, TlsFetchResult } from "../../open-sse/services/tlsClientBase.ts";
 
 type WebCookieId = keyof typeof WEB_COOKIE_PROVIDERS;
 type NoauthId = keyof typeof NOAUTH_PROVIDERS;
@@ -71,6 +72,46 @@ const VALID_BODY = {
   model: "test",
   messages: [{ role: "user", content: "ping" }],
 };
+
+// This contract sweep must never reach a real web provider. Several web executors use the
+// native wreq-js/koffi TLS transport, whose worker pool can abort during Node teardown when a
+// test leaves an in-flight request behind. The wrapper contract is exercised with deterministic
+// synthetic 401s instead; transport behavior belongs to the provider-specific suites.
+const originalFetch = globalThis.fetch;
+globalThis.fetch = async () =>
+  new Response(JSON.stringify({ error: "synthetic contract-sweep response" }), {
+    status: 401,
+    headers: { "Content-Type": "application/json" },
+  });
+
+const syntheticTlsFetch = async (
+  _url: string,
+  _options: TlsFetchOptions
+): Promise<TlsFetchResult> => ({
+  status: 401,
+  headers: new Headers({ "Content-Type": "application/json" }),
+  text: JSON.stringify({ error: "synthetic contract-sweep response" }),
+  body: null,
+});
+
+const tlsOverrideModules = await Promise.all([
+  import("../../open-sse/services/chatgptTlsClient.ts"),
+  import("../../open-sse/services/claudeTlsClient.ts"),
+  import("../../open-sse/services/grokTlsClient.ts"),
+  import("../../open-sse/services/lmarenaTlsClient.ts"),
+  import("../../open-sse/services/notionTlsClient.ts"),
+  import("../../open-sse/services/perplexityTlsClient.ts"),
+]);
+for (const module of tlsOverrideModules) {
+  module.__setTlsFetchOverrideForTesting(syntheticTlsFetch);
+}
+
+after(() => {
+  globalThis.fetch = originalFetch;
+  for (const module of tlsOverrideModules) {
+    module.__setTlsFetchOverrideForTesting(null);
+  }
+});
 
 /**
  * Asserts that `result` has the executor wrapper contract shape:

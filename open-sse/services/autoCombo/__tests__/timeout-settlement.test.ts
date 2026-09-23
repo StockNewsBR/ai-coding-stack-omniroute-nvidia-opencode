@@ -7,7 +7,7 @@ describe("timeout cancellation settlement", () => {
     let settled = false;
     const runner = buildTargetTimeoutRunner({
       comboTargetTimeoutMs: 5,
-      log: { warn: vi.fn() },
+      log: { warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
       handleSingleModel: async (_body, _model, target) => {
         await new Promise<void>((resolve) => {
           target?.modelAbortSignal?.addEventListener("abort", () => setTimeout(resolve, 10), {

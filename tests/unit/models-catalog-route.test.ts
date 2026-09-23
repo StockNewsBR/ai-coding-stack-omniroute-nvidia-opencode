@@ -16,6 +16,7 @@ const settingsDb = await import("../../src/lib/db/settings.ts");
 const apiKeysDb = await import("../../src/lib/db/apiKeys.ts");
 const featureFlagsDb = await import("../../src/lib/db/featureFlags.ts");
 const modelsDevSync = await import("../../src/lib/modelsDevSync.ts");
+const contextWindowResolver = await import("../../src/lib/contextWindowResolver.ts");
 const v1ModelsCatalog = await import("../../src/app/api/v1/models/catalog.ts");
 
 async function resetStorage() {
@@ -939,6 +940,12 @@ test("v1 models catalog advertises GLM-5.2 provider aliases with hosted context 
       outputTokenLimit: 128000,
     },
   ]);
+
+  // Synced-model writes schedule a debounced context-window reconciliation. Await
+  // it here so the catalog is built from the same settled fixture under shard
+  // concurrency; otherwise the static GLM window can win before discovery metadata
+  // is reconciled.
+  await contextWindowResolver.runContextWindowReconcile();
 
   try {
     modelsDevSync.saveModelsDevCapabilities({

@@ -16,10 +16,7 @@
  * Part of: Group B — Quota Sharing Engine (plan 22, frente F6).
  */
 
-import {
-  getPool,
-  listAllocationsForApiKey,
-} from "@/lib/localDb";
+import { getPool, listAllocationsForApiKey } from "@/lib/localDb";
 import { WINDOW_MS, dimensionKeyToString } from "./dimensions";
 import type { DimensionKey } from "./dimensions";
 import type { QuotaStore, PoolUsageSnapshot } from "./types";
@@ -39,6 +36,7 @@ interface RedisLike {
   eval(script: string, numkeys: number, ...args: unknown[]): Promise<unknown>;
   del(...keys: string[]): Promise<number>;
   quit(): Promise<string>;
+  disconnect(): void;
 }
 
 /**
@@ -65,7 +63,18 @@ export async function getRedisClient(url: string): Promise<RedisLike> {
 
 /** Test-only: reset the Redis singleton. */
 export function resetRedisClient(): void {
+  const client = _redisClient as RedisLike | null;
   _redisClient = null;
+  if (!client) return;
+
+  // `quit()` waits for a connection that may never become ready. The reset
+  // hook is used by tests after failed localhost probes, so close the socket
+  // synchronously and prevent ioredis from scheduling another retry.
+  try {
+    client.disconnect();
+  } catch {
+    // The test-only reset must still clear the singleton if the client is gone.
+  }
 }
 
 // ---------------------------------------------------------------------------

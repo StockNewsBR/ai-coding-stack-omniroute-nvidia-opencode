@@ -3150,11 +3150,13 @@ async function handleRoundRobinCombo({
   let rrExpired = false;
   let rrLoopSafetyTimer: ReturnType<typeof setTimeout> | null = null;
   let rrResolveSafety: ((res: Response) => void) | null = null;
+  const rrAbortControllers = new Set<AbortController>();
   const rrSafetyPromise = new Promise<Response>((resolve) => {
     rrResolveSafety = resolve;
   });
   rrLoopSafetyTimer = setTimeout(() => {
     rrExpired = true;
+    for (const controller of rrAbortControllers) controller.abort();
     log.warn(
       "COMBO-RR",
       `Round-robin loop exceeded ${rrLoopSafetyMs}ms without a terminal response — force-terminating`
@@ -3329,14 +3331,22 @@ async function handleRoundRobinCombo({
             fingerprint: resolveTargetFingerprint(target) ?? "",
           });
 
-          const result = await Promise.race([
-            handleSingleModel(attemptBody, modelStr, {
-              ...targetForAttempt,
-              effectiveComboStrategy: "round-robin",
-              failoverBeforeRetry: config.failoverBeforeRetry,
-            }),
-            rrSafetyPromise,
-          ]);
+          const rrTargetAbortController = new AbortController();
+          rrAbortControllers.add(rrTargetAbortController);
+          let result: Response;
+          try {
+            result = await Promise.race([
+              handleSingleModel(attemptBody, modelStr, {
+                ...targetForAttempt,
+                modelAbortSignal: rrTargetAbortController.signal,
+                effectiveComboStrategy: "round-robin",
+                failoverBeforeRetry: config.failoverBeforeRetry,
+              }),
+              rrSafetyPromise,
+            ]);
+          } finally {
+            rrAbortControllers.delete(rrTargetAbortController);
+          }
           if (rrExpired) return result; // G4: safety timer won — stop everything
 
           // Quota-aware scheduling: reserve the estimated budget for this

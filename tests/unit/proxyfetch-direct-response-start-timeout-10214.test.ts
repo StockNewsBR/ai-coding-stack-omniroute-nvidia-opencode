@@ -56,7 +56,15 @@ function hangingFetch(capture: {
 
 function withFastTimeout<T>(fn: () => Promise<T>): Promise<T> {
   process.env.OMNIROUTE_DIRECT_HEADERS_TIMEOUT_MS = "50";
-  return fn().finally(() => {
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  const backstop = new Promise<T>((_resolve, reject) => {
+    deadline = setTimeout(
+      () => reject(new Error("direct response-start test deadline exceeded")),
+      5000
+    );
+  });
+  return Promise.race([fn(), backstop]).finally(() => {
+    if (deadline) clearTimeout(deadline);
     delete process.env.OMNIROUTE_DIRECT_HEADERS_TIMEOUT_MS;
   });
 }

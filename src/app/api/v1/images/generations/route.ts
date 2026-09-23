@@ -174,6 +174,8 @@ async function postHandler(request, _context) {
   // the paid image framework but is disabled by default policy, so nothing paid
   // executes unless a future policy explicitly enables it.
   if (body.model === FREE_IMAGE_ROUTE_ID || body.model === FREE_IMAGE_ROUTE_ID_FREE) {
+    const requestedImageCount =
+      typeof body.n === "number" && Number.isFinite(body.n) ? Math.floor(body.n) : undefined;
     const selection = await resolveFreeImageRouteSelection(body, requestId);
     if (!selection.ok) {
       return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, NO_FREE_IMAGE_PROVIDER_AVAILABLE);
@@ -184,7 +186,7 @@ async function postHandler(request, _context) {
         requestId,
         modelId: body.model,
         prompt: body.prompt,
-        n: body.n,
+        n: requestedImageCount,
         policy: selection.paidExecution.policy,
         selection: selection.paid,
         ledger: selection.paidExecution.ledger,

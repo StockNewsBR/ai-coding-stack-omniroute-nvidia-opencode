@@ -89,6 +89,22 @@ test("hedge do parent já abortado propaga o abort ao filho", async () => {
   assert.equal(sawAbort, true);
 });
 
+test("cancelamento do parent encerra o timer quando o upstream ignora o abort", async () => {
+  const parent = new AbortController();
+  const runner = buildTargetTimeoutRunner({
+    handleSingleModel: () => new Promise<Response>(() => {}),
+    comboTargetTimeoutMs: 310_000,
+    log: noopLog,
+  });
+  const startedAt = Date.now();
+  const resultPromise = runner({}, "cancelled-model", { modelAbortSignal: parent.signal });
+  parent.abort(new Error("combo-cancelled"));
+  const result = await resultPromise;
+
+  assert.equal(result.status, 599);
+  assert.ok(Date.now() - startedAt < 1_000, "parent cancellation must not wait for the timeout");
+});
+
 test("rejection from handleSingleModel after timeout does not leak as unhandledRejection", async () => {
   // Simulate: timeout fires, handleSingleModel later rejects with the abort error.
   // Before the fix, this rejection could escape as an unhandledRejection if the
@@ -217,8 +233,7 @@ test("resolveTargetTimeoutMs provided: uses per-target timeout when present", as
         });
       }),
     comboTargetTimeoutMs: 20,
-    resolveTargetTimeoutMs: async (target) =>
-      target?.connectionId === "conn-1" ? 50 : undefined,
+    resolveTargetTimeoutMs: async (target) => (target?.connectionId === "conn-1" ? 50 : undefined),
     log: noopLog,
   });
   const res = await runner({}, "slow-model", {
@@ -265,8 +280,7 @@ test("resolveTargetTimeoutMs extended: 50ms outlives the 20ms base (does not abo
       return new Response(resolvedWith, { status: resolvedWith === "aborted" ? 599 : 200 });
     },
     comboTargetTimeoutMs: 20,
-    resolveTargetTimeoutMs: async (target) =>
-      target?.connectionId === "conn-1" ? 50 : undefined,
+    resolveTargetTimeoutMs: async (target) => (target?.connectionId === "conn-1" ? 50 : undefined),
     log: noopLog,
   });
   const res = await runner({}, "slow-model", {

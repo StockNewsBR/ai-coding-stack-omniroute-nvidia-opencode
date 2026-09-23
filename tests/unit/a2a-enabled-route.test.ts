@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { NextRequest } from "next/server";
+import { AUTHZ_HEADER_PEER_LOCALITY } from "../../src/server/authz/headers.ts";
 
 const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-a2a-enabled-route-"));
 const ORIGINAL_DATA_DIR = process.env.DATA_DIR;
@@ -26,7 +27,10 @@ async function resetStorage() {
 function makeJsonRpcRequest(body: unknown): NextRequest {
   return new Request("http://localhost/a2a", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      [AUTHZ_HEADER_PEER_LOCALITY]: "loopback",
+    },
     body: JSON.stringify(body),
   }) as unknown as NextRequest;
 }

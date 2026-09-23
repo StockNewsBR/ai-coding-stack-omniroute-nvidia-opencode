@@ -195,7 +195,9 @@ export interface AwsImageAdapterConfig {
   readonly now?: () => Date;
 }
 
-export function createAwsImageAdapter(config: AwsImageAdapterConfig = {}): PaidImageProviderAdapter {
+export function createAwsImageAdapter(
+  config: AwsImageAdapterConfig = {}
+): PaidImageProviderAdapter {
   const providerId =
     typeof config.providerId === "string" && config.providerId.trim() !== ""
       ? config.providerId.trim()
@@ -254,7 +256,12 @@ export function createAwsImageAdapter(config: AwsImageAdapterConfig = {}): PaidI
         };
       }
       if (!modelId) {
-        return { ok: false, providerId, error: "AWS_IMAGE_MODEL_MISSING", latencyMs: Date.now() - started };
+        return {
+          ok: false,
+          providerId,
+          error: "AWS_IMAGE_MODEL_MISSING",
+          latencyMs: Date.now() - started,
+        };
       }
 
       const headers: Record<string, string> = {
@@ -294,7 +301,7 @@ export function createAwsImageAdapter(config: AwsImageAdapterConfig = {}): PaidI
         }
 
         const parsed = parseResponse(payload);
-        if (!parsed.ok) {
+        if (parsed.ok === false) {
           return { ok: false, providerId, modelId, error: parsed.error, latencyMs };
         }
         return { ok: true, providerId, modelId, imageUrls: parsed.imageUrls, latencyMs };

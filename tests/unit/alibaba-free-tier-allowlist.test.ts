@@ -7,6 +7,9 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   ALIBABA_FREE_TIER_TEXT_CAPABLE_MODELS,
   ALIBABA_NO_FREE_TIER_TEXT_MODELS,
@@ -29,16 +32,30 @@ test("built-in allowlist includes operator free models and excludes paid blockli
 
 test("allowlist JSON pack overrides embedded lists when valid", () => {
   const previousPath = process.env.ALIBABA_FREE_TIER_ALLOWLIST_PATH;
-  const packPath = `${process.cwd()}/config/alibaba-free-tier-allowlist.json`;
-  process.env.ALIBABA_FREE_TIER_ALLOWLIST_PATH = packPath;
-  resetAlibabaFreeTierAllowlistCache();
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-alibaba-allowlist-"));
+  const packPath = path.join(tempDir, "allowlist.json");
+  fs.writeFileSync(
+    packPath,
+    JSON.stringify({
+      asOf: "2026-09-23",
+      validUntil: "2099-12-31",
+      capable: ["qwen3.6-plus"],
+      noFreeTier: ["qwen3.7-max"],
+    })
+  );
 
-  const pack = loadAlibabaFreeTierAllowlistPack();
-  assert.ok(pack);
-  assert.ok(isAlibabaFreeTierAllowlistPackValid(pack!));
-  assert.ok(pack!.capable.includes("qwen3.6-plus"));
+  try {
+    process.env.ALIBABA_FREE_TIER_ALLOWLIST_PATH = packPath;
+    resetAlibabaFreeTierAllowlistCache();
 
-  if (previousPath) process.env.ALIBABA_FREE_TIER_ALLOWLIST_PATH = previousPath;
-  else delete process.env.ALIBABA_FREE_TIER_ALLOWLIST_PATH;
-  resetAlibabaFreeTierAllowlistCache();
+    const pack = loadAlibabaFreeTierAllowlistPack();
+    assert.ok(pack);
+    assert.ok(isAlibabaFreeTierAllowlistPackValid(pack));
+    assert.ok(pack.capable.includes("qwen3.6-plus"));
+  } finally {
+    if (previousPath) process.env.ALIBABA_FREE_TIER_ALLOWLIST_PATH = previousPath;
+    else delete process.env.ALIBABA_FREE_TIER_ALLOWLIST_PATH;
+    resetAlibabaFreeTierAllowlistCache();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
 });

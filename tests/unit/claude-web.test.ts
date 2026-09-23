@@ -12,6 +12,17 @@ function reset() {
   __setTlsFetchOverrideForTesting(null);
 }
 
+const serial = { concurrency: false };
+
+function installTlsFetchOverride(): void {
+  __setTlsFetchOverrideForTesting(async () => ({
+    status: 401,
+    headers: new Headers({ "content-type": "application/json" }),
+    text: JSON.stringify({ error: "synthetic test response" }),
+    body: null,
+  }));
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 test("A: ClaudeWebExecutor is registered in executor index", () => {
@@ -46,7 +57,7 @@ test("F: ClaudeWebExecutor inherits from BaseExecutor", () => {
   assert.ok(typeof executor.testConnection === "function");
 });
 
-test("G: Test override hook can be set and unset", async () => {
+test("G: Test override hook can be set and unset", serial, async () => {
   const mockFn = async () => ({
     status: 200,
     headers: new Headers(),
@@ -63,8 +74,9 @@ test("G: Test override hook can be set and unset", async () => {
   assert.ok(true);
 });
 
-test("H: ClaudeWebExecutor handles missing credentials gracefully", async () => {
+test("H: ClaudeWebExecutor handles missing credentials gracefully", serial, async () => {
   reset();
+  installTlsFetchOverride();
   const executor = new ClaudeWebExecutor();
 
   try {
@@ -84,8 +96,9 @@ test("H: ClaudeWebExecutor handles missing credentials gracefully", async () => 
   }
 });
 
-test("I: ClaudeWebExecutor handles invalid messages parameter", async () => {
+test("I: ClaudeWebExecutor handles invalid messages parameter", serial, async () => {
   reset();
+  installTlsFetchOverride();
   const executor = new ClaudeWebExecutor();
 
   try {
@@ -105,7 +118,7 @@ test("I: ClaudeWebExecutor handles invalid messages parameter", async () => {
   }
 });
 
-test("J: tlsFetchOverride can be installed and mocked", async () => {
+test("J: tlsFetchOverride can be installed and mocked", serial, async () => {
   reset();
 
   let callCount = 0;
@@ -130,31 +143,37 @@ test("J: tlsFetchOverride can be installed and mocked", async () => {
   }
 });
 
-test("K: ClaudeWebExecutor execute returns response object with required fields", async () => {
-  reset();
-  const executor = new ClaudeWebExecutor();
-
-  try {
-    const result = await executor.execute({
-      model: "claude-sonnet-4-6",
-      body: { messages: [{ role: "user", content: "test" }] },
-      stream: false,
-      credentials: { apiKey: "sessionKey=test-token" },
-      signal: AbortSignal.timeout(5000),
-      log: null,
-    });
-
-    // Verify response structure
-    assert.ok(result.response);
-    assert.ok(typeof result.response.status === "number");
-    assert.ok(result.response.headers instanceof Headers);
-  } finally {
+test(
+  "K: ClaudeWebExecutor execute returns response object with required fields",
+  serial,
+  async () => {
     reset();
-  }
-});
+    installTlsFetchOverride();
+    const executor = new ClaudeWebExecutor();
 
-test("L: ClaudeWebExecutor processes streaming requests", async () => {
+    try {
+      const result = await executor.execute({
+        model: "claude-sonnet-4-6",
+        body: { messages: [{ role: "user", content: "test" }] },
+        stream: false,
+        credentials: { apiKey: "sessionKey=test-token" },
+        signal: AbortSignal.timeout(5000),
+        log: null,
+      });
+
+      // Verify response structure
+      assert.ok(result.response);
+      assert.ok(typeof result.response.status === "number");
+      assert.ok(result.response.headers instanceof Headers);
+    } finally {
+      reset();
+    }
+  }
+);
+
+test("L: ClaudeWebExecutor processes streaming requests", serial, async () => {
   reset();
+  installTlsFetchOverride();
   const executor = new ClaudeWebExecutor();
 
   try {
@@ -175,8 +194,9 @@ test("L: ClaudeWebExecutor processes streaming requests", async () => {
   }
 });
 
-test("M: ClaudeWebExecutor includes required fields in execute result", async () => {
+test("M: ClaudeWebExecutor includes required fields in execute result", serial, async () => {
   reset();
+  installTlsFetchOverride();
   const executor = new ClaudeWebExecutor();
 
   try {

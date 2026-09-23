@@ -14,3 +14,4 @@ import { Console } from "node:console";
 const stderrConsole = new Console({ stdout: process.stderr, stderr: process.stderr });
 console.log = stderrConsole.log.bind(stderrConsole);
 console.warn = stderrConsole.warn.bind(stderrConsole);
+console.debug = stderrConsole.debug.bind(stderrConsole);

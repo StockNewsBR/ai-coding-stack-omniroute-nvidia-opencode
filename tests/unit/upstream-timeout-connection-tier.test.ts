@@ -45,22 +45,24 @@ test("getExecutorTimeoutMs: invalid connection timeout falls through to model/pr
 test("executeWithUpstreamStartTimeout: connection timeout aborts before the global", async () => {
   let signalAbortedAt = Number.POSITIVE_INFINITY;
   const started = Date.now();
-  const result = await executeWithUpstreamStartTimeout({
-    executor: fakeExecutor(600_000),
-    provider: "openai",
-    model: "gpt-5",
-    connectionTimeoutMs: 50,
-    signal: new AbortController().signal,
-    log: null,
-    execute: (signal) =>
-      new Promise((resolve) => {
-        signal.addEventListener("abort", () => {
-          signalAbortedAt = Date.now() - started;
-          resolve("aborted");
-        });
-      }),
-  });
-  assert.equal(result, "aborted");
+  await assert.rejects(
+    executeWithUpstreamStartTimeout({
+      executor: fakeExecutor(600_000),
+      provider: "openai",
+      model: "gpt-5",
+      connectionTimeoutMs: 50,
+      signal: new AbortController().signal,
+      log: null,
+      execute: (signal) =>
+        new Promise((resolve) => {
+          signal.addEventListener("abort", () => {
+            signalAbortedAt = Date.now() - started;
+            resolve("aborted");
+          });
+        }),
+    }),
+    (error: unknown) => error instanceof Error && error.name === "TimeoutError"
+  );
   assert.ok(signalAbortedAt < 1_000, `aborted at ${signalAbortedAt}ms, expected < 1000ms`);
 });
 test("connection timeout extraction matches execCreds.providerSpecificData shape", () => {

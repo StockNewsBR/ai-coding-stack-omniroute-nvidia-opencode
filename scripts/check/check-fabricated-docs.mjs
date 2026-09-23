@@ -387,6 +387,15 @@ const SKIP_DOC_FILES = new Set([
   // Forward-looking coverage plan: a `- [ ]` checklist of test targets and helper
   // components to be created. Same rationale as the design/plan docs above.
   "docs/ops/COVERAGE_PLAN.md",
+  // Dated mission evidence reports: uppercase result labels and captured
+  // shell variables are evidence values, not product API/config claims.
+  "docs/OMNIROUTE_FINAL_R1_11_CANARY_2026-09-21.md",
+  "docs/OMNIROUTE_FINAL_R1_RECONSTRUCTION_2026-09-21.md",
+  "docs/OMNIROUTE_FINAL_R3_VISION_IMAGE_2026-09-21.md",
+  "docs/OMNIROUTE_IMAGE_FREE_FIRST_PAID_FALLBACK_R1_2026-09-22.md",
+  "docs/OMNIROUTE_IMAGE_PAID_FALLBACK_CANARY_R1_1_2026-09-22.md",
+  "docs/OMNIROUTE_IMAGE_PAID_FALLBACK_FRAMEWORK_R0_2026-09-21.md",
+  "docs/OMNIROUTE_IMAGE_PAID_FALLBACK_R2_2026-09-22.md",
 ]);
 
 // ── File discovery ─────────────────────────────────────────────────────────

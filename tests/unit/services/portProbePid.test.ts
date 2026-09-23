@@ -8,7 +8,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createServer } from "node:net";
+import { createServer, type AddressInfo } from "node:net";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -115,9 +115,10 @@ test("parseWindowsNetstatPid matches the local address, not the foreign one", ()
 
 test("resolvePortPid finds the pid holding a port", async () => {
   const server = createServer();
-  await new Promise<void>((resolve) => server.listen(29994, "127.0.0.1", resolve));
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
   try {
-    assert.equal(await resolvePortPid(29994), process.pid);
+    assert.equal(await resolvePortPid(port), process.pid);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
@@ -161,8 +162,9 @@ test("resolvePortPid still resolves a pid on a host without lsof", async (t) => 
     );
 
     process.env.PATH = shim;
-    await new Promise<void>((resolve) => server.listen(29992, "127.0.0.1", resolve));
-    assert.equal(await resolvePortPid(29992), process.pid);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as AddressInfo).port;
+    assert.equal(await resolvePortPid(port), process.pid);
   } finally {
     process.env.PATH = originalPath;
     await new Promise<void>((resolve) => server.close(() => resolve()));

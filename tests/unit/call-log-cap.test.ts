@@ -85,7 +85,8 @@ test.beforeEach(async () => {
   await resetStorage();
 });
 
-test.after(() => {
+test.after(async () => {
+  await callLogs.closeCallLogSaves(2_000);
   restorePipelineEnv();
   core.resetDbInstance();
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });

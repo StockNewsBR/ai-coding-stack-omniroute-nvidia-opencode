@@ -13,6 +13,7 @@ import { createChatPipelineHarness } from "../integration/_chatPipelineHarness.t
 
 const harness = await createChatPipelineHarness("chat-non-string-model-6407");
 const { handleChat, buildRequest, resetStorage, seedConnection } = harness;
+const serial = { concurrency: false };
 
 test.beforeEach(async () => {
   await resetStorage();
@@ -28,7 +29,7 @@ for (const [label, value, expectedType] of [
   ["array", [], "array"],
   ["object", {}, "object"],
 ] as const) {
-  test(`#6407: model as ${label} → 400 with typed error, no upstream call`, async () => {
+  test(`#6407: model as ${label} → 400 with typed error, no upstream call`, serial, async () => {
     await seedConnection("openai", { apiKey: "sk-openai" });
 
     let upstreamCalled = false;
@@ -69,7 +70,7 @@ for (const [label, value, expectedType] of [
   });
 }
 
-test("#6407: string model still routes normally (guard is not over-broad)", async () => {
+test("#6407: string model still routes normally (guard is not over-broad)", serial, async () => {
   await seedConnection("openai", { apiKey: "sk-openai" });
 
   let upstreamCalled = false;
@@ -78,9 +79,7 @@ test("#6407: string model still routes normally (guard is not over-broad)", asyn
     return Response.json({
       id: "x",
       object: "chat.completion",
-      choices: [
-        { index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop" },
-      ],
+      choices: [{ index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop" }],
     });
   };
 
@@ -98,26 +97,30 @@ test("#6407: string model still routes normally (guard is not over-broad)", asyn
   assert.equal(upstreamCalled, true, "a valid request must still reach upstream");
 });
 
-test("#6407: null model still routed to the existing 'Missing model' 400 (not the new guard)", async () => {
-  await seedConnection("openai", { apiKey: "sk-openai" });
+test(
+  "#6407: null model still routed to the existing 'Missing model' 400 (not the new guard)",
+  serial,
+  async () => {
+    await seedConnection("openai", { apiKey: "sk-openai" });
 
-  globalThis.fetch = async () =>
-    new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    globalThis.fetch = async () =>
+      new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
 
-  const response = await handleChat(
-    buildRequest({
-      body: {
-        model: null,
-        messages: [{ role: "user", content: "hi" }],
-      },
-    })
-  );
+    const response = await handleChat(
+      buildRequest({
+        body: {
+          model: null,
+          messages: [{ role: "user", content: "hi" }],
+        },
+      })
+    );
 
-  assert.equal(response.status, 400, "null model stays a 400");
-  const body = (await response.json()) as { error?: { message?: string } };
-  assert.match(
-    body.error?.message ?? "",
-    /missing model/i,
-    "null model keeps the existing 'Missing model' message (not the new type guard)"
-  );
-});
+    assert.equal(response.status, 400, "null model stays a 400");
+    const body = (await response.json()) as { error?: { message?: string } };
+    assert.match(
+      body.error?.message ?? "",
+      /missing model/i,
+      "null model keeps the existing 'Missing model' message (not the new type guard)"
+    );
+  }
+);

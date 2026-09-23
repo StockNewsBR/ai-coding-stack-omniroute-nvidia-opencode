@@ -42,13 +42,25 @@ function jsonRes(body: unknown, status = 200): Response {
 // deadline reused across fallback endpoints fails fast after the first abort).
 function stalledFetch(init?: { signal?: AbortSignal }): Promise<Response> {
   return new Promise((_resolve, reject) => {
+    // AbortSignal.timeout() uses an unref'd timer. Keep this deliberately
+    // bounded test promise alive until that signal fires, then release the
+    // watchdog with the request just like a real socket would.
+    const keepAlive = setTimeout(() => undefined, 30_000);
     const abortErr = () => new DOMException("The operation was aborted.", "AbortError");
     const signal = init?.signal;
     if (signal?.aborted) {
+      clearTimeout(keepAlive);
       reject(abortErr());
       return;
     }
-    signal?.addEventListener("abort", () => reject(abortErr()));
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(keepAlive);
+        reject(abortErr());
+      },
+      { once: true }
+    );
   });
 }
 

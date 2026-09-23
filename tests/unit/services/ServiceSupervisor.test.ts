@@ -51,9 +51,12 @@ db.prepare(
 const { ServiceSupervisor } = await import("../../../src/lib/services/ServiceSupervisor.ts");
 
 /** Starts a tiny HTTP health server on the given port that always returns 200. */
-function startHealthServer(port: number): http.Server {
+async function startHealthServer(port: number): Promise<http.Server> {
   const server = http.createServer((_, res) => res.writeHead(200).end("ok"));
-  server.listen(port);
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", resolve);
+  });
   return server;
 }
 
@@ -81,7 +84,7 @@ test.after(() => {
 });
 
 test("start spawns process and captures logs in ring buffer", async () => {
-  const healthServer = startHealthServer(29999);
+  const healthServer = await startHealthServer(29999);
   const sup = new ServiceSupervisor(tickConfig("test-svc", 29999));
 
   try {
@@ -105,7 +108,7 @@ test("start spawns process and captures logs in ring buffer", async () => {
 });
 
 test("stop sends SIGTERM and waits, then SIGKILL if needed", async () => {
-  const healthServer = startHealthServer(29999);
+  const healthServer = await startHealthServer(29999);
   const sup = new ServiceSupervisor({
     ...tickConfig("test-svc", 29999),
     stopTimeoutMs: 500,
@@ -122,7 +125,7 @@ test("stop sends SIGTERM and waits, then SIGKILL if needed", async () => {
 });
 
 test("crash sets state=error and lastError (no auto-restart)", async () => {
-  const healthServer = startHealthServer(29998);
+  const healthServer = await startHealthServer(29998);
   const crashConfig = {
     ...tickConfig("test-crash", 29998),
     spawnArgs: () => ({
@@ -164,7 +167,7 @@ test("crash sets state=error and lastError (no auto-restart)", async () => {
 });
 
 test("restart is atomic (concurrent calls serialize)", async () => {
-  const healthServer = startHealthServer(29999);
+  const healthServer = await startHealthServer(29999);
   const sup = new ServiceSupervisor(tickConfig("test-svc", 29999));
 
   try {
@@ -186,7 +189,7 @@ test("restart is atomic (concurrent calls serialize)", async () => {
 });
 
 test("does NOT auto-restart on crash", async () => {
-  const healthServer = startHealthServer(29998);
+  const healthServer = await startHealthServer(29998);
   const crashConfig = {
     ...tickConfig("test-crash", 29998),
     spawnArgs: () => ({
@@ -224,7 +227,7 @@ test("#6205: probeBeforeSpawn adopts a healthy existing instance (no spawn)", as
   // (a squatter can answer 2xx), so this adoption-path test opts in explicitly.
   const prevAdopt = process.env.OMNIROUTE_ADOPT_EXISTING_SERVICE;
   process.env.OMNIROUTE_ADOPT_EXISTING_SERVICE = "1";
-  const healthServer = startHealthServer(29996);
+  const healthServer = await startHealthServer(29996);
   const cfg = { ...tickConfig("test-adopt", 29996), probeBeforeSpawn: true };
   const sup = new ServiceSupervisor(cfg);
 
@@ -265,7 +268,7 @@ test("adopted service resolves and records the real pid of the process holding t
   // probe and flipping the adoption into a spurious "error" state. A separate
   // port keeps each probe isolated from the other test's pooled connection
   // (#10523).
-  const healthServer = startHealthServer(29995);
+  const healthServer = await startHealthServer(29995);
   const cfg = { ...tickConfig("test-adopt", 29995), probeBeforeSpawn: true };
   // Same opt-in as the adoption test above (GHSA-wg9p-6m2g-4v27).
   const prevAdopt = process.env.OMNIROUTE_ADOPT_EXISTING_SERVICE;
@@ -294,7 +297,7 @@ test("adopted service resolves and records the real pid of the process holding t
 // receiving the injected service API key. Without the operator opt-in the
 // supervisor must surface the actionable error instead of adopting.
 test("probeBeforeSpawn does NOT adopt a healthy listener without the opt-in", async () => {
-  const healthServer = startHealthServer(29994);
+  const healthServer = await startHealthServer(29994);
   const cfg = { ...tickConfig("test-adopt-deny", 29994), probeBeforeSpawn: true };
   const prevAdopt = process.env.OMNIROUTE_ADOPT_EXISTING_SERVICE;
   delete process.env.OMNIROUTE_ADOPT_EXISTING_SERVICE;

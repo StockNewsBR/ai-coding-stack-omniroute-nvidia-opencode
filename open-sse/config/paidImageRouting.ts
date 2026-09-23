@@ -534,18 +534,18 @@ function fallbackReasonForFreeFailure(
 export async function resolveImageRouteSelection(
   request: ImageRouteSelectionRequest
 ): Promise<ImageRouteSelection | ImageRouteUnavailable> {
-  if (request.free.ok) {
+  const free = request.free;
+  if (free.ok === true) {
     return {
       ok: true,
       via: "free",
-      providerId: request.free.providerId,
-      modelId: request.free.modelId,
-      free: request.free,
+      providerId: free.providerId,
+      modelId: free.modelId,
+      free,
     };
   }
 
-  const fallbackReason =
-    request.paid?.fallbackReason ?? fallbackReasonForFreeFailure(request.free.reason);
+  const fallbackReason = request.paid?.fallbackReason ?? fallbackReasonForFreeFailure(free.reason);
   const paid = await resolvePaidImageProvider({
     capability: request.capability,
     requestId: request.requestId,
@@ -560,7 +560,7 @@ export async function resolveImageRouteSelection(
     fallbackReason,
   });
 
-  if (paid.ok) {
+  if (paid.ok === true) {
     return {
       ok: true,
       via: "paid",
@@ -572,17 +572,18 @@ export async function resolveImageRouteSelection(
     };
   }
 
+  const paidUnavailable: PaidImageUnavailable = paid;
   return {
     ok: false,
     code: NO_FREE_IMAGE_PROVIDER_AVAILABLE,
-    reason: paid.reason,
-    free: request.free,
+    reason: paidUnavailable.reason,
+    free,
     paidFallback: {
       evaluated: true,
-      code: paid.code,
-      reason: paid.reason,
+      code: paidUnavailable.code,
+      reason: paidUnavailable.reason,
       fallbackReason,
-      considered: paid.considered,
+      considered: paidUnavailable.considered,
     },
   };
 }
