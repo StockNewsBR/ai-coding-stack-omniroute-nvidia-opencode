@@ -55,7 +55,10 @@ test("v1 ws handshake succeeds without credentials when wsAuth is disabled", asy
 
   const response = await wsRoute.GET(
     new Request("http://localhost/api/v1/ws?handshake=1", {
-      headers: { origin: "http://localhost" },
+      headers: {
+        origin: "http://localhost",
+        "x-omniroute-peer-locality": "loopback",
+      },
     })
   );
 

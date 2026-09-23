@@ -29,11 +29,13 @@ interface AcquireOptions {
    * Maximum number of requests allowed to wait in the per-model queue (#3872). When
    * the queue is already this deep, a new acquire rejects immediately with
    * `SEMAPHORE_QUEUE_FULL` instead of waiting, so the round-robin combo loop cascades
-   * to the next member right away (0 = never queue → fail over immediately). Omitted /
-   * negative keeps the historical unbounded-queue behavior.
+   * to the next member right away (0 = never queue → fail over immediately). Omitted
+   * values use the bounded process default.
    */
   maxQueueSize?: number;
 }
+
+const DEFAULT_MAX_QUEUE_SIZE = 100;
 
 interface RateLimitStatsEntry {
   running: number;
@@ -138,7 +140,11 @@ function createReleaseFn(modelStr: string): () => void {
  */
 export function acquire(
   modelStr: string,
-  { maxConcurrency = 3, timeoutMs = 30000, maxQueueSize }: AcquireOptions = {}
+  {
+    maxConcurrency = 3,
+    timeoutMs = 30000,
+    maxQueueSize = DEFAULT_MAX_QUEUE_SIZE,
+  }: AcquireOptions = {}
 ): Promise<() => void> {
   const gate = getGate(modelStr, maxConcurrency);
 

@@ -109,12 +109,8 @@ export function authenticateA2A(request: Request): boolean {
  * Agent Card) são delegáveis; os estados voltam pelo espelho SSE→A2A (RF1).
  */
 export async function POST(request: Request) {
-  if (!authenticateA2A(request)) {
-    return NextResponse.json(
-      { error: "Unauthorized: missing or invalid API key" },
-      { status: 401 }
-    );
-  }
+  const auth = await authorizeA2ATaskRoute(request);
+  if (auth instanceof Response) return auth;
   const settings = await getSettings();
   if (settings.a2aEnabled !== true) {
     return NextResponse.json(

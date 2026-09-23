@@ -225,6 +225,7 @@ export async function callAudioTranscription(
 
     const port = (deps.getPort ?? (() => getRuntimePorts().port))();
     const bearer = (deps.getBearer ?? resolveSelfLoopBearer)();
+    if (!bearer) throw new Error("Audio transcription authentication unavailable");
     const response = await (deps.fetchImpl ?? fetch)(
       `http://localhost:${port}/v1/audio/transcriptions`,
       {

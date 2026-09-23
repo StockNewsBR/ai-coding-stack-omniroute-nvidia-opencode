@@ -20,6 +20,7 @@ import { createLogger } from "../utils/logger";
 import { createHmac } from "crypto";
 import v8 from "node:v8";
 import { trackRequest } from "../../lib/gracefulShutdown";
+import { resolveInternalOmniRouteBearer } from "../utils/omnirouteAuth";
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
   const parsed = Number.parseInt(String(value), 10);
@@ -873,7 +874,6 @@ function rebuildRequest(request: Request, body: Uint8Array): Request {
  */
 export const ADMISSION_BYPASS_HEADER = "x-omniroute-admission-bypass";
 const ADMISSION_BYPASS_VALUE = "internal";
-const SELF_LOOP_KEY = "sk_omniroute";
 
 /**
  * Resolve the bearer credential used by trusted in-process self-loop
@@ -887,9 +887,7 @@ const SELF_LOOP_KEY = "sk_omniroute";
  * so local-mode behavior is unchanged.
  */
 export function resolveSelfLoopBearer(): string {
-  return (
-    process.env.OMNIROUTE_API_KEY?.trim() || process.env.ROUTER_API_KEY?.trim() || SELF_LOOP_KEY
-  );
+  return resolveInternalOmniRouteBearer() ?? "";
 }
 
 /**

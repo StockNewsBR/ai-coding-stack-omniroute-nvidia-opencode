@@ -12,6 +12,7 @@ import { createHash, timingSafeEqual } from "crypto";
 import type { NextRequest } from "next/server";
 import { extractApiKey, isValidApiKey } from "@/sse/services/auth";
 import { isRequireApiKeyEnabled } from "@/shared/utils/featureFlags";
+import { AUTHZ_HEADER_PEER_LOCALITY } from "@/server/authz/headers";
 
 function tokensMatch(provided: string, expected: string): boolean {
   const a = Buffer.from(provided);
@@ -32,13 +33,16 @@ export async function authenticateA2ARequest(req: NextRequest | Request): Promis
     return apiKey ? await isValidApiKey(apiKey) : false;
   }
 
-  const configuredKey = process.env.OMNIROUTE_API_KEY;
+  const configuredKey = process.env.OMNIROUTE_API_KEY?.trim() || process.env.ROUTER_API_KEY?.trim();
   if (configuredKey) {
     return apiKey ? tokensMatch(apiKey, configuredKey) : false;
   }
 
-  // No API key required and none configured — allow (keyless local-first).
-  return true;
+  // Keyless mode is local-first, not public. The locality header is stamped by
+  // the auth pipeline and cannot be supplied by an external caller.
+  return apiKey
+    ? await isValidApiKey(apiKey)
+    : req.headers.get(AUTHZ_HEADER_PEER_LOCALITY) === "loopback";
 }
 
 /**

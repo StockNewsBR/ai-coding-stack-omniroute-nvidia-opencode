@@ -4,8 +4,8 @@ import { executeA2ATaskWithState } from "../../../src/lib/a2a/taskExecution.ts";
 
 const managers: A2ATaskManager[] = [];
 
-function createManager(ttlMinutes = 5) {
-  const manager = new A2ATaskManager(ttlMinutes);
+function createManager(ttlMinutes = 5, maxActiveTasks?: number) {
+  const manager = new A2ATaskManager(ttlMinutes, maxActiveTasks);
   managers.push(manager);
   return manager;
 }
@@ -17,6 +17,30 @@ afterEach(() => {
 });
 
 describe("A2A task lifecycle regressions", () => {
+  it("rejects new work at the active task capacity and admits after completion", () => {
+    const tm = createManager(5, 1);
+    const first = tm.createTask({
+      skill: "smart-routing",
+      messages: [{ role: "user", content: "first" }],
+    });
+
+    expect(() =>
+      tm.createTask({
+        skill: "smart-routing",
+        messages: [{ role: "user", content: "second" }],
+      })
+    ).toThrow("A2A task capacity exceeded");
+
+    tm.updateTask(first.id, "working");
+    tm.updateTask(first.id, "completed");
+    expect(() =>
+      tm.createTask({
+        skill: "smart-routing",
+        messages: [{ role: "user", content: "after completion" }],
+      })
+    ).not.toThrow();
+  });
+
   it("does not force completed tasks to failed after expiration", () => {
     const tm = createManager();
     const task = tm.createTask({
@@ -77,7 +101,7 @@ describe("A2A task lifecycle regressions", () => {
     task.expiresAt = new Date(Date.now() - 1_000).toISOString();
 
     // private in TS only; callable at runtime for regression test
-    (tm as any).cleanupExpired();
+    (tm as unknown as { cleanupExpired: () => void }).cleanupExpired();
 
     const loaded = tm.getTask(task.id);
     expect(loaded?.state).toBe("cancelled");

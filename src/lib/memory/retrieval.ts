@@ -12,6 +12,7 @@ import { getQdrantConfig, checkQdrantHealth, searchSemanticMemory } from "./qdra
 import type { MemoryEngineStatus } from "@/shared/schemas/memory";
 import { estimateTokens, parseMetadata, rowToMemory, getRelevanceScore } from "./retrieval/scoring";
 import type { MemoryRow } from "./retrieval/scoring";
+import { internalOmniRouteAuthHeaders } from "@/shared/utils/omnirouteAuth";
 
 const log = logger("MEMORY_RETRIEVAL");
 
@@ -164,10 +165,16 @@ async function applyRerank<T extends { memory: Memory; score: number }>(
       top_n: items.length,
     };
 
+    const headers = internalOmniRouteAuthHeaders({ "content-type": "application/json" });
+    if (!headers) {
+      log.warn("memory.rerank.auth_missing", { model: rerankProviderModel });
+      return items;
+    }
+
     const res = await fetch(RERANK_LOOPBACK_URL, {
       // nosemgrep: typescript.react.security.react-insecure-request.react-insecure-request
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers,
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(5000),
     });

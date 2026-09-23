@@ -211,7 +211,15 @@ export async function POST(req: NextRequest) {
         return jsonRpcError(id, -32601, `Unknown skill: ${skill}`);
       }
 
-      const task = tm.createTask({ skill, messages, metadata: params?.metadata }, callerOwner);
+      let task;
+      try {
+        task = tm.createTask({ skill, messages, metadata: params?.metadata }, callerOwner);
+      } catch (error) {
+        if (error instanceof Error && error.message === "A2A task capacity exceeded") {
+          return jsonRpcError(id, -32000, "A2A task capacity exceeded");
+        }
+        throw error;
+      }
       try {
         tm.updateTask(task.id, "working");
         const result = await handler(task);
@@ -277,7 +285,15 @@ export async function POST(req: NextRequest) {
         return jsonRpcError(id, -32601, `Unknown skill: ${skill}`);
       }
 
-      const task = tm.createTask({ skill, messages, metadata: params?.metadata }, callerOwner);
+      let task;
+      try {
+        task = tm.createTask({ skill, messages, metadata: params?.metadata }, callerOwner);
+      } catch (error) {
+        if (error instanceof Error && error.message === "A2A task capacity exceeded") {
+          return jsonRpcError(id, -32000, "A2A task capacity exceeded");
+        }
+        throw error;
+      }
       tm.updateTask(task.id, "working");
 
       const stream = createA2AStream(

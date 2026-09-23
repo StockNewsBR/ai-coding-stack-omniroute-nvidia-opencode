@@ -26,11 +26,19 @@ import {
 
 export const PAID_IMAGE_LEDGER_SCOPE = "paid-image";
 
-const reservationsById = new Map<string, { cost: number; timestampMs: number }>();
+const RESERVATION_TTL_MS = 15 * 60 * 1000;
+const reservationsById = new Map<
+  string,
+  { cost: number; timestampMs: number; expiresAtMs: number }
+>();
 
-function reservedSince(startMs: number, excludeRequestId?: string): number {
+function reservedSince(startMs: number, excludeRequestId?: string, nowMs = Date.now()): number {
   let total = 0;
   for (const [requestId, reservation] of reservationsById) {
+    if (reservation.expiresAtMs <= nowMs) {
+      reservationsById.delete(requestId);
+      continue;
+    }
     if (requestId === excludeRequestId) continue;
     if (Number.isFinite(reservation.timestampMs) && reservation.timestampMs < startMs) continue;
     total += reservation.cost;
@@ -39,10 +47,16 @@ function reservedSince(startMs: number, excludeRequestId?: string): number {
 }
 
 export function createDomainStatePaidImageLedger(): PaidImageBudgetLedger {
-  const dailyCommitted = (startMs: number, excludeRequestId?: string): number =>
-    loadCostTotal(PAID_IMAGE_LEDGER_SCOPE, startMs) + reservedSince(startMs, excludeRequestId);
-  const monthlyCommitted = (startMs: number, excludeRequestId?: string): number =>
-    loadCostTotal(PAID_IMAGE_LEDGER_SCOPE, startMs) + reservedSince(startMs, excludeRequestId);
+  const dailyCommitted = (startMs: number, excludeRequestId?: string, nowMs = Date.now()): number =>
+    loadCostTotal(PAID_IMAGE_LEDGER_SCOPE, startMs) +
+    reservedSince(startMs, excludeRequestId, nowMs);
+  const monthlyCommitted = (
+    startMs: number,
+    excludeRequestId?: string,
+    nowMs = Date.now()
+  ): number =>
+    loadCostTotal(PAID_IMAGE_LEDGER_SCOPE, startMs) +
+    reservedSince(startMs, excludeRequestId, nowMs);
 
   return {
     record(entry: PaidImageLedgerEntry) {
@@ -67,13 +81,22 @@ export function createDomainStatePaidImageLedger(): PaidImageBudgetLedger {
         maxCostPerImage: request.maxCostPerImage,
         dailyImageBudget: request.dailyImageBudget,
         monthlyImageBudget: request.monthlyImageBudget,
-        dailyCommittedUsd: dailyCommitted(utcDayStartMs(request.now), request.requestId),
-        monthlyCommittedUsd: monthlyCommitted(utcMonthStartMs(request.now), request.requestId),
+        dailyCommittedUsd: dailyCommitted(
+          utcDayStartMs(request.now),
+          request.requestId,
+          request.now.getTime()
+        ),
+        monthlyCommittedUsd: monthlyCommitted(
+          utcMonthStartMs(request.now),
+          request.requestId,
+          request.now.getTime()
+        ),
       });
       if (verdict.reserved) {
         reservationsById.set(request.requestId, {
           cost: request.estimatedCostUsd,
           timestampMs: request.now.getTime(),
+          expiresAtMs: request.now.getTime() + RESERVATION_TTL_MS,
         });
       }
       return verdict;

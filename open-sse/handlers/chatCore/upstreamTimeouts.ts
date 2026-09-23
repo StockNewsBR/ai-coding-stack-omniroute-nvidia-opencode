@@ -123,10 +123,7 @@ export function getExecutorTimeoutMs(
     // Defensive backstop for direct callers: resolveConnectionTimeoutMs is the
     // gate (it rejects out-of-range values so the chain falls through); this
     // clamp only caps values a future caller could pass unvetted.
-    return Math.min(
-      Math.max(0, Math.floor(connectionTimeoutMs)),
-      MAX_PROVIDER_SPECIFIC_TIMEOUT_MS
-    );
+    return Math.min(Math.max(0, Math.floor(connectionTimeoutMs)), MAX_PROVIDER_SPECIFIC_TIMEOUT_MS);
   }
   const modelOverride = resolveModelTimeoutOverride(provider, model);
   if (modelOverride !== undefined) return modelOverride;
@@ -251,6 +248,7 @@ export async function executeWithUpstreamStartTimeout<T>({
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
   let abortListener: (() => void) | null = null;
   let timeoutAbortListener: (() => void) | null = null;
+  let abortRejectListener: (() => void) | null = null;
 
   const abortCombined = (source: AbortSignal) => {
     if (combinedController.signal.aborted) return;
@@ -272,14 +270,28 @@ export async function executeWithUpstreamStartTimeout<T>({
   });
 
   const abortPromise = new Promise<never>((_, reject) => {
-    signal.addEventListener("abort", () => reject(createAbortError(signal)), { once: true });
+    abortRejectListener = () => reject(createAbortError(signal));
+    signal.addEventListener("abort", abortRejectListener, { once: true });
   });
 
+  const operation = Promise.resolve().then(() => execute(combinedController.signal));
+  operation.catch(() => undefined);
+
   try {
-    return await Promise.race([execute(combinedController.signal), timeoutPromise, abortPromise]);
+    return await Promise.race([operation, timeoutPromise, abortPromise]);
   } finally {
+    if (combinedController.signal.aborted) {
+      await Promise.race([
+        operation.then(
+          () => undefined,
+          () => undefined
+        ),
+        new Promise<void>((resolve) => setTimeout(resolve, 100)),
+      ]);
+    }
     if (timeoutId) clearTimeout(timeoutId);
     if (abortListener) signal.removeEventListener("abort", abortListener);
+    if (abortRejectListener) signal.removeEventListener("abort", abortRejectListener);
     if (timeoutAbortListener) {
       timeoutController.signal.removeEventListener("abort", timeoutAbortListener);
     }

@@ -20,6 +20,7 @@ import { logToolCall } from "../audit.ts";
 import { getMcpHttpAuthHeadersForInternalFetch } from "../httpAuthContext.ts";
 import { normalizeQuotaResponse } from "../../../src/shared/contracts/quota.ts";
 import { resolveOmniRouteBaseUrl } from "../../../src/shared/utils/resolveOmniRouteBaseUrl.ts";
+import { internalOmniRouteAuthHeaders } from "../../../src/shared/utils/omnirouteAuth.ts";
 import {
   getComboModelProvider,
   getComboModelString,
@@ -31,16 +32,13 @@ import type {
 } from "../../../src/shared/constants/routingStrategies.ts";
 import { normalizeRoutingStrategy } from "../../../src/shared/constants/routingStrategies.ts";
 
-const OMNIROUTE_BASE_URL = resolveOmniRouteBaseUrl();
-const OMNIROUTE_API_KEY = process.env.OMNIROUTE_API_KEY || "";
-
 async function apiFetch(path: string, options: RequestInit = {}): Promise<unknown> {
-  const url = `${OMNIROUTE_BASE_URL}${path}`;
+  const url = `${resolveOmniRouteBaseUrl()}${path}`;
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
-    // Static env key is only a fallback; the per-caller MCP identity forwarded via
-    // withMcpHttpAuthContext must win over it (#5819).
-    ...(OMNIROUTE_API_KEY ? { Authorization: `Bearer ${OMNIROUTE_API_KEY}` } : {}),
+    ...(internalOmniRouteAuthHeaders() ?? {}),
+    // The per-caller MCP identity forwarded via withMcpHttpAuthContext wins over
+    // the process fallback (#5819).
     ...getMcpHttpAuthHeadersForInternalFetch(),
     ...((options.headers as Record<string, string>) || {}),
   };

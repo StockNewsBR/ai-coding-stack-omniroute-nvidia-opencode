@@ -4,8 +4,8 @@
  * Encrypts/decrypts sensitive fields (API keys, tokens) stored in SQLite.
  * Format: `enc:v1:<iv_hex>:<ciphertext_hex>:<authTag_hex>`
  *
- * If STORAGE_ENCRYPTION_KEY is not set, operates in passthrough mode
- * (stores plaintext for development convenience).
+ * If STORAGE_ENCRYPTION_KEY is not set, development may use passthrough mode;
+ * production fails closed instead of silently storing plaintext.
  *
  * KEY DERIVATION CHANGE (v3.7.9):
  * The PRIMARY key is now derived with a static salt ("omniroute-field-encryption-v1").
@@ -137,6 +137,10 @@ export function looksEncrypted(value: unknown): boolean {
   return typeof value === "string" && value.startsWith(PREFIX);
 }
 
+function plaintextFallbackAllowed(): boolean {
+  return process.env.NODE_ENV !== "production";
+}
+
 /**
  * Encrypt a plaintext string using the STATIC salt key.
  * If encryption is not configured, returns plaintext unchanged.
@@ -146,6 +150,9 @@ export function encrypt(plaintext: string | null | undefined): string | null | u
 
   const key = getStaticKey();
   if (!key) {
+    if (!plaintextFallbackAllowed()) {
+      throw new Error("Field encryption is required in production");
+    }
     console.warn(
       "[Encryption] STORAGE_ENCRYPTION_KEY not set. Storing plaintext (passthrough mode)."
     );
@@ -170,7 +177,10 @@ export function encrypt(plaintext: string | null | undefined): string | null | u
       `[Encryption] Encryption failed: ${message}. ` +
         `Check your STORAGE_ENCRYPTION_KEY — generate one with: openssl rand -base64 32`
     );
-    return plaintext; // fallback to plaintext rather than crashing
+    if (!plaintextFallbackAllowed()) {
+      throw new Error("Field encryption failed in production");
+    }
+    return plaintext;
   }
 }
 
@@ -297,12 +307,14 @@ export function decryptConnectionFields<T extends ConnectionFields | null | unde
 
   if (credentialDecryptFailed) {
     const failed: Array<{ field: string; value: unknown }> = [];
-    if (looksEncrypted(row.apiKey) && apiKey === null) failed.push({ field: "apiKey", value: row.apiKey });
+    if (looksEncrypted(row.apiKey) && apiKey === null)
+      failed.push({ field: "apiKey", value: row.apiKey });
     if (looksEncrypted(row.accessToken) && accessToken === null)
       failed.push({ field: "accessToken", value: row.accessToken });
     if (looksEncrypted(row.refreshToken) && refreshToken === null)
       failed.push({ field: "refreshToken", value: row.refreshToken });
-    if (looksEncrypted(row.idToken) && idToken === null) failed.push({ field: "idToken", value: row.idToken });
+    if (looksEncrypted(row.idToken) && idToken === null)
+      failed.push({ field: "idToken", value: row.idToken });
 
     const connectionId = typeof row.id === "string" ? row.id : "";
     const provider = typeof row.provider === "string" ? row.provider : "unknown";

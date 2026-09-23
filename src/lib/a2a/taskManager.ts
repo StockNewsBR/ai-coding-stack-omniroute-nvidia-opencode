@@ -83,11 +83,17 @@ const VALID_TRANSITIONS: Record<TaskState, TaskState[]> = {
 export class A2ATaskManager {
   private tasks = new Map<string, A2ATask>();
   private readonly ttlMs: number;
+  private readonly maxActiveTasks: number;
   private cleanupInterval: ReturnType<typeof setInterval>;
   private activeStreams = 0;
 
-  constructor(ttlMinutes: number = 5) {
+  constructor(
+    ttlMinutes: number = 5,
+    maxActiveTasks = Number(process.env.A2A_MAX_ACTIVE_TASKS ?? 100)
+  ) {
     this.ttlMs = ttlMinutes * 60 * 1000;
+    this.maxActiveTasks =
+      Number.isSafeInteger(maxActiveTasks) && maxActiveTasks > 0 ? maxActiveTasks : 100;
     this.cleanupInterval = setInterval(() => this.cleanupExpired(), 60_000);
     if (
       this.cleanupInterval &&
@@ -99,6 +105,12 @@ export class A2ATaskManager {
   }
 
   createTask(input: TaskInput, owner?: string): A2ATask {
+    this.cleanupExpired();
+    const active = [...this.tasks.values()].filter(
+      (task) => task.state === "submitted" || task.state === "working"
+    ).length;
+    if (active >= this.maxActiveTasks) throw new Error("A2A task capacity exceeded");
+
     const now = new Date();
     const task: A2ATask = {
       id: randomUUID(),

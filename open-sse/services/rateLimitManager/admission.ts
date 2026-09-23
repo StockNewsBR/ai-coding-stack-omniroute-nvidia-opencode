@@ -1,11 +1,11 @@
 /**
  * rateLimitManager/admission — queue-depth admission check (pure).
  *
- * `maxQueueDepth` (RequestQueueSettings, issue #6593) is an opt-in admission
+ * `maxQueueDepth` (RequestQueueSettings, issue #6593) is an admission
  * cap on the local rate-limit queue: when set (>0), a request that would be
  * queued behind `maxQueueDepth` already-queued jobs is fast-rejected before
  * it ever reaches Bottleneck's `schedule()`, instead of growing the queue
- * unboundedly. Default `0` = disabled, preserving today's behavior exactly.
+ * unboundedly. An explicit `0` still disables the cap.
  *
  * Extracted as a pure function (no Bottleneck/limiter dependency) so it is
  * unit-testable without spinning up a real limiter.

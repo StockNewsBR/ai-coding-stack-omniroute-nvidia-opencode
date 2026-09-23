@@ -31,12 +31,13 @@ test.after(() => {
   else process.env.OMNIROUTE_API_KEY = ORIGINAL_A2A_KEY;
 });
 
-function post(key?: string) {
+function post(key?: string, locality = "loopback") {
   return route.POST(
     new Request("http://localhost/a2a", {
       method: "POST",
       headers: {
         "content-type": "application/json",
+        "x-omniroute-peer-locality": locality,
         ...(key ? { authorization: `Bearer ${key}` } : {}),
       },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "message/send", params: {} }),
@@ -66,4 +67,10 @@ test("keyless local-first default still allows /a2a (posture preserved)", async 
   delete process.env.REQUIRE_API_KEY;
   delete process.env.OMNIROUTE_API_KEY;
   assert.equal(await isUnauthorized(await post()), false, "keyless default must not 401");
+});
+
+test("keyless /a2a rejects an untrusted remote locality", async () => {
+  delete process.env.REQUIRE_API_KEY;
+  delete process.env.OMNIROUTE_API_KEY;
+  assert.equal(await isUnauthorized(await post(undefined, "remote")), true);
 });

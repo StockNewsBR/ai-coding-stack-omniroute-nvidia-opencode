@@ -231,8 +231,8 @@ test("#6593 a maxWaitMs override of 0 is treated as no override", () => {
   }
 });
 
-test("#6593 DEFAULT_REQUEST_QUEUE_MAX_DEPTH defaults to 0 (disabled) absent an env override", () => {
+test("#6593 DEFAULT_REQUEST_QUEUE_MAX_DEPTH defaults to a bounded queue absent an env override", () => {
   assert.equal(process.env.RATE_LIMIT_MAX_QUEUE_DEPTH, undefined);
-  assert.equal(resilienceSettings.DEFAULT_REQUEST_QUEUE_MAX_DEPTH, 0);
-  assert.equal(resilienceSettings.DEFAULT_RESILIENCE_SETTINGS.requestQueue.maxQueueDepth, 0);
+  assert.equal(resilienceSettings.DEFAULT_REQUEST_QUEUE_MAX_DEPTH, 100);
+  assert.equal(resilienceSettings.DEFAULT_RESILIENCE_SETTINGS.requestQueue.maxQueueDepth, 100);
 });

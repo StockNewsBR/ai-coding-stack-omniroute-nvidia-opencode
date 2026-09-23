@@ -327,11 +327,6 @@
       "count": 5
     }
   },
-  "open-sse/mcp-server/__tests__/a2aLifecycle.test.ts": {
-    "@typescript-eslint/no-explicit-any": {
-      "count": 1
-    }
-  },
   "open-sse/mcp-server/__tests__/dbHealthTool.test.ts": {
     "@typescript-eslint/no-explicit-any": {
       "count": 1
@@ -1947,11 +1942,6 @@
       "count": 2
     }
   },
-  "src/app/api/v1/images/generations/route.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
   "src/app/api/v1/management/proxies/assignments/route.ts": {
     "no-restricted-imports": {
       "count": 1
@@ -2370,11 +2360,6 @@
   "src/lib/guardrails/promptInjection.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 2
-    }
-  },
-  "src/lib/guardrails/visionBridgeHelpers.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
     }
   },
   "src/lib/guardrails/visionBridgeRouter.ts": {

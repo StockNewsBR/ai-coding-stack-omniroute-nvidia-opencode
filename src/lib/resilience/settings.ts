@@ -45,11 +45,11 @@ export const DEFAULT_REQUEST_QUEUE_MAX_WAIT_MS = (() => {
   return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : 15000;
 })();
 
-// Issue #6593: opt-in admission cap on the local rate-limit queue depth.
-// Default 0 = disabled (unbounded queue, today's behavior unchanged).
+// Keep the local rate-limit queue bounded by default. An explicit 0 still
+// disables the cap for an operator who accepts unbounded queueing.
 export const DEFAULT_REQUEST_QUEUE_MAX_DEPTH = (() => {
-  const parsed = Number(process.env.RATE_LIMIT_MAX_QUEUE_DEPTH || "0");
-  return Number.isFinite(parsed) && parsed >= 0 ? Math.trunc(parsed) : 0;
+  const parsed = Number(process.env.RATE_LIMIT_MAX_QUEUE_DEPTH || "100");
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.trunc(parsed) : 100;
 })();
 
 export const DEFAULT_RESILIENCE_SETTINGS: ResilienceSettings = {

@@ -241,14 +241,16 @@ test("FREE circuit open maps to FREE_IMAGE_CIRCUIT_OPEN fallback reason", async 
 test("FREE unavailable + paid fallback enabled synthetically: candidate evaluated, cheapest acceptable chosen", async () => {
   const expensive = fakeAdapter({ providerId: "paid-expensive", cost: 0.9 });
   const cheap = fakeAdapter({ providerId: "paid-cheap", cost: 0.1 });
+  const policy = enabledPolicy();
+  const ledger = createInMemoryPaidImageLedger();
   const selection = await resolveImageRouteSelection({
     capability: "image-generation",
     requestId: "req-paid-1",
     free: FREE_UNAVAILABLE,
     paid: {
-      policy: enabledPolicy(),
+      policy,
       adapters: [expensive, cheap],
-      ledger: createInMemoryPaidImageLedger(),
+      ledger,
       now: NOW,
     },
   });
@@ -257,6 +259,8 @@ test("FREE unavailable + paid fallback enabled synthetically: candidate evaluate
   assert.equal(selection.via, "paid");
   assert.equal(selection.providerId, "paid-cheap");
   assert.equal(selection.estimatedCostUsd, 0.1);
+  assert.equal(selection.paidExecution?.policy, policy);
+  assert.equal(selection.paidExecution?.ledger, ledger);
   assert.equal(expensive.calls.quoteCost, 1);
   assert.equal(cheap.calls.quoteCost, 1);
   assert.equal(expensive.calls.generateImage, 0);

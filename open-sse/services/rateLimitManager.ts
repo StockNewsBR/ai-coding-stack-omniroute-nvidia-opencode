@@ -571,7 +571,7 @@ export async function withRateLimit(provider, connectionId, model, fn, signal = 
 
   // Issue #6593: opt-in admission cap — fast-reject before Bottleneck's
   // schedule() (and before any downstream compression/prompt work runs) when
-  // the queue is already at/over maxQueueDepth. Default 0 = disabled.
+  // the queue is already at/over maxQueueDepth. The default is bounded.
   const admissionErr = checkQueueAdmission(
     limiter.counts().QUEUED,
     currentRequestQueueSettings.maxQueueDepth,

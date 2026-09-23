@@ -71,7 +71,10 @@ function qualityRank(value: number | undefined): number {
  * Health, then rate limiting, then recent failures, then latency, then quality,
  * then cost, then providerId. Cost stays the decider when every other signal ties.
  */
-function compareRankingSignals(left: PaidImageRankingSignals, right: PaidImageRankingSignals): number {
+function compareRankingSignals(
+  left: PaidImageRankingSignals,
+  right: PaidImageRankingSignals
+): number {
   return (
     HEALTH_RANK[left.health] - HEALTH_RANK[right.health] ||
     Number(left.rateLimited) - Number(right.rateLimited) ||
@@ -495,6 +498,10 @@ export interface ImageRouteSelection {
   readonly estimatedCostUsd?: number;
   readonly free?: FreeImageSelection;
   readonly paid?: PaidImageSelection;
+  readonly paidExecution?: Pick<
+    NonNullable<ImageRouteSelectionRequest["paid"]>,
+    "policy" | "ledger" | "fallbackReason" | "now"
+  >;
 }
 
 export interface ImageRouteUnavailable {
@@ -561,6 +568,7 @@ export async function resolveImageRouteSelection(
       modelId: paid.modelId,
       estimatedCostUsd: paid.estimatedCostUsd,
       paid,
+      paidExecution: request.paid,
     };
   }
 

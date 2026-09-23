@@ -5,7 +5,7 @@ import { detectMediaParts, type MediaPart } from "@omniroute/open-sse/utils/medi
 import { normalizeDataUri } from "@omniroute/open-sse/utils/imageNormalize";
 import { fetchRemoteImage } from "@/shared/network/remoteImageFetch";
 import { getRuntimePorts } from "@/lib/runtime/ports";
-import { resolveSelfLoopBearer } from "@/shared/middleware/chatBodyAdmission";
+import { internalOmniRouteAuthHeaders } from "@/shared/utils/omnirouteAuth";
 import { getBestVisionModel, getFallbackModels, recordLatency } from "./visionBridgeRouter";
 import { REGISTRY } from "@omniroute/open-sse/config/providers";
 import { fetch as undiciFetch } from "undici";
@@ -256,7 +256,7 @@ export async function ensureBase64ImagesForClaudeWire(
 
   // Map sequential image index → resolved data URI (null = keep original).
   const byIndex = new Map<number, string>();
-  parts.forEach((part, i) => {
+  parts.forEach((_, i) => {
     if (resolved[i]) byIndex.set(i, resolved[i] as string);
   });
   if (byIndex.size === 0) return body;
@@ -754,21 +754,26 @@ async function callVisionModelSingle(
           !config.model.startsWith("openai/"));
       const requestModel = useFullModelId ? config.model : modelName;
 
+      const isOmniRouteSelfLoop = /^http:\/\/(?:localhost|127\.0\.0\.1)(?::|\/)/.test(baseUrl);
+      const selfLoopHeaders = isOmniRouteSelfLoop
+        ? internalOmniRouteAuthHeaders({
+            "Content-Type": "application/json",
+            // Explicit JSON opt-in: without `Accept: application/json` OmniRoute's
+            // self-loop defaults to SSE and response.json() cannot parse it.
+            Accept: "application/json",
+          })
+        : null;
+      if (isOmniRouteSelfLoop && !selfLoopHeaders) {
+        throw new Error("OmniRoute self-loop authentication unavailable");
+      }
+
       // Build headers with optional recursion guard for self-loop calls.
       // When routing through OmniRoute's own API, omit the vision-bridge
       // guardrail on the sub-request to prevent infinite recursion.
-      // Use a real DB-backed key for self-loop (sk_omniroute is rejected by
-      // REQUIRE_API_KEY instances with 401 "Missing API key").
-      const selfLoopApiKey = resolvedApiKey || (await resolveSelfLoopApiKey());
-      const headers: Record<string, string> = {
+      const headers: Record<string, string> = selfLoopHeaders ?? {
         "Content-Type": "application/json",
-        // Explicit JSON opt-in: without `Accept: application/json` OmniRoute's
-        // self-loop defaults to SSE (resolveStreamFlag's legacy default) and the
-        // describe call would receive a `data:` stream that response.json() can't
-        // parse (`Unexpected token 'd'`), failing the whole vision-bridge
-        // describe path. Pair with `stream: false` below.
         Accept: "application/json",
-        Authorization: `Bearer ${selfLoopApiKey}`,
+        Authorization: `Bearer ${resolvedApiKey}`,
       };
       if (useFullModelId) {
         headers["x-omniroute-disabled-guardrails"] = routeThroughOmniRoute
@@ -785,11 +790,6 @@ async function callVisionModelSingle(
         // The compression pipeline must not touch the image payload of the
         // self-loop describe call (stacked RTK/Caveman can mangle data URIs).
         headers["x-omniroute-compression"] = "off";
-        // The admission bypass honors the env key when set (REQUIRE_API_KEY=true
-        // deployments) and the `sk_omniroute` sentinel otherwise. Force the same
-        // resolved credential so the bypass holds even when a real vision key is
-        // configured for the vision model's provider.
-        headers["Authorization"] = `Bearer ${resolveSelfLoopBearer()}`;
       }
 
       response = await fetchImpl(`${baseUrl}/chat/completions`, {

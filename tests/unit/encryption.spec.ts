@@ -131,6 +131,16 @@ describe("encryption module", () => {
     });
   });
 
+  it("fails closed in production when no storage encryption key is configured", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.resetModules();
+
+    const { encrypt } = await import("@/lib/db/encryption");
+    expect(() => encrypt("production-secret")).toThrow(
+      "Field encryption is required in production"
+    );
+  });
+
   describe("encryptConnectionFields / decryptConnectionFields helpers", () => {
     it("should encrypt all credential fields in a connection object", async () => {
       vi.stubEnv("STORAGE_ENCRYPTION_KEY", "test-secret-key-12345");

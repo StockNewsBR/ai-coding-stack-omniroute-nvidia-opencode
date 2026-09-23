@@ -10,11 +10,10 @@ import {
 } from "@/domain/assessment/types";
 import { validateBody } from "@/shared/validation/helpers";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
+import { internalOmniRouteAuthHeaders } from "@/shared/utils/omnirouteAuth";
+import { resolveOmniRouteBaseUrl } from "@/shared/utils/resolveOmniRouteBaseUrl";
 
-const assessor = new Assessor(
-  process.env.OMNIROUTe_API_KEY ?? process.env.API_KEY ?? "",
-  process.env.OMNIROUTe_BASE_URL ?? "http://localhost:20128/v1"
-);
+const assessor = new Assessor();
 
 const categorizer = new Categorizer();
 const healer = new SelfHealer();
@@ -142,11 +141,10 @@ export async function GET(request: NextRequest) {
 
 async function getAllModels(): Promise<Array<{ providerId: string; modelId: string }>> {
   try {
-    const resp = await fetch("http://localhost:20128/v1/models", {
-      headers: {
-        Authorization: `Bearer ${process.env.OMNIROUTe_API_KEY ?? process.env.API_KEY ?? ""}`,
-      },
-    });
+    const headers = internalOmniRouteAuthHeaders();
+    if (!headers) return [];
+    const resp = await fetch(`${resolveOmniRouteBaseUrl()}/v1/models`, { headers });
+    if (!resp.ok) return [];
     const data = (await resp.json()) as { data?: unknown };
     const models = Array.isArray(data.data) ? data.data : [];
     return models

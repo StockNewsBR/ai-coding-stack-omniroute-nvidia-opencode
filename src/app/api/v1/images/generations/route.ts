@@ -26,7 +26,10 @@ import {
   NO_FREE_IMAGE_PROVIDER_AVAILABLE,
   resolveFreeImageProvider,
 } from "@omniroute/open-sse/config/freeImageRouting.ts";
-import { resolveImageRouteSelection } from "@omniroute/open-sse/config/paidImageRouting.ts";
+import {
+  executePaidImageProvider,
+  resolveImageRouteSelection,
+} from "@omniroute/open-sse/config/paidImageRouting.ts";
 import { buildPaidImageRoutingDeps } from "@omniroute/open-sse/config/paidImageRouteFallback.ts";
 import { getCachedProviderConnections } from "@/lib/db/readCache";
 import { getCircuitBreaker } from "@/shared/utils/circuitBreaker";
@@ -41,6 +44,7 @@ import { runWithProxyContext } from "@omniroute/open-sse/utils/proxyFetch.ts";
 import { attachOmniRouteMetaHeaders } from "@/domain/omnirouteResponseMeta";
 import { calculateModalCost } from "@/lib/usage/costCalculator";
 import { generateRequestId } from "@/shared/utils/requestId";
+import { createDomainStatePaidImageLedger } from "@/lib/usage/domainPaidImageLedger";
 import { getSpecialtyModelsResponse } from "@/app/api/v1/_shared/specialtyCatalog";
 import { enforceClientApiRouteAuth } from "@/shared/utils/clientApiRouteAuth";
 import { runWithCallLogApiKeyContext } from "@/lib/usage/callLogApiKeyContext";
@@ -107,7 +111,10 @@ function publicBaseUrlHeaders(headers: Headers): Record<string, string> {
   return out;
 }
 
-async function resolveFreeImageRouteSelection() {
+async function resolveFreeImageRouteSelection(
+  body: { model?: string; prompt?: string; n?: number },
+  requestId: string
+) {
   const connections = await getCachedProviderConnections();
   const activeProviders = new Set(
     connections
@@ -122,16 +129,21 @@ async function resolveFreeImageRouteSelection() {
   // The default policy denies, so this composes to the same FREE_ONLY behavior.
   // Fail closed: paid deps stay undefined unless the paid policy is explicitly enabled and funded.
   const paid = buildPaidImageRoutingDeps({
+    ledger: createDomainStatePaidImageLedger(),
     isCircuitOpen: (providerId) => !getCircuitBreaker(providerId).canExecute(),
   });
   return resolveImageRouteSelection({
     capability: "image-generation",
+    requestId,
+    modelId: body.model,
+    prompt: body.prompt,
+    n: body.n,
     free,
     ...(paid ? { paid } : {}),
   });
 }
 
-async function postHandler(request, context) {
+async function postHandler(request, _context) {
   let rawBody;
   try {
     rawBody = await request.json();
@@ -146,6 +158,7 @@ async function postHandler(request, context) {
   }
   const body = validation.data;
   const startTime = Date.now();
+  const requestId = generateRequestId();
 
   // Authenticate before policy enforcement. Policy checks intentionally allow
   // keyless local mode and assume the route has already rejected invalid keys.
@@ -161,9 +174,41 @@ async function postHandler(request, context) {
   // the paid image framework but is disabled by default policy, so nothing paid
   // executes unless a future policy explicitly enables it.
   if (body.model === FREE_IMAGE_ROUTE_ID || body.model === FREE_IMAGE_ROUTE_ID_FREE) {
-    const selection = await resolveFreeImageRouteSelection();
+    const selection = await resolveFreeImageRouteSelection(body, requestId);
     if (!selection.ok) {
       return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, NO_FREE_IMAGE_PROVIDER_AVAILABLE);
+    }
+    if (selection.via === "paid" && selection.paid && selection.paidExecution) {
+      const execution = await executePaidImageProvider({
+        capability: "image-generation",
+        requestId,
+        modelId: body.model,
+        prompt: body.prompt,
+        n: body.n,
+        policy: selection.paidExecution.policy,
+        selection: selection.paid,
+        ledger: selection.paidExecution.ledger,
+        fallbackReason: selection.paidExecution.fallbackReason,
+        now: selection.paidExecution.now,
+      });
+      if (!execution.ok || !execution.imageUrls?.length) {
+        return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, "Paid image generation unavailable");
+      }
+      const headers = new Headers({ "Content-Type": "application/json" });
+      attachOmniRouteMetaHeaders(headers, {
+        provider: execution.providerId ?? selection.providerId,
+        model: selection.modelId ?? selection.providerId,
+        costUsd: execution.actualCostUsd ?? execution.estimatedCostUsd ?? 0,
+        latencyMs: execution.latencyMs ?? Date.now() - startTime,
+        requestId,
+      });
+      return new Response(
+        JSON.stringify({
+          created: Math.floor(Date.now() / 1000),
+          data: execution.imageUrls.map((url) => ({ url })),
+        }),
+        { status: 200, headers }
+      );
     }
     body.model = selection.modelId
       ? `${selection.providerId}/${selection.modelId}`
@@ -379,7 +424,7 @@ async function postHandler(request, context) {
       model: body.model,
       costUsd,
       latencyMs: Date.now() - startTime,
-      requestId: generateRequestId(),
+      requestId,
     });
     return new Response(JSON.stringify((result as { data: unknown }).data), {
       status: 200,

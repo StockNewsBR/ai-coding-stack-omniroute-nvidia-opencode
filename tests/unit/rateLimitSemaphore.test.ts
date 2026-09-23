@@ -9,18 +9,14 @@
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import {
-  acquire,
-  getStats,
-  resetAll,
-} from "../../open-sse/services/rateLimitSemaphore.ts";
+import { acquire, getStats, resetAll } from "../../open-sse/services/rateLimitSemaphore.ts";
 
 afterEach(() => {
   resetAll();
 });
 
 describe("rateLimitSemaphore queue depth (#3872)", () => {
-  it("queues unbounded when maxQueueSize is omitted (backward-compatible default)", async () => {
+  it("uses a bounded default queue when maxQueueSize is omitted", async () => {
     const model = "minimax/abab6.5";
 
     const releaseA = await acquire(model, { maxConcurrency: 1, timeoutMs: 500 });

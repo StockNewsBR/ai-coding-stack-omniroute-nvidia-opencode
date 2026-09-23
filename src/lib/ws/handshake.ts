@@ -1,6 +1,7 @@
 import { jwtVerify } from "jose";
 import { getSettings } from "@/lib/localDb";
 import { validateApiKey } from "@/lib/db/apiKeys";
+import { AUTHZ_HEADER_PEER_LOCALITY } from "@/server/authz/headers";
 
 export const DEFAULT_WS_PATH = "/v1/ws";
 const WS_QUERY_TOKEN_KEYS = ["api_key", "token", "access_token"];
@@ -88,13 +89,16 @@ export async function authorizeWebSocketHandshake(
   const token = extractWsTokenFromRequest(request);
   const hasCredential = typeof token === "string" && token.length > 0;
   const validApiKey = hasCredential ? await validateApiKey(token) : false;
+  const validSession = await hasValidSessionCookie(request);
+  const loopback = request.headers.get(AUTHZ_HEADER_PEER_LOCALITY) === "loopback";
 
   if (!config.wsAuth) {
+    const authorized = validApiKey || validSession || loopback;
     return {
       ...config,
-      authorized: true,
-      authenticated: validApiKey,
-      authType: validApiKey ? "api_key" : "none",
+      authorized,
+      authenticated: validApiKey || validSession,
+      authType: validApiKey ? "api_key" : validSession ? "session" : "none",
       hasCredential,
     };
   }
@@ -109,7 +113,7 @@ export async function authorizeWebSocketHandshake(
     };
   }
 
-  if (await hasValidSessionCookie(request)) {
+  if (validSession) {
     return {
       ...config,
       authorized: true,

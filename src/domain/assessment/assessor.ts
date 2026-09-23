@@ -17,6 +17,8 @@ import type {
   AssessmentTrigger,
 } from "./types";
 import { DEFAULT_ASSESSMENT_CONFIG, PROBE_MESSAGES, PROBE_MAX_TOKENS } from "./types";
+import { resolveInternalOmniRouteBearer } from "@/shared/utils/omnirouteAuth";
+import { resolveOmniRouteBaseUrl } from "@/shared/utils/resolveOmniRouteBaseUrl";
 
 interface ProbeResult {
   status: AssessmentStatus;
@@ -29,15 +31,11 @@ interface ProbeResult {
 export class Assessor {
   private config: AssessmentConfig;
   private assessments: Map<string, ModelAssessment> = new Map();
-  private apiKey: string;
-  private baseUrl: string;
+  private apiKey?: string;
+  private baseUrl?: string;
 
-  constructor(
-    apiKey: string,
-    baseUrl: string = "http://localhost:20128/v1",
-    config: Partial<AssessmentConfig> = {}
-  ) {
-    this.apiKey = apiKey;
+  constructor(apiKey?: string, baseUrl?: string, config: Partial<AssessmentConfig> = {}) {
+    this.apiKey = apiKey?.trim() || undefined;
     this.baseUrl = baseUrl;
     this.config = { ...DEFAULT_ASSESSMENT_CONFIG, ...config };
   }
@@ -49,16 +47,21 @@ export class Assessor {
   ): Promise<ProbeResult> {
     const messages = PROBE_MESSAGES[level];
     const maxTokens = PROBE_MAX_TOKENS[level];
+    const apiKey = this.apiKey ?? resolveInternalOmniRouteBearer();
+    if (!apiKey) {
+      return { status: "auth_error", latencyMs: 0, error: "Authentication unavailable" };
+    }
+    const baseUrl = this.baseUrl ?? `${resolveOmniRouteBaseUrl()}/v1`;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.probeTimeoutMs);
 
     try {
       const start = Date.now();
-      const response = await fetch(`${this.baseUrl}/chat/completions`, {
+      const response = await fetch(`${baseUrl}/chat/completions`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${this.apiKey}`,
+          Authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify({
           model: `${providerId}/${modelId}`,

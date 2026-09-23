@@ -34,6 +34,16 @@ const lastTimeoutContexts: Array<{
 }> = [];
 let contextRingIndex = 0;
 
+async function settleAfterAbort<T>(operation: Promise<T>): Promise<void> {
+  await Promise.race([
+    operation.then(
+      () => undefined,
+      () => undefined
+    ),
+    new Promise<void>((resolve) => setTimeout(resolve, 100)),
+  ]);
+}
+
 function recordTimeoutContext(ctx: {
   modelStr: string;
   timeoutMs: number;
@@ -188,24 +198,30 @@ export function buildTargetTimeoutRunner(deps: {
       // itself (e.g. a broken Error.prototype.message getter) — without
       // this, such a throw would surface as an unhandledRejection tagged
       // "combo-per-model-timeout" in production logs.
-      return await Promise.race([
-        handleSingleModel(b, modelStr, targetWithSignal).catch((err) => {
-          if (timedOut) {
-            // Inner call rejected because we aborted it. The synthetic 504 from
-            // timeoutPromise already wins the race; return an empty response so
-            // the loser branch resolves cleanly without leaking err.message.
-            return new Response(null, { status: 599 });
-          }
-          return errorResponse(502, err?.message ?? "Upstream model error");
-        }),
-        timeoutPromise,
-      ]).catch((raceErr) => {
+      const operation = handleSingleModel(b, modelStr, targetWithSignal).catch((err) => {
+        if (timedOut) {
+          // Inner call rejected because we aborted it. The synthetic 504 from
+          // timeoutPromise already wins the race; return an empty response so
+          // the loser branch resolves cleanly without leaking err.message.
+          return new Response(null, { status: 599 });
+        }
+        return errorResponse(502, err?.message ?? "Upstream model error");
+      });
+      // Observe the loser even when the timeout response wins. Providers should
+      // honor the abort signal; the bounded settle window prevents a broken
+      // adapter from holding the combo forever.
+      const raced = await Promise.race([operation, timeoutPromise]).catch((raceErr) => {
         // Defensive: should never fire — both race branches always resolve.
         // Include the error message so the root cause is not masked.
         const detail = raceErr instanceof Error ? raceErr.message : String(raceErr);
-        log.error?.("COMBO", `Unexpected rejection in combo timeout race for ${modelStr}: ${detail}`);
+        log.error?.(
+          "COMBO",
+          `Unexpected rejection in combo timeout race for ${modelStr}: ${detail}`
+        );
         return errorResponse(502, `Combo timeout dispatch error: ${detail}`);
       });
+      if (timedOut) await settleAfterAbort(operation);
+      return raced;
     } finally {
       clearTimeout(timeoutId);
       if (parentHedgeSignal && onParentHedgeAbort) {

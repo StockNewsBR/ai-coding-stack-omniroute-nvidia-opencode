@@ -17,6 +17,7 @@ const compliance = await import("../../src/lib/compliance/index.ts");
 const listRoute = await import("../../src/app/api/keys/route.ts");
 const keyRoute = await import("../../src/app/api/keys/[id]/route.ts");
 const revealRoute = await import("../../src/app/api/keys/[id]/reveal/route.ts");
+const revokeRoute = await import("../../src/app/api/keys/[id]/revoke/route.ts");
 
 const MACHINE_ID = "1234567890abcdef";
 
@@ -520,4 +521,35 @@ test("DELETE /api/keys/[id] removes keys and reports missing resources", async (
   assert.equal(await apiKeysDb.getApiKeyById(created.id), null);
   assert.equal(missingDeleteResponse.status, 404);
   assert.equal(missingDeleteBody.error, "Key not found");
+});
+
+test("additive cutover keeps both keys valid until the specific old row is revoked", async () => {
+  await enableManagementAuth();
+  const oldKey = await apiKeysDb.createApiKey("old synthetic key", MACHINE_ID);
+  const replacement = await apiKeysDb.createApiKey("replacement synthetic key", MACHINE_ID);
+
+  assert.equal(await apiKeysDb.validateApiKey(oldKey.key), true);
+  assert.equal(await apiKeysDb.validateApiKey(replacement.key), true);
+
+  const response = await revokeRoute.POST(
+    await makeManagementSessionRequest(
+      `http://localhost/api/keys/${oldKey.id.slice(0, 8)}/revoke`,
+      {
+        method: "POST",
+      }
+    ),
+    { params: Promise.resolve({ id: oldKey.id.slice(0, 8) }) }
+  );
+  const body = (await response.json()) as { revoked?: boolean; id?: string; keyPrefix?: string };
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(body, {
+    revoked: true,
+    id: oldKey.id,
+    keyPrefix: oldKey.key.slice(0, 12),
+  });
+  assert.equal(await apiKeysDb.validateApiKey(oldKey.key), false);
+  assert.equal(await apiKeysDb.validateApiKey(replacement.key), true);
+  assert.equal((await apiKeysDb.getApiKeyById(oldKey.id))?.isActive, false);
+  assert.equal((await apiKeysDb.getApiKeyById(replacement.id))?.isActive, true);
 });
