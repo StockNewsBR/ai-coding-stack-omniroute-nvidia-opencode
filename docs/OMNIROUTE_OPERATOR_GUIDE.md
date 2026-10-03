@@ -408,3 +408,27 @@ Deferred / not adopted:
 Routing rollback: `DELETE /api/combos/<id>` per combo; settings via `PATCH /api/settings`; full config restore from the R2 snapshot; image rollback to `sha256:085c57ad…`.
 
 Proof: `PAID_CALLS=0`, `PAID_SPEND=$0` (all E2E headers `x-omniroute-response-cost: 0.0000000000`).
+
+---
+
+## 23. No-auth audit + advanced config discovery R3 (2026-10-03)
+
+Snapshot gate before any R3 mutation: `/var/backups/aimmarketmaster/omniroute-config-r3-20261003T124243Z.tar.gz` (sha256 `7510a061…`, verified; offsite copy under `/home/dcima/vps-backups/omniroute-config-r3/`).
+
+No-auth real E2E (no keys, zero cost), summarized — full matrix in `reports/NOAUTH_PROVIDERS_R3_MATRIX.md`:
+
+| Provider | Modality | Result | Status |
+|---|---|---|---|
+| `ddgw` (DuckDuckGo) | TEXT | 3/3 HTTP 200, 0.82-0.96 s | **PROD** |
+| `aihorde` | IMAGE | 4/4 HTTP 200, WEBP 256x256 | **PROD** |
+| `horde` text | TEXT | 401 key required | excluded |
+| `oc` (OpenCode Free) | TEXT | 403 client-restricted / 429 cooldown | CLIENT_RESTRICTED |
+| `unc` | TEXT | 404 model missing | BROKEN |
+| `aug`, `cfp`, `dva`, `cxa`, `zc` | TEXT/AGENT | 5xx: missing CLI/browser/bridge/transport | LOCAL_BRIDGE_REQUIRED |
+| `veo-free`, `veoaifree-web` | VIDEO | 502 artifact download 403 | CLIENT_RESTRICTED |
+
+Adopted change (single mutation): `modelVisibilityAllowlist = ["auto/*","duckduckgo-web/*","aihorde/*"]` (was `[]`) via `PATCH /api/settings` -> `/v1/models` 199 -> 196 (client-restricted `oc` and broken `unc` hidden); `aimm-default` verified HTTP 200 via `ddgw` at cost 0. Notes: allowlist matches providerId (`duckduckgo-web`, not alias `ddgw`); video models bypass visibility filtering; denylist had no observable effect. Rollback: `PATCH /api/settings {"modelVisibilityAllowlist":[],"modelVisibilityDenylist":[]}`.
+
+Audited and deferred/off (details in `reports/OMNIROUTE_ADVANCED_CONFIG_R3.md`): webhooks (no internal receiver), MCP (disabled; read-only profile unproven), A2A (disabled), cache (off; tenant isolation unproven), Quota Share (no credentialed connections), vision (no no-auth route; DDGW rejects images), skills catalog (READ_ONLY inventory only), native backup CLI (secondary; canonical remains tar.gz + sha256 + offsite). Upstream 3.8.52 unchanged (no tag) — do not install; see `reports/UPSTREAM_3_8_52_WATCHLIST_R3.md`. Images: `NOAUTH_IMAGE_CANDIDATES.md`.
+
+Proof: `PAID_CALLS=0`, `PAID_SPEND=$0`; all E2E responses `x-omniroute-response-cost: 0.0000000000`; `healthz=200`; single listener `127.0.0.1:20128`.
