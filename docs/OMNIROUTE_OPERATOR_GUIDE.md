@@ -377,3 +377,34 @@ All items below were verified during the v3.8.50 → v3.8.51 safe upgrade (VPS p
 - Preflight and post-upgrade checks: `bash scripts/omniroute-upgrade-preflight.sh` and `bash scripts/omniroute-post-upgrade-verify.sh`.
 - Rollback: restore the unit file and the previously pinned image digest (older Docker images are kept locally; never prune right after an upgrade). If the new version applied migrations and the database must be reverted, stop the service first, replace `storage.sqlite` from the hot backup and remove the `-wal`/`-shm` files, then restart.
 - Baseline for this line: `3.8.51` (upstream release commit `c1e30b76`, VPS image digest `sha256:8bd462c9…`), rollback target `3.8.50` (SHA `dea6bb8`, VPS image digest `sha256:085c57ad…`).
+
+---
+
+## 22. Super configuration audit R2 (2026-10-03)
+
+Snapshot gate: fresh VPS config snapshot `/var/backups/aimmarketmaster/omniroute-config-r2-20261003T114247Z.tar.gz` (sha256 `d3f5e2e4…`, verified; includes env, unit, API JSONs and a `VACUUM INTO` database backup).
+
+Adopted (safe, FREE-only):
+
+- `credentialRedactionEnabled: true` (was false) — error strings and logs redact credential patterns.
+- Custom FREE-first combos (was none), all strategy `priority`, provider pool ddgw/oc/horde:
+  - `aimm-default`: ddgw/gpt-5.4-mini → ddgw/gpt-5.6-luna
+  - `aimm-quality`: ddgw/gpt-5.6-luna → ddgw/gpt-5.4-mini → ddgw/claude-haiku-4-5
+  - `aimm-fast`: ddgw/gpt-5.4-mini → ddgw/claude-haiku-4-5
+  - `aimm-coding`: ddgw/gpt-5.6-luna → ddgw/gpt-5.4-mini → ddgw/tinfoil/gpt-oss-120b
+  - `aimm-failover-proof`: oc/deepseek-v4-flash-free → ddgw/gpt-5.4-mini (proves FREE → FREE failover: observed `x-omniroute-fallback-attempts: 1`, selected ddgw, cost 0)
+  - `aimm-image`: aihorde/Deliberate (works via `POST /v1/images/generations`, cost 0)
+- Verified already enabled: `hidePaidModels=true`, `freeAccessPolicy=strict`, adaptive routing, failure classification, circuit breakers, local 429 cooldowns.
+
+Tested and reverted (no production change):
+
+- Compression `lite`: 1,954 tokens before/after (zero savings on a prose payload), +0.2 s latency → kept `off` (`PUT /api/settings/compression` with `{"enabled":false,"defaultMode":"off"}`; note PATCH returns 405, use PUT).
+
+Deferred / not adopted:
+
+- `autoRefreshProviderQuota` (no credentialed connections), call-log pipeline (privacy), Radar, Quota Share, `subscription`/`thrifty` (CONFLICT_FREE_ONLY), plugin-v2 (OpenCode 2.x not in use), video routes (untested).
+- AI Horde text models require an API key (401 when keyless) — not in any production pool.
+
+Routing rollback: `DELETE /api/combos/<id>` per combo; settings via `PATCH /api/settings`; full config restore from the R2 snapshot; image rollback to `sha256:085c57ad…`.
+
+Proof: `PAID_CALLS=0`, `PAID_SPEND=$0` (all E2E headers `x-omniroute-response-cost: 0.0000000000`).
