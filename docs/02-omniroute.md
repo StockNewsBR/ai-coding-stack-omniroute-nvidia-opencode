@@ -1,8 +1,8 @@
 # OmniRoute Setup
 
-Verified against the OmniRoute v3.8.50 release line, with the coding pool re-validated on **2026-08-16**.
+Verified against the OmniRoute v3.8.51 release line, with the local + VPS production runtime re-validated on **2026-10-03**.
 
-Official README: https://github.com/diegosouzapw/OmniRoute/blob/release/v3.8.50/README.md
+Official README: https://github.com/diegosouzapw/OmniRoute/blob/release/v3.8.51/README.md
 
 ## Install
 

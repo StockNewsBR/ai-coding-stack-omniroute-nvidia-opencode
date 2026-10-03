@@ -13,7 +13,7 @@ omniroute
 
 Open `http://localhost:20128`. The OpenAI-compatible API is at `http://localhost:20128/v1`.
 
-Official quick start: https://github.com/diegosouzapw/OmniRoute/blob/release/v3.8.50/docs/getting-started/QUICK-START.md
+Official quick start: https://github.com/diegosouzapw/OmniRoute/blob/release/v3.8.51/docs/getting-started/QUICK-START.md
 
 ## 2. Connect at least two independent providers
 

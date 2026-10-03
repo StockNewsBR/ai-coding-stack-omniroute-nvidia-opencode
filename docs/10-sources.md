@@ -3,7 +3,7 @@
 Use upstream documentation as the source of truth for current install commands, model IDs, quotas and supported configuration.
 
 - OmniRoute — https://github.com/diegosouzapw/OmniRoute
-- OmniRoute v3.8.50 README — https://github.com/diegosouzapw/OmniRoute/blob/release/v3.8.50/README.md
+- OmniRoute v3.8.51 README — https://github.com/diegosouzapw/OmniRoute/blob/release/v3.8.51/README.md
 - OpenCode docs — https://opencode.ai/docs/
 - OpenCode plugins — https://opencode.ai/docs/plugins/
 - OpenCode config — https://opencode.ai/docs/config/

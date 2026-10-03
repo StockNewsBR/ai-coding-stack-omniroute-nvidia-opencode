@@ -10,7 +10,7 @@
 
 > Uma configuração prática e testada em batalha para rodar um ambiente poderoso de codificação com IA usando **OpenCode como plataforma principal de codificação**, **OmniRoute como gateway local de IA**, **modelos gratuitos ou de camada gratuita como fallbacks** e **NVIDIA NIM** para modelos pesados como **GLM-5.2** e **Nemotron 3 Ultra**.
 >
-> Última verificação: **2026-08-12** durante a janela de lançamento do OmniRoute **v3.8.49 → v3.8.50**.
+> Última verificação: **2026-10-03** com o OmniRoute **v3.8.51** (Node 24.21.0 LTS).
 
 ![Dashboard do OmniRoute](assets/screenshots/omniroute-home-final.jpg)
 
@@ -39,8 +39,8 @@ Este **não** é um laboratório de benchmarks fingindo que todo provider é sem
 |---|---|
 | Host | Windows + WSL/Linux |
 | Ambiente Linux | WSL baseado em Ubuntu |
-| Node | 22.22.2 durante a configuração OmniRoute verificada |
-| OmniRoute | Janela de lançamento v3.8.49 → v3.8.50 |
+| Node | 24.21.0 LTS durante a configuração OmniRoute 3.8.51 verificada |
+| OmniRoute | v3.8.51 (validado em 2026-10-03; caminho de upgrade v3.8.50 → v3.8.51) |
 | Dashboard/API do OmniRoute | `127.0.0.1:20128` / `/v1` |
 | Cliente de codificação principal | OpenCode |
 | Orquestração | Oh My OpenAgent / Sisyphus Ultraworker |
@@ -210,7 +210,7 @@ Projeto oficial: [diegosouzapw/OmniRoute](https://github.com/diegosouzapw/OmniRo
 
 ## Requisitos
 
-Use uma versão do Node.js suportada pela release do OmniRoute que você instalar. Para a linha de releases v3.8.50, as notas upstream de solução de problemas aceitam explicitamente Node `>=22.22.2 <23` (junto com faixas suportadas de Node 20/24). Nossa configuração WSL testada usou Node 22.22.2.
+Use uma versão do Node.js suportada pela release do OmniRoute que você instalar. Para a linha v3.8.51, o OmniRoute aceita Node `>=22.22.2 <23` ou `>=24.0.0 <27` (Node 24 LTS recomendado). Nossa configuração WSL verificada usou Node 24.21.0 LTS com OmniRoute 3.8.51 (validada em 2026-10-03).
 
 Verifique:
 

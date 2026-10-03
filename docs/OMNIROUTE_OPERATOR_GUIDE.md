@@ -33,7 +33,7 @@ or credentials appear here. Version/paths below are the state verified in missio
 - **Runtime**: user systemd unit `omniroute.service`, `ExecStart` wraps
   `omniroute serve --no-open --no-recovery` via `/home/dcima/.local/bin/omniroute-systemd-run`
   (sets `HOSTNAME=127.0.0.1`); `ExecStartPost` runs `/home/dcima/.local/bin/omniroute-fix-orcarouter`.
-- **Version**: `3.8.50`, build SHA `dea6bb8` (baseline / rollback target).
+- **Version**: `3.8.51`, upstream release commit `c1e30b76` (VPS pinned image digest `sha256:8bd462c9f60d8eda79329cfbb6ea7ea723505fe7721beb944f3d43835409e218`; previous baseline `3.8.50`, SHA `dea6bb8`, kept as rollback target).
 - **State DB**: `~/.omniroute/storage.sqlite` (call logs, provider connections, quota
   snapshots, circuit breakers, combos, api keys).
 - **Installed package**: `~/.local/share/pnpm/global/v11/<hash>/node_modules/omniroute`.
@@ -238,7 +238,7 @@ gateway defect and must not be fixed by editing frozen files.
 
 ## 14. Rollback
 
-1. Gateway package: reinstall the pinned baseline build (`3.8.50`, SHA `dea6bb8`) from the
+1. Gateway package: to roll back from `3.8.51` (VPS image digest `sha256:8bd462c9…`), reinstall the pinned baseline build (`3.8.50`, SHA `dea6bb8`) from the
    rollback archive noted in the closure report.
 2. Service: `systemctl --user restart omniroute.service` (and confirm
    `omniroute-fix-orcarouter` succeeded).
@@ -339,3 +339,41 @@ node scripts/routelab explain <request-id>
 # Static stack audit (read-only; expected to flag widened keys)
 node scripts/free-ai-audit
 ```
+
+---
+
+## 21. Troubleshooting (verified upgrade paths, 2026-10-03)
+
+All items below were verified during the v3.8.50 → v3.8.51 safe upgrade (VPS production + local workstation).
+
+### NODE_VERSION_UNSUPPORTED
+
+- Symptom: OmniRoute refuses to start and prints `Incompatible Node.js Version`, requiring Node.js 22.22.2+ (22.x LTS) or 24.0.0+ (24.x LTS); Node 24 LTS recommended.
+- Cause: the process is running an older runtime (e.g. Node 22.22.1 from `/usr/bin/node`).
+- Fix: install Node 24 LTS (`nvm install 24`; verified with v24.21.0), reinstall OmniRoute explicitly (`pnpm add -g omniroute@3.8.51` or `npm install -g omniroute@3.8.51`) so native modules (better-sqlite3) rebuild, then restart through the supervisor.
+- Verify: `node --version`, `omniroute --version`, and that the serving process really uses the new Node (`readlink /proc/<pid>/exe`). On systemd, ensure the wrapper PATH pins the new Node version (worked example: `~/.local/bin/omniroute-systemd-run` pinned to `~/.nvm/versions/node/v24.21.0/bin`).
+
+### EADDRINUSE on port 20128
+
+- Symptom: `Error: listen EADDRINUSE: address already in use 127.0.0.1:20128`.
+- Root cause (observed 2026-09-21 locally): a duplicate manually started instance raced the systemd `Restart=always` supervisor.
+- Diagnose (read-only, never kill blindly): `bash scripts/omniroute-port-owner.sh 20128` — shows the exact listener PID, command line, executable, cgroup and owner.
+- Fix: run exactly one instance, always through its supervisor. Workstation: `systemctl --user restart omniroute.service`. VPS: `systemctl restart aimmarketmaster-omniroute.service`. Never start a second `omniroute serve`.
+
+### REMOTE_VPS (production topology)
+
+- Production OmniRoute runs on the VPS as Docker container `aimmarketmaster-omniroute`, bound to loopback `127.0.0.1:20128`, supervised by systemd unit `aimmarketmaster-omniroute.service`.
+- Canonical update path: edit the pinned image digest + version in `/opt/aimarketmaster/current/ops/production/omniroute-bootstrap.sh` (single-m paths), run `install`, then restart the systemd unit.
+- The local workstation runtime is a separate dev/test instance. Never treat local state as production proof, and never expose management endpoints beyond loopback.
+
+### AUTH_401
+
+- With `REQUIRE_API_KEY=true`, `/v1/models` and `/v1/chat/completions` require `Authorization: Bearer <OMNIROUTE_API_KEY>`. A 401 is an authentication problem, not a provider outage — check headers before classifying provider unavailability.
+- Anonymous `GET /api/monitoring/health` returning 200 is expected. Management endpoints under `/api/*` require an admin session cookie (`POST /api/auth/login`).
+
+### BACKUP_AND_ROLLBACK
+
+- Before any upgrade: back up storage.sqlite (hot backup), env/secrets (mode 600), systemd unit, version metadata and sha256 manifest. Local: `bash scripts/omniroute-backup.sh`. VPS: see `reports/OMNIROUTE_V3_8_51_BACKUP_MANIFEST.md`.
+- Preflight and post-upgrade checks: `bash scripts/omniroute-upgrade-preflight.sh` and `bash scripts/omniroute-post-upgrade-verify.sh`.
+- Rollback: restore the unit file and the previously pinned image digest (older Docker images are kept locally; never prune right after an upgrade). If the new version applied migrations and the database must be reverted, stop the service first, replace `storage.sqlite` from the hot backup and remove the `-wal`/`-shm` files, then restart.
+- Baseline for this line: `3.8.51` (upstream release commit `c1e30b76`, VPS image digest `sha256:8bd462c9…`), rollback target `3.8.50` (SHA `dea6bb8`, VPS image digest `sha256:085c57ad…`).

@@ -86,8 +86,8 @@ This is **not** a benchmark lab pretending every provider is always stable. It i
 |---|---|
 | Host | Windows + WSL/Linux |
 | Linux environment | Ubuntu-based WSL |
-| Node | 22.22.2 during the verified OmniRoute setup |
-| OmniRoute | v3.8.49 → v3.8.50 release window |
+| Node | 24.21.0 LTS during the verified OmniRoute 3.8.51 setup |
+| OmniRoute | v3.8.51 (validated 2026-10-03; upgrade path v3.8.50 → v3.8.51) |
 | OmniRoute dashboard/API | `127.0.0.1:20128` / `/v1` |
 | Main coding client | OpenCode |
 | Orchestration | Oh My OpenAgent / Sisyphus Ultraworker |
@@ -262,7 +262,7 @@ Official project: [diegosouzapw/OmniRoute](https://github.com/diegosouzapw/OmniR
 
 ## Requirements
 
-Use a Node.js version supported by the OmniRoute release you install. For the v3.8.50 release line, the upstream troubleshooting notes explicitly accept Node `>=22.22.2 <23` (along with supported Node 20/24 ranges). Our tested WSL setup used Node 22.22.2.
+Use a Node.js version supported by the OmniRoute release you install. For the v3.8.51 release line, OmniRoute accepts Node `>=22.22.2 <23` or `>=24.0.0 <27` (Node 24 LTS recommended). Our verified WSL setup used Node 24.21.0 LTS with OmniRoute 3.8.51 (validated 2026-10-03).
 
 Check:
 
