@@ -1341,3 +1341,15 @@ This guide is independent community documentation. The projects below own their 
 ## Disclaimer
 
 Free tiers, model availability, rate limits and provider names change frequently. The words **free** and **working** in this repository describe the state observed or documented at the verification date above. Always check the upstream provider's current terms and run your own smoke test before depending on a route.
+
+---
+
+<div align="center">
+
+### 🤝 Patrocínio:
+
+<a href="https://iamarketmaster.com"><img src="https://raw.githubusercontent.com/StockNewsBR/New-DeepSeek-Harness-2.0-GOD-Setup/main/assets/sponsors.svg" alt="AI Market Master e StockNewsBR — Patrocínio" width="900"></a>
+
+[AI Market Master](https://iamarketmaster.com) · [StockNewsBR](https://stocknewsbr.com)
+
+</div>
