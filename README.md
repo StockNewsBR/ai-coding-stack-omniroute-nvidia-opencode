@@ -1348,7 +1348,7 @@ Free tiers, model availability, rate limits and provider names change frequently
 
 ### 🤝 Patrocínio:
 
-<a href="https://iamarketmaster.com"><img src="https://raw.githubusercontent.com/StockNewsBR/New-DeepSeek-Harness-2.0-GOD-Setup/main/assets/sponsors.svg" alt="AI Market Master e StockNewsBR — Patrocínio" width="900"></a>
+<a href="https://iamarketmaster.com"><img src="https://raw.githubusercontent.com/StockNewsBR/New-DeepSeek-Harness-2.0-GOD-Setup/main/assets/unnamed.png" alt="AI Market Master e StockNewsBR — Patrocínio" width="900"></a>
 
 [AI Market Master](https://iamarketmaster.com) · [StockNewsBR](https://stocknewsbr.com)
 
